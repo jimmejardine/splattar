@@ -1,0 +1,347 @@
+//! winit window + event loop around the shared render pipeline. Kept behind
+//! the default `winit` feature; app-web and app-vr bring their own surfaces.
+
+use std::sync::Arc;
+use std::time::Instant;
+
+use glam::{Quat, Vec2};
+use gs_core::SplatCloud;
+use gs_render::{GpuScene, RenderSettings, SplatRenderer};
+use gs_wgpu::GpuContext;
+use winit::application::ApplicationHandler;
+use winit::event::{DeviceEvent, DeviceId, ElementState, MouseScrollDelta, WindowEvent};
+use winit::event_loop::{ActiveEventLoop, EventLoop};
+use winit::keyboard::{KeyCode, PhysicalKey};
+use winit::window::{CursorGrabMode, Window, WindowId};
+
+use crate::camera::FlyCamera;
+use crate::input::InputState;
+
+pub struct ViewOptions {
+    pub backends: wgpu::Backends,
+    pub vsync: bool,
+    pub width: u32,
+    pub height: u32,
+    pub sh_degree: u8,
+    pub splat_scale: f32,
+    /// Rotate the scene 180° about z (COLMAP-convention data renders upside
+    /// down in a y-up viewer). On by default.
+    pub flip_scene: bool,
+    pub title: String,
+}
+
+impl Default for ViewOptions {
+    fn default() -> Self {
+        Self {
+            backends: wgpu::Backends::VULKAN | wgpu::Backends::DX12 | wgpu::Backends::GL,
+            vsync: false,
+            width: 1600,
+            height: 900,
+            sh_degree: 3,
+            splat_scale: 1.0,
+            flip_scene: true,
+            title: "splattar".to_string(),
+        }
+    }
+}
+
+pub fn run(cloud: SplatCloud, options: ViewOptions) -> Result<(), String> {
+    let event_loop = EventLoop::new().map_err(|e| e.to_string())?;
+    let mut app = App {
+        cloud: Some(cloud),
+        options,
+        state: None,
+        input: InputState::default(),
+        locked: false,
+    };
+    event_loop.run_app(&mut app).map_err(|e| e.to_string())
+}
+
+struct GfxState {
+    window: Arc<Window>,
+    ctx: GpuContext,
+    surface: wgpu::Surface<'static>,
+    config: wgpu::SurfaceConfiguration,
+    renderer: SplatRenderer,
+    camera: FlyCamera,
+    scene_rot: Quat,
+    settings: RenderSettings,
+    num_splats: u32,
+    last_frame: Instant,
+    fps_window: Vec<f32>,
+    last_title: Instant,
+}
+
+struct App {
+    cloud: Option<SplatCloud>,
+    options: ViewOptions,
+    state: Option<GfxState>,
+    input: InputState,
+    locked: bool,
+}
+
+impl App {
+    fn init(&mut self, event_loop: &ActiveEventLoop) {
+        let Some(cloud) = self.cloud.take() else {
+            return; // already initialized
+        };
+        let window = Arc::new(
+            event_loop
+                .create_window(
+                    Window::default_attributes()
+                        .with_title(&self.options.title)
+                        .with_inner_size(winit::dpi::PhysicalSize::new(
+                            self.options.width,
+                            self.options.height,
+                        )),
+                )
+                .expect("create window"),
+        );
+
+        let mut desc = wgpu::InstanceDescriptor::new_without_display_handle().with_env();
+        desc.backends = self.options.backends;
+        let instance = wgpu::Instance::new(desc);
+        let surface = instance
+            .create_surface(window.clone())
+            .expect("create surface");
+        let ctx = pollster::block_on(GpuContext::with_instance(instance, Some(&surface)))
+            .expect("gpu context");
+
+        let caps = surface.get_capabilities(&ctx.adapter);
+        let format = caps
+            .formats
+            .iter()
+            .copied()
+            .find(|f| !f.is_srgb())
+            .unwrap_or(caps.formats[0]);
+        let present_mode = if self.options.vsync {
+            wgpu::PresentMode::Fifo
+        } else if caps.present_modes.contains(&wgpu::PresentMode::Mailbox) {
+            wgpu::PresentMode::Mailbox
+        } else if caps.present_modes.contains(&wgpu::PresentMode::Immediate) {
+            wgpu::PresentMode::Immediate
+        } else {
+            wgpu::PresentMode::Fifo
+        };
+        log::info!("surface: {format:?}, present mode: {present_mode:?}");
+
+        let size = window.inner_size();
+        let config = wgpu::SurfaceConfiguration {
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            format,
+            width: size.width.max(1),
+            height: size.height.max(1),
+            present_mode,
+            desired_maximum_frame_latency: 2,
+            alpha_mode: caps.alpha_modes[0],
+            color_space: wgpu::SurfaceColorSpace::Auto,
+            view_formats: vec![],
+        };
+        surface.configure(&ctx.device, &config);
+
+        let scene = GpuScene::upload(&ctx, &cloud);
+        let renderer = SplatRenderer::new(&ctx, &scene, format);
+        let scene_rot = if self.options.flip_scene {
+            Quat::from_rotation_z(std::f32::consts::PI)
+        } else {
+            Quat::IDENTITY
+        };
+        // Frame the bbox in upright space: rotate the scene bbox corners.
+        let (lo, hi) = scene.bbox;
+        let corners = [scene_rot * lo, scene_rot * hi];
+        let bbox = (corners[0].min(corners[1]), corners[0].max(corners[1]));
+        let camera = FlyCamera::framing(bbox);
+
+        self.state = Some(GfxState {
+            window,
+            ctx,
+            surface,
+            config,
+            renderer,
+            camera,
+            scene_rot,
+            settings: RenderSettings {
+                sh_degree: self.options.sh_degree,
+                splat_scale: self.options.splat_scale,
+                ..Default::default()
+            },
+            num_splats: scene.num_splats,
+            last_frame: Instant::now(),
+            fps_window: Vec::with_capacity(120),
+            last_title: Instant::now(),
+        });
+    }
+
+    fn set_locked(&mut self, locked: bool) {
+        let Some(state) = &self.state else { return };
+        if locked {
+            let ok = state
+                .window
+                .set_cursor_grab(CursorGrabMode::Locked)
+                .or_else(|_| state.window.set_cursor_grab(CursorGrabMode::Confined))
+                .is_ok();
+            if ok {
+                state.window.set_cursor_visible(false);
+                self.locked = true;
+            }
+        } else {
+            let _ = state.window.set_cursor_grab(CursorGrabMode::None);
+            state.window.set_cursor_visible(true);
+            self.locked = false;
+        }
+    }
+
+    fn frame(&mut self) {
+        let Some(state) = &mut self.state else { return };
+        let dt = state.last_frame.elapsed().as_secs_f32().min(0.1);
+        state.last_frame = Instant::now();
+
+        if self.locked {
+            state.camera.update(dt, &self.input);
+        }
+        self.input.end_frame();
+
+        use wgpu::CurrentSurfaceTexture as Cst;
+        let frame = match state.surface.get_current_texture() {
+            Cst::Success(f) | Cst::Suboptimal(f) => f,
+            Cst::Outdated | Cst::Lost => {
+                state.surface.configure(&state.ctx.device, &state.config);
+                return;
+            }
+            Cst::Timeout | Cst::Occluded => return,
+            other => {
+                log::error!("surface acquire failed: {other:?}");
+                return;
+            }
+        };
+        let view = frame
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        let mut encoder = state
+            .ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        let camera = state.camera.to_camera(state.scene_rot);
+        state.renderer.render(
+            &state.ctx,
+            &mut encoder,
+            &view,
+            &camera,
+            Vec2::new(state.config.width as f32, state.config.height as f32),
+            &state.settings,
+        );
+        state.ctx.queue.submit([encoder.finish()]);
+        state.window.pre_present_notify();
+        state.ctx.queue.present(frame);
+
+        state.fps_window.push(dt);
+        if state.last_title.elapsed().as_secs_f32() > 0.25 && !state.fps_window.is_empty() {
+            let avg = state.fps_window.iter().sum::<f32>() / state.fps_window.len() as f32;
+            state.fps_window.clear();
+            state.last_title = Instant::now();
+            state.window.set_title(&format!(
+                "{} — {} splats — {:.1} ms / {:.0} FPS — SH deg {} — {}",
+                self.options.title,
+                state.num_splats,
+                avg * 1e3,
+                1.0 / avg.max(1e-6),
+                state.settings.sh_degree,
+                if self.locked { "esc to release" } else { "click to fly" },
+            ));
+        }
+    }
+
+    fn handle_key(&mut self, code: KeyCode, pressed: bool, event_loop: &ActiveEventLoop) {
+        match code {
+            KeyCode::KeyW | KeyCode::ArrowUp => self.input.forward = pressed,
+            KeyCode::KeyS | KeyCode::ArrowDown => self.input.back = pressed,
+            KeyCode::KeyA | KeyCode::ArrowLeft => self.input.left = pressed,
+            KeyCode::KeyD | KeyCode::ArrowRight => self.input.right = pressed,
+            KeyCode::KeyE | KeyCode::Space => self.input.up = pressed,
+            KeyCode::KeyQ | KeyCode::ControlLeft => self.input.down = pressed,
+            KeyCode::ShiftLeft => self.input.sprint = pressed,
+            KeyCode::Escape if pressed => {
+                if self.locked {
+                    self.set_locked(false);
+                } else {
+                    event_loop.exit();
+                }
+            }
+            KeyCode::Digit0 | KeyCode::Digit1 | KeyCode::Digit2 | KeyCode::Digit3
+                if pressed =>
+            {
+                if let Some(state) = &mut self.state {
+                    state.settings.sh_degree = match code {
+                        KeyCode::Digit0 => 0,
+                        KeyCode::Digit1 => 1,
+                        KeyCode::Digit2 => 2,
+                        _ => 3,
+                    };
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+impl ApplicationHandler for App {
+    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        self.init(event_loop);
+    }
+
+    fn window_event(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        _window_id: WindowId,
+        event: WindowEvent,
+    ) {
+        match event {
+            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::Resized(size) => {
+                if let Some(state) = &mut self.state {
+                    state.config.width = size.width.max(1);
+                    state.config.height = size.height.max(1);
+                    state.surface.configure(&state.ctx.device, &state.config);
+                }
+            }
+            WindowEvent::KeyboardInput { event, .. } => {
+                if let PhysicalKey::Code(code) = event.physical_key {
+                    self.handle_key(code, event.state == ElementState::Pressed, event_loop);
+                }
+            }
+            WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                button: winit::event::MouseButton::Left,
+                ..
+            } if !self.locked => self.set_locked(true),
+            WindowEvent::MouseWheel { delta, .. } => {
+                self.input.scroll += match delta {
+                    MouseScrollDelta::LineDelta(_, y) => y,
+                    MouseScrollDelta::PixelDelta(p) => p.y as f32 / 120.0,
+                };
+            }
+            WindowEvent::RedrawRequested => self.frame(),
+            _ => {}
+        }
+    }
+
+    fn device_event(
+        &mut self,
+        _event_loop: &ActiveEventLoop,
+        _device_id: DeviceId,
+        event: DeviceEvent,
+    ) {
+        if let DeviceEvent::MouseMotion { delta } = event
+            && self.locked
+        {
+            self.input.mouse_dx += delta.0 as f32;
+            self.input.mouse_dy += delta.1 as f32;
+        }
+    }
+
+    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+        if let Some(state) = &self.state {
+            state.window.request_redraw();
+        }
+    }
+}

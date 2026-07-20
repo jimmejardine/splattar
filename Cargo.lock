@@ -868,6 +868,8 @@ dependencies = [
  "gs-render",
  "gs-wgpu",
  "log",
+ "pollster",
+ "wgpu",
  "winit",
 ]
 

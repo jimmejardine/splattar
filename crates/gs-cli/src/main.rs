@@ -1,6 +1,6 @@
 //! Headless pipeline driver. Every pipeline stage runs here before any GUI work.
 
-use anyhow::bail;
+use anyhow::{bail, Context};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
@@ -13,10 +13,29 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Render a splat .ply file in an interactive window (M0).
+    /// Render a splat .ply file in an interactive window (WASD + mouse).
     View {
         /// Path to a .ply splat file.
         file: PathBuf,
+        /// GPU backend: vulkan (default), dx12, or gl.
+        #[arg(long)]
+        backend: Option<String>,
+        /// Cap to the monitor refresh rate (Fifo). Off by default so FPS is measurable.
+        #[arg(long)]
+        vsync: bool,
+        #[arg(long, default_value_t = 1600)]
+        width: u32,
+        #[arg(long, default_value_t = 900)]
+        height: u32,
+        /// Active spherical-harmonics degree 0-3 (keys 0-3 switch at runtime).
+        #[arg(long, default_value_t = 3)]
+        sh_degree: u8,
+        /// Debug multiplier on splat extents.
+        #[arg(long, default_value_t = 1.0)]
+        splat_scale: f32,
+        /// Disable the 180° upright flip applied to COLMAP-convention scenes.
+        #[arg(long)]
+        no_flip: bool,
     },
     /// Full pipeline: video → splat model (creates a project). Arrives in M7.
     Run { video: PathBuf },
@@ -29,14 +48,44 @@ enum Command {
 }
 
 fn main() -> anyhow::Result<()> {
-    env_logger::init();
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let cli = Cli::parse();
     match cli.command {
-        Command::View { file } => {
-            bail!(
-                "`view` lands with the M0 renderer (next commits) — asked to view {}",
-                file.display()
-            )
+        Command::View {
+            file,
+            backend,
+            vsync,
+            width,
+            height,
+            sh_degree,
+            splat_scale,
+            no_flip,
+        } => {
+            let contents = gs_io::load_ply(&file)
+                .with_context(|| format!("loading {}", file.display()))?;
+            let cloud = match contents {
+                gs_io::PlyContents::Splats(c) => c,
+                gs_io::PlyContents::Points(p) => bail!(
+                    "'{}' is a plain point cloud ({} points, xyz+rgb), not a gaussian \
+                     splat file. Point rendering is not part of M0.",
+                    file.display(),
+                    p.len()
+                ),
+            };
+            let options = gs_viewer::windowed::ViewOptions {
+                backends: gs_wgpu::backends_from_str(backend.as_deref())?,
+                vsync,
+                width,
+                height,
+                sh_degree: sh_degree.min(3),
+                splat_scale,
+                flip_scene: !no_flip,
+                title: format!(
+                    "splattar — {}",
+                    file.file_name().unwrap_or_default().to_string_lossy()
+                ),
+            };
+            gs_viewer::windowed::run(cloud, options).map_err(|e| anyhow::anyhow!(e))
         }
         Command::Run { .. } => bail!("`run` arrives in M7 — see PLAN.md"),
         Command::Add { .. } => bail!("`add` arrives in M8 — see PLAN.md"),

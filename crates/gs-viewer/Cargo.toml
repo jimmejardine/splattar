@@ -17,4 +17,6 @@ gs-render = { workspace = true }
 gs-wgpu = { workspace = true }
 glam = { workspace = true }
 log = { workspace = true }
+wgpu = { workspace = true }
+pollster = { workspace = true }
 winit = { workspace = true, optional = true }
