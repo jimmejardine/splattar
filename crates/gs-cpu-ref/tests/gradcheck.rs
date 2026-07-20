@@ -227,6 +227,104 @@ fn gradcheck_deg3_scene() {
     grad_check(53, 6, 3, 20);
 }
 
+/// M4 aux-gradient gate: depth + normal image losses and the in-walk
+/// depth-distortion loss, FD-checked over every parameter class.
+fn grad_check_aux(seed: u64, n_surfels: usize, size: usize) {
+    let scene = make_scene(seed, n_surfels, 0, size);
+    let n_px = size * size;
+    let w_color = make_weights(seed ^ 0x11, n_px);
+    let w_normal = make_weights(seed ^ 0x22, n_px);
+    let w_depth: Vec<f64> = {
+        let mut rng = seed ^ 0x33;
+        (0..n_px).map(|_| uniform(&mut rng, -0.3, 0.3)).collect()
+    };
+    let lambda_dist = 0.35;
+
+    let loss_val = |s: &MicroScene| -> f64 {
+        let out = gs_cpu_ref::render(s);
+        let mut l = 0.0;
+        for i in 0..n_px {
+            l += out.color[i].dot(w_color[i]);
+            l += out.depth[i] * w_depth[i];
+            l += out.normal[i].dot(w_normal[i]);
+        }
+        l + lambda_dist * gs_cpu_ref::distortion_loss(s)
+    };
+    let grads = gs_cpu_ref::gradients_full(
+        &scene,
+        &gs_cpu_ref::LossGrads {
+            dl_dcolor: &w_color,
+            dl_ddepth: Some(&w_depth),
+            dl_dnormal: Some(&w_normal),
+            lambda_dist,
+        },
+    );
+
+    let mut ck = Checker::new();
+    let h = ck.h;
+    for i in 0..n_surfels {
+        for dim in 0..3 {
+            let mut sp = scene.clone();
+            let mut sm = scene.clone();
+            sp.surfels[i].pos[dim] += h;
+            sm.surfels[i].pos[dim] -= h;
+            ck.check(&format!("aux pos[{i}][{dim}]"), grads.pos[i][dim], (loss_val(&sp) - loss_val(&sm)) / (2.0 * h));
+        }
+        for dim in 0..2 {
+            let mut sp = scene.clone();
+            let mut sm = scene.clone();
+            sp.surfels[i].scales[dim] += h;
+            sm.surfels[i].scales[dim] -= h;
+            ck.check(&format!("aux scale[{i}][{dim}]"), grads.scales[i][dim], (loss_val(&sp) - loss_val(&sm)) / (2.0 * h));
+        }
+        for dim in 0..4 {
+            let mut sp = scene.clone();
+            let mut sm = scene.clone();
+            sp.surfels[i].quat[dim] += h;
+            sm.surfels[i].quat[dim] -= h;
+            ck.check(&format!("aux quat[{i}][{dim}]"), grads.quat[i][dim], (loss_val(&sp) - loss_val(&sm)) / (2.0 * h));
+        }
+        {
+            let mut sp = scene.clone();
+            let mut sm = scene.clone();
+            sp.surfels[i].opacity += h;
+            sm.surfels[i].opacity -= h;
+            ck.check(&format!("aux opacity[{i}]"), grads.opacity[i], (loss_val(&sp) - loss_val(&sm)) / (2.0 * h));
+        }
+    }
+    for dim in 0..3 {
+        let mut sp = scene.clone();
+        let mut sm = scene.clone();
+        sp.camera.center[dim] += h;
+        sm.camera.center[dim] -= h;
+        ck.check(&format!("aux cam_center[{dim}]"), grads.cam_center[dim], (loss_val(&sp) - loss_val(&sm)) / (2.0 * h));
+    }
+    {
+        let mut sp = scene.clone();
+        let mut sm = scene.clone();
+        sp.camera.focal += h;
+        sm.camera.focal -= h;
+        ck.check("aux focal", grads.focal, (loss_val(&sp) - loss_val(&sm)) / (2.0 * h));
+    }
+    // Guard against a vacuous pass: the losses must actually bite.
+    let grad_mag: f64 = grads.pos.iter().map(|g| g.length()).sum::<f64>()
+        + grads.opacity.iter().map(|g| g.abs()).sum::<f64>();
+    assert!(
+        grad_mag > 1e-2,
+        "aux losses produced near-zero gradients ({grad_mag:.2e}) — vacuous test"
+    );
+    eprintln!(
+        "aux gradcheck seed={seed} n={n_surfels}: worst rel {:.2e} at {} (grad mag {grad_mag:.2})",
+        ck.worst, ck.worst_label
+    );
+}
+
+#[test]
+fn gradcheck_aux_losses() {
+    grad_check_aux(71, 10, 20);
+    grad_check_aux(83, 8, 24);
+}
+
 #[test]
 fn forward_renders_something() {
     let scene = make_scene(99, 10, 1, 32);

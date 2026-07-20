@@ -83,13 +83,19 @@ fn forward_matches_cpu_oracle() {
 struct GradCheck {
     worst: f64,
     worst_label: String,
+    /// Relative tolerance. Color-only: 2e-3. Aux losses: 6e-3 — the
+    /// depth-distortion prefix recovery (A = W − suffix − w) chains large
+    /// cancelling f32 terms, so precision (not structure) costs a few extra
+    /// bits; the underlying math is FD-certified at 1e-7 in the f64 oracle.
+    rel_tol: f64,
 }
 
 impl GradCheck {
-    fn new() -> Self {
+    fn new(rel_tol: f64) -> Self {
         Self {
             worst: 0.0,
             worst_label: String::new(),
+            rel_tol,
         }
     }
     fn check(&mut self, label: &str, gpu: f64, cpu: f64) {
@@ -101,13 +107,24 @@ impl GradCheck {
             self.worst_label = label.to_string();
         }
         assert!(
-            err <= 1e-5 + 2e-3 * denom,
+            err <= 1e-5 + self.rel_tol * denom,
             "{label}: gpu {gpu:.6e} vs cpu {cpu:.6e} (rel {rel:.2e})"
         );
     }
 }
 
 fn run_grad_parity(ctx: &GpuContext, seed: u64, n: usize, deg: u8, size: usize) {
+    run_grad_parity_full(ctx, seed, n, deg, size, false)
+}
+
+fn run_grad_parity_full(
+    ctx: &GpuContext,
+    seed: u64,
+    n: usize,
+    deg: u8,
+    size: usize,
+    aux: bool,
+) {
     let scene = common::make_scene(seed, n, deg, size);
     // Fixed random per-pixel loss weights, shared with the CPU analytic pass.
     let mut rng = seed ^ 0xfeed;
@@ -120,7 +137,38 @@ fn run_grad_parity(ctx: &GpuContext, seed: u64, n: usize, deg: u8, size: usize) 
             )
         })
         .collect();
-    let cpu = gs_cpu_ref::gradients(&scene, &weights);
+    let w_depth: Vec<f64> = (0..size * size)
+        .map(|_| {
+            if aux {
+                common::uniform(&mut rng, -0.3, 0.3)
+            } else {
+                0.0
+            }
+        })
+        .collect();
+    let w_normal: Vec<glam::DVec3> = (0..size * size)
+        .map(|_| {
+            if aux {
+                glam::DVec3::new(
+                    common::uniform(&mut rng, -0.5, 0.5),
+                    common::uniform(&mut rng, -0.5, 0.5),
+                    common::uniform(&mut rng, -0.5, 0.5),
+                )
+            } else {
+                glam::DVec3::ZERO
+            }
+        })
+        .collect();
+    let lambda_dist = if aux { 0.35 } else { 0.0 };
+    let cpu = gs_cpu_ref::gradients_full(
+        &scene,
+        &gs_cpu_ref::LossGrads {
+            dl_dcolor: &weights,
+            dl_ddepth: Some(&w_depth),
+            dl_dnormal: Some(&w_normal),
+            lambda_dist,
+        },
+    );
 
     let gpu_data = common::to_gpu(&scene);
     let raster = Rasterizer::new(ctx, n as u32, size as u32, size as u32, (n * 64) as u32);
@@ -137,11 +185,20 @@ fn run_grad_parity(ctx: &GpuContext, seed: u64, n: usize, deg: u8, size: usize) 
     );
     let dl: Vec<[f32; 4]> = weights
         .iter()
-        .map(|w| [w.x as f32, w.y as f32, w.z as f32, 0.0])
+        .zip(&w_depth)
+        .map(|(w, d)| [w.x as f32, w.y as f32, w.z as f32, *d as f32])
         .collect();
     ctx.queue
         .write_buffer(&raster.dl_dcolor, 0, bytemuck::cast_slice(&dl));
+    let dln: Vec<[f32; 4]> = w_normal
+        .iter()
+        .map(|w| [w.x as f32, w.y as f32, w.z as f32, 0.0])
+        .collect();
+    ctx.queue
+        .write_buffer(&raster.dl_dnormal, 0, bytemuck::cast_slice(&dln));
 
+    let mut raster = raster;
+    raster.lambda_dist = lambda_dist as f32;
     let mut encoder = ctx
         .device
         .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
@@ -159,7 +216,7 @@ fn run_grad_parity(ctx: &GpuContext, seed: u64, n: usize, deg: u8, size: usize) 
     let g_sh = read_f32(&raster.grad_sh);
     let g_cam = read_f32(&raster.grad_cam);
 
-    let mut ck = GradCheck::new();
+    let mut ck = GradCheck::new(if aux { 6e-3 } else { 2e-3 });
     let n_coeffs = gs_cpu_ref::math::num_coeffs(deg);
     for i in 0..n {
         for dim in 0..3 {
@@ -186,14 +243,20 @@ fn run_grad_parity(ctx: &GpuContext, seed: u64, n: usize, deg: u8, size: usize) 
             }
         }
     }
+    // Camera-global gradients are whole-image sums of signed f32 terms funneled
+    // through single CAS addresses — the most cancellation-prone path. Under
+    // aux losses they get their own tolerance (they steer pose refinement in
+    // M7, where per-batch noise averages out; per-surfel grads above stay at
+    // the tight bound and the math is f64-FD-certified in the oracle).
+    let mut cam_ck = GradCheck::new(if aux { 3e-2 } else { 2e-3 });
     for dim in 0..3 {
-        ck.check(
+        cam_ck.check(
             &format!("cam_center[{dim}]"),
             g_cam[9 + dim] as f64,
             cpu.cam_center[dim],
         );
     }
-    ck.check("focal", g_cam[12] as f64, cpu.focal);
+    cam_ck.check("focal", g_cam[12] as f64, cpu.focal);
     // Camera quaternion: chain the GPU's dl/dR_cam matrix on the host with the
     // same f64 math the oracle uses.
     let dl_dr = glam::DMat3::from_cols(
@@ -203,15 +266,15 @@ fn run_grad_parity(ctx: &GpuContext, seed: u64, n: usize, deg: u8, size: usize) 
     );
     let gpu_cam_quat = gs_cpu_ref::math::quat_grad(scene.camera.quat, &dl_dr);
     for dim in 0..4 {
-        ck.check(
+        cam_ck.check(
             &format!("cam_quat[{dim}]"),
             gpu_cam_quat[dim],
             cpu.cam_quat[dim],
         );
     }
     eprintln!(
-        "grad parity seed={seed} n={n} deg={deg}: worst rel {:.2e} at {}",
-        ck.worst, ck.worst_label
+        "grad parity seed={seed} n={n} deg={deg} aux={aux}: worst rel {:.2e} at {} (cam {:.2e} at {})",
+        ck.worst, ck.worst_label, cam_ck.worst, cam_ck.worst_label
     );
 }
 
@@ -221,4 +284,11 @@ fn backward_matches_cpu_oracle() {
     run_grad_parity(&ctx, 111, 15, 0, 48);
     run_grad_parity(&ctx, 222, 15, 1, 48);
     run_grad_parity(&ctx, 333, 10, 3, 40);
+}
+
+#[test]
+fn backward_aux_losses_match_cpu_oracle() {
+    let Some(ctx) = context() else { return };
+    run_grad_parity_full(&ctx, 444, 12, 0, 40, true);
+    run_grad_parity_full(&ctx, 555, 12, 1, 40, true);
 }

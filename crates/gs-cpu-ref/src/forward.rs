@@ -142,6 +142,39 @@ pub fn evaluate(sc: &SurfelCam, d: DVec3, pix_x: f64, pix_y: f64) -> Hit {
     }
 }
 
+/// Total per-ray pairwise depth-distortion loss over the image:
+/// Σ_rays Σᵢ Σⱼ wᵢ wⱼ |tᵢ − tⱼ|, evaluated as 2·Σᵢ wᵢ(tᵢ·Aᵢ − Bᵢ) with the
+/// composite order treated as depth order (prefix sums A, B).
+pub fn distortion_loss(scene: &MicroScene) -> f64 {
+    let cam = &scene.camera;
+    let surfels = prepare(scene);
+    let mut total = 0.0;
+    for y in 0..cam.height {
+        for x in 0..cam.width {
+            let d = pixel_ray(cam, x, y);
+            let (pix_x, pix_y) = (x as f64 + 0.5, y as f64 + 0.5);
+            let mut transmittance = 1.0;
+            let (mut a_pre, mut b_pre) = (0.0, 0.0);
+            for sc in &surfels {
+                let hit = evaluate(sc, d, pix_x, pix_y);
+                let alpha = (sc.opacity * hit.ghat).min(ALPHA_CLAMP);
+                if alpha < ALPHA_SKIP {
+                    continue;
+                }
+                let w = transmittance * alpha;
+                total += 2.0 * w * (hit.t * a_pre - b_pre);
+                a_pre += w;
+                b_pre += w * hit.t;
+                transmittance *= 1.0 - alpha;
+                if transmittance < T_TERMINATE {
+                    break;
+                }
+            }
+        }
+    }
+    total
+}
+
 pub fn render(scene: &MicroScene) -> RenderOutput {
     let cam = &scene.camera;
     let surfels = prepare(scene);

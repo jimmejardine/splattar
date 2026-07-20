@@ -7,6 +7,6 @@ pub mod forward;
 pub mod math;
 pub mod scene;
 
-pub use backward::gradients;
-pub use forward::render;
+pub use backward::{LossGrads, gradients, gradients_full};
+pub use forward::{distortion_loss, render};
 pub use scene::{Gradients, MicroScene, RefCamera, RenderOutput, Surfel};

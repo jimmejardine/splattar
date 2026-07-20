@@ -1,18 +1,15 @@
-//! Analytic backward pass for the reference renderer. Color loss only (M2):
-//! given dL/d(color image), produce gradients for every surfel parameter
-//! (position, scales, quaternion, opacity, SH) and the camera (center,
-//! quaternion, focal).
-//!
-//! Structure mirrors what the GPU will do: a per-pixel reverse compositing
-//! walk yielding dL/dα and dL/dcolor per contribution, chained through the
-//! ray–splat intersection (triple-product gradients) or the screen-space
-//! low-pass branch into camera-space accumulators (dc, dτu, dτv), which are
-//! then chained once per surfel into parameter space.
+//! Analytic backward pass for the reference renderer. Losses supported (M4):
+//! color, depth, normal images, plus the in-walk per-ray depth-distortion
+//! loss. Structure mirrors the GPU: a per-pixel reverse compositing walk with
+//! suffix accumulators per output channel, chained through the ray–splat
+//! intersection (triple products) or the screen-branch projection into
+//! camera-space accumulators (dc, dτu, dτv, dnormal), then one per-surfel
+//! chain into parameter space.
 
 use glam::{DMat3, DVec3};
 
 use crate::forward::{SurfelCam, evaluate, pixel_ray, prepare};
-use crate::math::{self, quat_grad, quat_to_mat, triple_grads};
+use crate::math::{self, quat_grad, quat_to_mat, triple, triple_grads};
 use crate::scene::*;
 
 #[derive(Default, Clone)]
@@ -22,10 +19,21 @@ struct CamSpaceAcc {
     dtv: DVec3,
     dcolor: DVec3,
     dopacity: f64,
+    dnormal: DVec3,
+}
+
+/// Per-pixel loss gradients for every render target the walk produces, plus
+/// the in-walk depth-distortion weight. All optional inputs default to zero.
+pub struct LossGrads<'a> {
+    pub dl_dcolor: &'a [DVec3],
+    pub dl_ddepth: Option<&'a [f64]>,
+    pub dl_dnormal: Option<&'a [DVec3]>,
+    /// Weight on the per-ray pairwise depth-distortion loss
+    /// D = Σᵢ Σⱼ wᵢ wⱼ |tᵢ − tⱼ| (composite order treated as depth order).
+    pub lambda_dist: f64,
 }
 
 struct Contribution {
-    /// Index into the prepared (sorted) surfel list.
     list_idx: usize,
     alpha: f64,
     clamped_alpha: bool,
@@ -33,9 +41,23 @@ struct Contribution {
     hit: crate::forward::Hit,
 }
 
+/// Color-only convenience wrapper (M2/M3 call sites and tests).
 pub fn gradients(scene: &MicroScene, dl_dcolor: &[DVec3]) -> Gradients {
+    gradients_full(
+        scene,
+        &LossGrads {
+            dl_dcolor,
+            dl_ddepth: None,
+            dl_dnormal: None,
+            lambda_dist: 0.0,
+        },
+    )
+}
+
+pub fn gradients_full(scene: &MicroScene, loss: &LossGrads<'_>) -> Gradients {
     let cam = &scene.camera;
-    assert_eq!(dl_dcolor.len(), cam.width * cam.height);
+    let n_px = cam.width * cam.height;
+    assert_eq!(loss.dl_dcolor.len(), n_px);
     let surfels = prepare(scene);
     let mut grads = Gradients::zeros(scene);
     let mut acc = vec![CamSpaceAcc::default(); surfels.len()];
@@ -44,16 +66,23 @@ pub fn gradients(scene: &MicroScene, dl_dcolor: &[DVec3]) -> Gradients {
     let mut contribs: Vec<Contribution> = Vec::with_capacity(64);
     for y in 0..cam.height {
         for x in 0..cam.width {
-            let dl_dc_pix = dl_dcolor[y * cam.width + x];
-            if dl_dc_pix == DVec3::ZERO {
+            let pix_i = y * cam.width + x;
+            let dl_dc_pix = loss.dl_dcolor[pix_i];
+            let dl_dd_pix = loss.dl_ddepth.map_or(0.0, |d| d[pix_i]);
+            let dl_dn_pix = loss.dl_dnormal.map_or(DVec3::ZERO, |d| d[pix_i]);
+            let any_image_loss =
+                dl_dc_pix != DVec3::ZERO || dl_dd_pix != 0.0 || dl_dn_pix != DVec3::ZERO;
+            if !any_image_loss && loss.lambda_dist == 0.0 {
                 continue;
             }
             let d = pixel_ray(cam, x, y);
             let (pix_x, pix_y) = (x as f64 + 0.5, y as f64 + 0.5);
 
-            // Forward replay to collect this pixel's contribution list.
+            // Forward replay to collect the contribution list + totals.
             contribs.clear();
             let mut transmittance = 1.0;
+            let mut w_total = 0.0;
+            let mut wt_total = 0.0;
             for (list_idx, sc) in surfels.iter().enumerate() {
                 let hit = evaluate(sc, d, pix_x, pix_y);
                 let raw_alpha = sc.opacity * hit.ghat;
@@ -61,6 +90,9 @@ pub fn gradients(scene: &MicroScene, dl_dcolor: &[DVec3]) -> Gradients {
                 if alpha < ALPHA_SKIP {
                     continue;
                 }
+                let w = transmittance * alpha;
+                w_total += w;
+                wt_total += w * hit.t;
                 contribs.push(Contribution {
                     list_idx,
                     alpha,
@@ -74,32 +106,65 @@ pub fn gradients(scene: &MicroScene, dl_dcolor: &[DVec3]) -> Gradients {
                 }
             }
 
-            // Reverse walk: dL/dα_i = ⟨dL/dC, c_i·T_i⟩ − ⟨dL/dC, S_i⟩/(1−α_i)
-            // with S_i the color already accumulated behind i.
-            let mut suffix = DVec3::ZERO;
+            // Reverse walk with per-output suffix accumulators.
+            let mut suffix_color = DVec3::ZERO; // Σ_{j>i} c_j w_j
+            let mut suffix_depth = 0.0; // Σ_{j>i} t_j w_j
+            let mut suffix_normal = DVec3::ZERO; // Σ_{j>i} n_j w_j
+            let mut suffix_w = 0.0; // Σ_{j>i} w_j
+            let mut suffix_cw = 0.0; // Σ_{j>i} coef_j w_j (distortion)
             for contrib in contribs.iter().rev() {
                 let sc = &surfels[contrib.list_idx];
                 let a = &mut acc[contrib.list_idx];
                 let t_i = contrib.t_before;
                 let alpha = contrib.alpha;
+                let w = t_i * alpha;
+                let t_hit = contrib.hit.t;
 
-                a.dcolor += dl_dc_pix * (alpha * t_i);
-                let dl_dalpha = dl_dc_pix.dot(sc.color) * t_i
-                    - dl_dc_pix.dot(suffix) / (1.0 - alpha);
-                suffix += sc.color * (alpha * t_i);
-                if contrib.clamped_alpha {
-                    continue; // clamp kills the α chain
+                // Distortion prefix values recovered from totals + suffixes.
+                let (mut dt_dist, mut coef) = (0.0, 0.0);
+                if loss.lambda_dist != 0.0 {
+                    let a_pre = w_total - suffix_w - w; // Σ_{j<i} w_j
+                    let b_pre = wt_total - suffix_depth - w * t_hit; // Σ_{j<i} w_j t_j
+                    dt_dist = loss.lambda_dist * 2.0 * w * (a_pre - suffix_w);
+                    coef = loss.lambda_dist
+                        * (2.0 * (t_hit * a_pre - b_pre)
+                            + 2.0 * (suffix_depth - t_hit * suffix_w));
                 }
 
+                a.dcolor += dl_dc_pix * w;
+                a.dnormal += dl_dn_pix * w;
+                let mut dl_dt = dl_dd_pix * w + dt_dist;
+
+                let dl_dalpha = dl_dc_pix.dot(sc.color) * t_i
+                    - dl_dc_pix.dot(suffix_color) / (1.0 - alpha)
+                    + dl_dd_pix * (t_hit * t_i - suffix_depth / (1.0 - alpha))
+                    + dl_dn_pix.dot(sc.normal) * t_i
+                    - dl_dn_pix.dot(suffix_normal) / (1.0 - alpha)
+                    + coef * t_i
+                    - suffix_cw / (1.0 - alpha);
+
+                suffix_color += sc.color * w;
+                suffix_depth += t_hit * w;
+                suffix_normal += sc.normal * w;
+                suffix_w += w;
+                suffix_cw += coef * w;
+
+                if contrib.clamped_alpha {
+                    continue;
+                }
                 a.dopacity += dl_dalpha * contrib.hit.ghat;
                 let dl_dghat = dl_dalpha * sc.opacity;
 
                 if contrib.hit.ray_branch {
-                    chain_ray_branch(sc, d, &contrib.hit, dl_dghat, a, &mut dfocal, cam.focal);
-                } else {
-                    chain_screen_branch(
-                        sc, pix_x, pix_y, dl_dghat, a, &mut dfocal, cam,
+                    chain_ray_branch(
+                        sc, d, &contrib.hit, dl_dghat, dl_dt, a, &mut dfocal, cam.focal,
                     );
+                } else {
+                    // Screen branch: t fell back to the center depth (−c.z).
+                    a.dc.z -= dl_dt;
+                    dl_dt = 0.0;
+                    let _ = dl_dt;
+                    chain_screen_branch(sc, pix_x, pix_y, dl_dghat, a, &mut dfocal, cam);
                 }
             }
         }
@@ -111,6 +176,21 @@ pub fn gradients(scene: &MicroScene, dl_dcolor: &[DVec3]) -> Gradients {
     for (sc, a) in surfels.iter().zip(&acc) {
         let s = &scene.surfels[sc.idx];
         let rs = quat_to_mat(s.quat);
+        let mut a_dtu = a.dtu;
+        let mut a_dtv = a.dtv;
+
+        // Normal chain: n = sign · normalize(τu × τv).
+        if a.dnormal != DVec3::ZERO {
+            let m = sc.tu.cross(sc.tv);
+            let len = m.length();
+            if len > 1e-12 {
+                let mhat = m / len;
+                let sign = if mhat.dot(sc.c) > 0.0 { -1.0 } else { 1.0 };
+                let dl_dm = (a.dnormal - mhat * mhat.dot(a.dnormal)) * (sign / len);
+                a_dtu += sc.tv.cross(dl_dm);
+                a_dtv += dl_dm.cross(sc.tu);
+            }
+        }
 
         // c = R_camᵀ (p − C)
         let x = s.pos - cam.center;
@@ -120,8 +200,7 @@ pub fn gradients(scene: &MicroScene, dl_dcolor: &[DVec3]) -> Gradients {
         add_transpose_chain(&mut dl_dr_cam, x, a.dc);
 
         // τu = R_camᵀ (s_u · Rs·e0), τv analogous.
-        for (axis, (dtau, scale)) in [(0usize, (a.dtu, s.scales[0])), (1, (a.dtv, s.scales[1]))]
-        {
+        for (axis, (dtau, scale)) in [(0usize, (a_dtu, s.scales[0])), (1, (a_dtv, s.scales[1]))] {
             let axis_world = rs.col(axis);
             let y_vec = axis_world * scale;
             let dy = r_cam * dtau;
@@ -174,26 +253,29 @@ fn add_transpose_chain(dl_dr: &mut DMat3, y: DVec3, dl_da: DVec3) {
     }
 }
 
-/// Chain dL/dĝ through the ray–splat intersection: u = Nu/D, v = Nv/D with
-/// Nu = det[−c, τv, −d], Nv = det[τu, −c, −d], D = det[τu, τv, −d].
+/// Chain dL/dĝ and dL/dt through the ray–splat intersection: u = Nu/D,
+/// v = Nv/D, t = Nt/D with the four scalar triple products.
+#[allow(clippy::too_many_arguments)]
 fn chain_ray_branch(
     sc: &SurfelCam,
     d: DVec3,
     hit: &crate::forward::Hit,
     dl_dghat: f64,
+    dl_dt: f64,
     a: &mut CamSpaceAcc,
     dfocal: &mut f64,
     focal: f64,
 ) {
     let s_vec = -d;
-    let det = crate::math::triple(sc.tu, sc.tv, s_vec);
+    let det = triple(sc.tu, sc.tv, s_vec);
     debug_assert!(det.abs() > 1e-12);
-    let (u, v) = (hit.u, hit.v);
+    let (u, v, t) = (hit.u, hit.v, hit.t);
     let dl_du = -u * hit.ghat * dl_dghat;
     let dl_dv = -v * hit.ghat * dl_dghat;
     let dl_dnu = dl_du / det;
     let dl_dnv = dl_dv / det;
-    let dl_ddet = -(u * dl_du + v * dl_dv) / det;
+    let dl_dnt = dl_dt / det;
+    let dl_ddet = -(u * dl_du + v * dl_dv + t * dl_dt) / det;
 
     let mut ds_vec = DVec3::ZERO;
     // Nu = det[−c, τv, S]
@@ -206,6 +288,11 @@ fn chain_ray_branch(
     a.dtu += ga * dl_dnv;
     a.dc -= gb * dl_dnv;
     ds_vec += gc * dl_dnv;
+    // Nt = det[τu, τv, −c]
+    let (ga, gb, gc) = triple_grads(sc.tu, sc.tv, -sc.c);
+    a.dtu += ga * dl_dnt;
+    a.dtv += gb * dl_dnt;
+    a.dc -= gc * dl_dnt;
     // D = det[τu, τv, S]
     let (ga, gb, gc) = triple_grads(sc.tu, sc.tv, s_vec);
     a.dtu += ga * dl_ddet;

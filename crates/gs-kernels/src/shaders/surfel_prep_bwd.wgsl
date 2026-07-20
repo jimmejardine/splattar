@@ -19,7 +19,7 @@
 @group(0) @binding(11) var<storage, read_write> grad_sh: array<vec4<f32>>; // 12 per surfel
 @group(0) @binding(12) var<storage, read_write> grad_cam: array<atomic<u32>>;
 
-const GS: u32 = 13u;
+const GS: u32 = 16u; // == GRAD_STRIDE
 const SH_C0: f32 = 0.28209479;
 const SH_C1: f32 = 0.48860252;
 
@@ -126,10 +126,30 @@ fn surfel_prep_bwd(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     let g = i * GS;
     let dc = vec3<f32>(grad_geom[g], grad_geom[g + 1u], grad_geom[g + 2u]);
-    let dtu = vec3<f32>(grad_geom[g + 3u], grad_geom[g + 4u], grad_geom[g + 5u]);
-    let dtv = vec3<f32>(grad_geom[g + 6u], grad_geom[g + 7u], grad_geom[g + 8u]);
+    var dtu = vec3<f32>(grad_geom[g + 3u], grad_geom[g + 4u], grad_geom[g + 5u]);
+    var dtv = vec3<f32>(grad_geom[g + 6u], grad_geom[g + 7u], grad_geom[g + 8u]);
     var dcolor = vec3<f32>(grad_geom[g + 9u], grad_geom[g + 10u], grad_geom[g + 11u]);
     let dopacity = grad_geom[g + 12u];
+    let dnormal = vec3<f32>(grad_geom[g + 13u], grad_geom[g + 14u], grad_geom[g + 15u]);
+
+    // Normal chain: n = sign · normalize(τu_cam × τv_cam); τ and c come from
+    // the forward prep record.
+    if dnormal.x != 0.0 || dnormal.y != 0.0 || dnormal.z != 0.0 {
+        let sc = surf_cam[i];
+        let m = cross(sc.tu.xyz, sc.tv.xyz);
+        let len2 = dot(m, m);
+        if len2 > 1e-24 {
+            let len = sqrt(len2);
+            let mhat = m / len;
+            var sign = 1.0;
+            if dot(mhat, sc.c.xyz) > 0.0 {
+                sign = -1.0;
+            }
+            let dl_dm = (dnormal - mhat * dot(mhat, dnormal)) * (sign / len);
+            dtu += cross(sc.tv.xyz, dl_dm);
+            dtv += cross(dl_dm, sc.tu.xyz);
+        }
+    }
 
     var dpos = vec3<f32>(0.0);
     var dcenter = vec3<f32>(0.0);

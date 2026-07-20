@@ -26,7 +26,7 @@ struct CameraUniform {
     num_surfels: u32,
     tiles_x: u32,
     tiles_y: u32,
-    _pad: u32,
+    lambda_dist: f32,
 }
 
 #[derive(Debug, Clone)]
@@ -53,6 +53,9 @@ pub struct SceneInput<'a> {
 
 pub struct Rasterizer {
     capacity: u32,
+    /// Depth-distortion loss weight, written into the camera uniform each
+    /// forward (0 disables the distortion gradient path).
+    pub lambda_dist: f32,
     pub width: u32,
     pub height: u32,
     tiles_x: u32,
@@ -74,8 +77,10 @@ pub struct Rasterizer {
     prep_bg: wgpu::BindGroup,
     fwd_pipeline: wgpu::ComputePipeline,
     fwd_bg: wgpu::BindGroup,
-    // Backward: dL/d(color image) in, parameter gradients out.
+    // Backward: dL/d(color image) in (w channel = depth-loss grad),
+    // dL/d(normal image), parameter gradients out.
     pub dl_dcolor: wgpu::Buffer,
+    pub dl_dnormal: wgpu::Buffer,
     grad_geom: wgpu::Buffer,
     pub grad_pos: wgpu::Buffer,
     pub grad_scales: wgpu::Buffer,
@@ -161,7 +166,8 @@ impl Rasterizer {
         );
 
         let dl_dcolor = buffers::storage_empty(device, "raster-dl-dcolor", px * 16);
-        let grad_geom = buffers::storage_empty(device, "raster-grad-geom", n * 13 * 4);
+        let dl_dnormal = buffers::storage_empty(device, "raster-dl-dnormal", px * 16);
+        let grad_geom = buffers::storage_empty(device, "raster-grad-geom", n * 16 * 4);
         let grad_pos = buffers::storage_empty(device, "raster-grad-pos", n * 16);
         let grad_scales = buffers::storage_empty(device, "raster-grad-scales", n * 8);
         let grad_quat = buffers::storage_empty(device, "raster-grad-quat", n * 16);
@@ -214,6 +220,8 @@ impl Rasterizer {
                 bind(7, &out_ncontrib),
                 bind(8, &grad_geom),
                 bind(9, &grad_cam),
+                bind(10, &dl_dnormal),
+                bind(11, &out_color),
             ],
         });
         let geom_bwd_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -238,6 +246,7 @@ impl Rasterizer {
 
         Self {
             capacity,
+            lambda_dist: 0.0,
             width,
             height,
             tiles_x,
@@ -259,6 +268,7 @@ impl Rasterizer {
             fwd_pipeline,
             fwd_bg,
             dl_dcolor,
+            dl_dnormal,
             grad_geom,
             grad_pos,
             grad_scales,
@@ -355,7 +365,7 @@ impl Rasterizer {
             num_surfels,
             tiles_x: self.tiles_x,
             tiles_y: self.tiles_y,
-            _pad: 0,
+            lambda_dist: self.lambda_dist,
         };
         ctx.queue
             .write_buffer(&self.camera_buf, 0, bytemuck::bytes_of(&uniform));

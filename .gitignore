@@ -2,3 +2,4 @@
 /target
 # scratch outputs from golden-image debugging (never commit diffs)
 golden-diff*/
+/datasets

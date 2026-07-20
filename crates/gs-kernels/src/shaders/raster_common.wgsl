@@ -15,8 +15,12 @@ struct RasterCamera {
     num_surfels: u32,
     tiles_x: u32,
     tiles_y: u32,
-    _pad: u32,
+    // Weight on the per-ray pairwise depth-distortion loss (0 disables).
+    lambda_dist: f32,
 }
+
+// grad_geom layout per surfel: [dc 3, dtu 3, dtv 3, dcolor 3, dopacity 1, dnormal 3].
+const GRAD_STRIDE: u32 = 16u;
 
 // Camera-space surfel produced by surfel_prep, consumed by fwd/bwd kernels.
 struct SurfelCam {
