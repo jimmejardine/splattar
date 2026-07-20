@@ -7,6 +7,7 @@ Pure-Rust pipeline: apartment walkthrough video → Gaussian-surfel (2DGS) model
 - **100% Rust.** No C/C++ build dependencies: no ffmpeg, no COLMAP, no OpenCV, no `-sys` crates that compile or link C/C++. System runtimes loaded at runtime (GPU driver, OpenXR runtime DLL) are the only exception. Check what a crate links before adding it.
 - **From scratch.** The differentiable rasterizer (WGSL ray-splat-intersection forward + hand-derived backward, 2DGS surfels), Adam optimizer, and MCMC densification are implemented here — do not depend on Brush or port its code wholesale; reading it as a reference is fine.
 - **GPU via wgpu** (Vulkan primary backend on the dev machine). No CUDA.
+- **Video is the only product input.** No photo/image-folder input mode. The pipeline is video-native and SLAM-shaped (tracking front-end → incremental mapping → short global refinement), exploiting temporal structure: KLT flow tracking, PTS-parameterized SE(3) trajectory spline, dense small-baseline depth for surfel init, temporal minibatches with tile-sort reuse, track-new-keyframes-against-the-model. Do not reintroduce unordered-photo SfM or random-view batch training as the product path. Posed-frame-sequence loaders are internal validation harnesses only.
 
 ## Workspace
 
@@ -24,7 +25,8 @@ Conventions:
 cargo build --workspace                 # native build (excludes app-web)
 cargo test --workspace                  # unit + property + gradient-check tests
 cargo run -p gs-cli -- view <file.ply>  # render a splat file
-cargo run -p gs-cli -- train <dataset>  # train on a COLMAP/Nerfstudio dataset
+cargo run -p gs-cli -- run <video.mp4>  # full pipeline: video → splat model (the product path)
+cargo run -p gs-cli -- train <dataset>  # validation harness: posed video-sequence datasets only
 cargo clippy --workspace -- -D warnings
 ```
 
@@ -44,5 +46,5 @@ cargo clippy --workspace -- -D warnings
 - Training uses f32 throughout; the viewer path uses packed f16 (`shader-f16` when available). Don't mix.
 - Primitives are 2D Gaussian surfels (2 scales + orientation), not 3D ellipsoids. The trainer only produces the surfel layout, but `gs-io`/`gs-render` must also load standard 3DGS .ply files (3 scales) — M0 and golden tests depend on public 3DGS scenes.
 - Geometry losses (depth-distortion, normal-consistency) phase in after warm-up iterations — enabling them from iteration 0 hurts convergence. Mesh extraction consumes rendered median depth, not splat centers.
-- iPhone footage defaults to HEVC in .mov (10-bit Main 10, often Dolby Vision/HLG). H.264 decode candidates: NihAV, `rusty_h264`; HEVC candidate: `rust_h265` (pure Rust, new 2026-07) — treat all as unproven until validated against reference decodes of real clips. Beware parser-only crates that sound like decoders (`media-codec-h265`, `scuffle-h26x`, `h264-reader` — headers only, no frames). The image-folder input path is the supported fallback; keep it first-class. 10-bit HLG needs tone mapping before training.
+- iPhone footage defaults to HEVC in .mov (10-bit Main 10, often Dolby Vision/HLG). H.264 decode candidates: NihAV, `rusty_h264`; HEVC candidate: `rust_h265` (pure Rust, new 2026-07) — treat all as unproven until validated against reference decodes of real clips. Beware parser-only crates that sound like decoders (`media-codec-h265`, `scuffle-h26x`, `h264-reader` — headers only, no frames). Decode is hard-blocking (video-only input): validate decoders early, and use the internal frame-sequence test harness to keep trainer/VO work unblocked if decode stalls. 10-bit HLG needs tone mapping before training.
 - iPhone video is Variable Frame Rate. Never compute timing as frame_index / fps — always use the PTS carried per-frame from the demuxer, and preserve PTS through decode → keyframe selection.
