@@ -6,5 +6,5 @@
 pub mod colmap;
 pub mod ply;
 
-pub use colmap::{ColmapDataset, ColmapError, load_colmap};
+pub use colmap::{ColmapDataset, ColmapError, SfmPoint, load_colmap};
 pub use ply::{PlyContents, PlyError, load_ply, load_ply_from, write_3dgs_ply};

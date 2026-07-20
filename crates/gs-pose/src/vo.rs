@@ -108,6 +108,8 @@ struct Track {
     at_last_kf: Option<(f32, f32)>,
     /// Observations at keyframes: (kf index, position).
     obs: Vec<(usize, (f32, f32))>,
+    /// Binary patch descriptor per observation (for cross-video matching).
+    obs_desc: Vec<crate::descriptor::Descriptor>,
     /// Landmark index once triangulated.
     landmark: Option<usize>,
 }
@@ -146,6 +148,11 @@ impl KeyframePose {
 pub struct VoResult {
     pub keyframe_poses: Vec<Option<KeyframePose>>,
     pub landmarks: Vec<DVec3>,
+    /// One reference observation per landmark: (keyframe index, pixel
+    /// position). Lets callers sample appearance for initialization.
+    pub landmark_obs: Vec<(usize, (f32, f32))>,
+    /// Binary descriptor at the reference observation (cross-video matching).
+    pub landmark_desc: Vec<crate::descriptor::Descriptor>,
     pub spline: Option<PoseSpline>,
     /// Index of the anchor keyframe (gauge origin).
     pub anchor: usize,
@@ -236,9 +243,16 @@ impl VoFrontEnd {
                 pts,
                 sharpness,
             });
+            let smooth = &pyr.levels[1.min(pyr.levels.len() - 1)];
+            let lvl_scale = if pyr.levels.len() > 1 { 0.5 } else { 1.0 };
             for tr in &mut self.tracks {
                 if let Some(p) = tr.cur {
                     tr.obs.push((kf_idx, p));
+                    tr.obs_desc.push(crate::descriptor::describe(
+                        smooth,
+                        p.0 * lvl_scale,
+                        p.1 * lvl_scale,
+                    ));
                 }
                 // Dead tracks must drop out of the survival statistics, or
                 // the ratio decays monotonically and every frame becomes a
@@ -258,6 +272,11 @@ impl VoFrontEnd {
                     cur: Some((c.x, c.y)),
                     at_last_kf: Some((c.x, c.y)),
                     obs: vec![(kf_idx, (c.x, c.y))],
+                    obs_desc: vec![crate::descriptor::describe(
+                        smooth,
+                        c.x * lvl_scale,
+                        c.y * lvl_scale,
+                    )],
                     landmark: None,
                 });
             }
@@ -494,12 +513,28 @@ impl VoFrontEnd {
             .map(|kp| (kp.pts, kp.pose))
             .collect();
         let spline = PoseSpline::fit(&spline_samples);
+        // Reference observation per landmark: the middle keyframe obs of the
+        // owning track (median viewpoint → least grazing appearance sample).
+        let mut landmark_obs = vec![(usize::MAX, (0.0f32, 0.0f32)); landmarks.len()];
+        let mut landmark_desc =
+            vec![[0u8; crate::descriptor::DESC_BYTES]; landmarks.len()];
+        for tr in &self.tracks {
+            let Some(l) = tr.landmark else { continue };
+            if !tr.obs.is_empty() {
+                let mid = tr.obs.len() / 2;
+                let (kf, p) = tr.obs[mid];
+                landmark_obs[l] = (kf, p);
+                landmark_desc[l] = tr.obs_desc[mid];
+            }
+        }
         Some(VoResult {
             keyframe_poses,
             landmarks: landmarks
                 .iter()
                 .map(|l| DVec3::new(l[0], l[1], l[2]))
                 .collect(),
+            landmark_obs,
+            landmark_desc,
             spline,
             anchor,
         })

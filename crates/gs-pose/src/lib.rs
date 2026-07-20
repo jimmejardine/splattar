@@ -4,11 +4,13 @@
 //! in this crate — public APIs speak glam.
 
 pub mod ba;
+pub mod descriptor;
 pub mod detect;
 pub mod image;
 pub mod klt;
 pub mod pnp;
 pub mod se3;
+pub mod sim3;
 pub mod spline;
 pub mod triangulate;
 pub mod twoview;
