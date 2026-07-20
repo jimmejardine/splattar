@@ -6,11 +6,13 @@
 
 pub mod buffers;
 pub mod context;
+pub mod prefix_sum;
 #[cfg(feature = "profile")]
 pub mod profile;
 pub mod sort;
 
 pub use context::{GpuContext, backends_from_str};
+pub use prefix_sum::PrefixSum;
 #[cfg(feature = "profile")]
 pub use profile::GpuTimer;
 pub use sort::RadixSorter;
