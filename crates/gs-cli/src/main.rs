@@ -36,6 +36,10 @@ enum Command {
         /// Disable the 180° upright flip applied to COLMAP-convention scenes.
         #[arg(long)]
         no_flip: bool,
+        /// Headless: render the three canonical golden poses (800×600 PNGs)
+        /// into this directory and exit. Used to (re)generate assets/golden/.
+        #[arg(long, value_name = "DIR")]
+        render_golden: Option<PathBuf>,
     },
     /// Full pipeline: video → splat model (creates a project). Arrives in M7.
     Run { video: PathBuf },
@@ -60,6 +64,7 @@ fn main() -> anyhow::Result<()> {
             sh_degree,
             splat_scale,
             no_flip,
+            render_golden,
         } => {
             let contents = gs_io::load_ply(&file)
                 .with_context(|| format!("loading {}", file.display()))?;
@@ -72,6 +77,9 @@ fn main() -> anyhow::Result<()> {
                     p.len()
                 ),
             };
+            if let Some(dir) = render_golden {
+                return render_goldens(&file, &cloud, &dir, backend.as_deref());
+            }
             let options = gs_viewer::windowed::ViewOptions {
                 backends: gs_wgpu::backends_from_str(backend.as_deref())?,
                 vsync,
@@ -92,4 +100,35 @@ fn main() -> anyhow::Result<()> {
         Command::Train { .. } => bail!("`train` arrives in M3 — see PLAN.md"),
         Command::Export { .. } => bail!("`export` arrives in M7 — see PLAN.md"),
     }
+}
+
+/// Headless golden regeneration: renders the three canonical poses through the
+/// exact viewer pipeline and writes `<stem>-pose{0,1,2}.png` into `dir`.
+fn render_goldens(
+    file: &std::path::Path,
+    cloud: &gs_core::SplatCloud,
+    dir: &std::path::Path,
+    backend: Option<&str>,
+) -> anyhow::Result<()> {
+    use gs_render::{GpuScene, SplatRenderer, golden, offscreen};
+
+    std::fs::create_dir_all(dir)?;
+    let ctx = pollster::block_on(gs_wgpu::GpuContext::new(gs_wgpu::backends_from_str(
+        backend,
+    )?))?;
+    let scene = GpuScene::upload(&ctx, cloud);
+    let renderer = SplatRenderer::new(&ctx, &scene, offscreen::OFFSCREEN_FORMAT);
+    let images = golden::render_goldens(&ctx, &scene, &renderer);
+
+    let stem = file.file_stem().unwrap_or_default().to_string_lossy();
+    let (w, h) = golden::GOLDEN_SIZE;
+    for (i, rgba) in images.into_iter().enumerate() {
+        let out = dir.join(format!("{stem}-pose{i}.png"));
+        image::RgbaImage::from_raw(w, h, rgba)
+            .context("image size")?
+            .save(&out)
+            .with_context(|| format!("writing {}", out.display()))?;
+        println!("wrote {}", out.display());
+    }
+    Ok(())
 }

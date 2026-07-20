@@ -35,6 +35,18 @@ impl Camera {
     pub fn forward(&self) -> Vec3 {
         self.rotation * Vec3::NEG_Z
     }
+
+    /// Camera at `eye` looking toward `target` (y-up world).
+    pub fn look_at(eye: Vec3, target: Vec3, up: Vec3) -> Self {
+        let fwd = (target - eye).normalize();
+        let right = fwd.cross(up).normalize();
+        let up2 = right.cross(fwd);
+        Self {
+            position: eye,
+            rotation: glam::Quat::from_mat3(&glam::Mat3::from_cols(right, up2, -fwd)),
+            ..Default::default()
+        }
+    }
 }
 
 impl Default for Camera {
@@ -68,6 +80,13 @@ mod tests {
     fn forward_is_neg_z() {
         let cam = Camera::default();
         assert!((cam.forward() - Vec3::NEG_Z).length() < 1e-6);
+    }
+
+    #[test]
+    fn look_at_faces_target() {
+        let cam = Camera::look_at(Vec3::new(5.0, 3.0, 5.0), Vec3::ZERO, Vec3::Y);
+        let expect = (Vec3::ZERO - cam.position).normalize();
+        assert!((cam.forward() - expect).length() < 1e-5);
     }
 
     #[test]

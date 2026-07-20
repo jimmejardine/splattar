@@ -2,6 +2,7 @@
 //! preprocess → depth sort → instanced-quad draw, shared by desktop, VR, and web.
 //! Shaders live in `src/shaders/`.
 
+pub mod golden;
 pub mod offscreen;
 pub mod pipeline;
 pub mod scene;
