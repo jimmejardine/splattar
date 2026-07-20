@@ -60,6 +60,24 @@ enum Command {
         /// Output path for the baked compat .ply.
         #[arg(long, default_value = "trained.ply")]
         out: PathBuf,
+        /// Fixed surfel budget (MCMC); SfM init is upsampled to this count.
+        #[arg(long, default_value_t = 300_000)]
+        budget: u32,
+        /// Depth-distortion loss weight (per-pixel normalized).
+        #[arg(long, default_value_t = 0.01)]
+        lambda_dist: f32,
+        /// Normal-consistency loss weight.
+        #[arg(long, default_value_t = 0.05)]
+        lambda_normal: f32,
+        /// MCMC relocation interval in iterations (0 = off).
+        #[arg(long, default_value_t = 300)]
+        mcmc_every: u32,
+        /// MCMC exploration-noise multiplier (× position LR).
+        #[arg(long, default_value_t = 20.0)]
+        mcmc_noise: f32,
+        /// Promote SH degree every N iterations (0 = full degree from start).
+        #[arg(long, default_value_t = 1000)]
+        sh_promote: u32,
     },
     /// Export the project as baked .ply/.spz (+ scene manifest). Arrives in M7.
     Export { project: PathBuf },
@@ -117,20 +135,60 @@ fn main() -> anyhow::Result<()> {
             downscale,
             holdout,
             out,
-        } => train(&dataset, iters, downscale, holdout, &out),
+            budget,
+            lambda_dist,
+            lambda_normal,
+            mcmc_every,
+            mcmc_noise,
+            sh_promote,
+        } => train(
+            &dataset,
+            TrainCliOpts {
+                iters,
+                downscale,
+                holdout,
+                out,
+                budget,
+                lambda_dist,
+                lambda_normal,
+                mcmc_every,
+                mcmc_noise,
+                sh_promote,
+            },
+        ),
         Command::Export { .. } => bail!("`export` arrives in M7 — see PLAN.md"),
     }
 }
 
-fn train(
-    dataset: &std::path::Path,
+struct TrainCliOpts {
     iters: u32,
     downscale: u32,
     holdout: u32,
-    out: &std::path::Path,
-) -> anyhow::Result<()> {
+    out: PathBuf,
+    budget: u32,
+    lambda_dist: f32,
+    lambda_normal: f32,
+    mcmc_every: u32,
+    mcmc_noise: f32,
+    sh_promote: u32,
+}
+
+fn train(dataset: &std::path::Path, opts: TrainCliOpts) -> anyhow::Result<()> {
     use gs_kernels::RasterCamera;
     use gs_train::{TrainConfig, TrainView, Trainer};
+    let TrainCliOpts {
+        iters,
+        downscale,
+        holdout,
+        out,
+        budget,
+        lambda_dist,
+        lambda_normal,
+        mcmc_every,
+        mcmc_noise,
+        sh_promote,
+    } = opts;
+    let out = out.as_path();
 
     let ctx = pollster::block_on(gs_wgpu::GpuContext::new(gs_wgpu::backends_from_str(None)?))?;
     let ds = gs_io::load_colmap(dataset, downscale)?;
@@ -159,10 +217,25 @@ fn train(
         eval_views.len()
     );
 
-    let init = gs_train::init_from_sfm_points(&ds.points, 0x5eed);
+    let mut init = gs_train::init_from_sfm_points(&ds.points, 0x5eed);
+    gs_train::upsample_to_budget(&mut init, budget as usize, 0xb00);
+    log::info!(
+        "init: {} SfM points upsampled to a {} surfel budget",
+        ds.points.len(),
+        init.positions.len()
+    );
     let config = TrainConfig {
         iters,
         log_every: 500,
+        lambda_dist,
+        lambda_normal,
+        reg_opacity: 0.01,
+        reg_scale: 0.005,
+        geo_start: 1500,
+        sh_promote_every: sh_promote,
+        mcmc_every,
+        mcmc_noise,
+        entries_per_surfel: 48,
         ..Default::default()
     };
     let mut trainer = Trainer::new(&ctx, ds.width, ds.height, train_views, init, config);

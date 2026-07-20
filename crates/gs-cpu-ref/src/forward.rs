@@ -96,6 +96,32 @@ pub fn prepare(scene: &MicroScene) -> Vec<SurfelCam> {
     out
 }
 
+/// Mirror of the GPU tile binning: a surfel reaches pixel (x, y) only if the
+/// pixel's 16px tile lies in the surfel's clamped tile rect, whose radius is
+/// capped at 64px (TDR guard). The truncation is part of the shipped forward
+/// model, so the oracle reproduces it exactly — including the u32 truncation
+/// of the tile bounds.
+pub fn covers_pixel(sc: &SurfelCam, cam: &RefCamera, x: usize, y: usize) -> bool {
+    const TILE: f64 = 16.0;
+    let r_px =
+        (3.0 * cam.focal * (sc.tu.length() + sc.tv.length()) / sc.depth + 3.0).min(64.0);
+    if !(sc.px + r_px >= 0.0
+        && sc.px - r_px < cam.width as f64
+        && sc.py + r_px >= 0.0
+        && sc.py - r_px < cam.height as f64)
+    {
+        return false;
+    }
+    let max_tx = (cam.width.div_ceil(16) - 1) as f64;
+    let max_ty = (cam.height.div_ceil(16) - 1) as f64;
+    let x0 = ((sc.px - r_px) / TILE).clamp(0.0, max_tx) as usize;
+    let y0 = ((sc.py - r_px) / TILE).clamp(0.0, max_ty) as usize;
+    let x1 = ((sc.px + r_px) / TILE).clamp(0.0, max_tx) as usize;
+    let y1 = ((sc.py + r_px) / TILE).clamp(0.0, max_ty) as usize;
+    let (tx, ty) = (x / 16, y / 16);
+    tx >= x0 && tx <= x1 && ty >= y0 && ty <= y1
+}
+
 /// One pixel–surfel evaluation.
 #[derive(Debug, Clone, Copy)]
 pub struct Hit {
@@ -156,6 +182,9 @@ pub fn distortion_loss(scene: &MicroScene) -> f64 {
             let mut transmittance = 1.0;
             let (mut a_pre, mut b_pre) = (0.0, 0.0);
             for sc in &surfels {
+                if !covers_pixel(sc, cam, x, y) {
+                    continue;
+                }
                 let hit = evaluate(sc, d, pix_x, pix_y);
                 let alpha = (sc.opacity * hit.ghat).min(ALPHA_CLAMP);
                 if alpha < ALPHA_SKIP {
@@ -193,6 +222,9 @@ pub fn render(scene: &MicroScene) -> RenderOutput {
             let i = y * cam.width + x;
             let mut transmittance = 1.0;
             for sc in &surfels {
+                if !covers_pixel(sc, cam, x, y) {
+                    continue;
+                }
                 let hit = evaluate(sc, d, pix_x, pix_y);
                 let alpha = (sc.opacity * hit.ghat).min(ALPHA_CLAMP);
                 if alpha < ALPHA_SKIP {

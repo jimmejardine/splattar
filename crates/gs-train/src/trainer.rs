@@ -299,12 +299,19 @@ impl Trainer {
             camera.focal,
         );
 
+        // Split into two submissions so a heavy early-training iteration stays
+        // under the Windows GPU watchdog (TDR ~2 s per submission).
         let mut encoder = ctx
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
         self.raster.forward(ctx, &mut encoder, &camera, self.num_surfels);
         self.loss.encode(&mut encoder);
         self.normal_loss.encode(&mut encoder);
+        ctx.queue.submit([encoder.finish()]);
+
+        let mut encoder = ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
         self.raster.backward(&mut encoder, self.num_surfels);
         self.optim.encode_step(ctx, &mut encoder);
 

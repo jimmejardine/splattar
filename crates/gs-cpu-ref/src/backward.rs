@@ -8,7 +8,7 @@
 
 use glam::{DMat3, DVec3};
 
-use crate::forward::{SurfelCam, evaluate, pixel_ray, prepare};
+use crate::forward::{SurfelCam, covers_pixel, evaluate, pixel_ray, prepare};
 use crate::math::{self, quat_grad, quat_to_mat, triple, triple_grads};
 use crate::scene::*;
 
@@ -84,6 +84,9 @@ pub fn gradients_full(scene: &MicroScene, loss: &LossGrads<'_>) -> Gradients {
             let mut w_total = 0.0;
             let mut wt_total = 0.0;
             for (list_idx, sc) in surfels.iter().enumerate() {
+                if !covers_pixel(sc, cam, x, y) {
+                    continue;
+                }
                 let hit = evaluate(sc, d, pix_x, pix_y);
                 let raw_alpha = sc.opacity * hit.ghat;
                 let alpha = raw_alpha.min(ALPHA_CLAMP);

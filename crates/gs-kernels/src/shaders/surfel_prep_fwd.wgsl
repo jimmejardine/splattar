@@ -112,8 +112,11 @@ fn surfel_prep(@builtin(global_invocation_id) gid: vec3<u32>) {
         vec4<f32>(normal, clamp_mask),
     );
 
-    // Conservative pixel radius: 3σ of both axes projected + low-pass reach.
-    let r_px = 3.0 * cam.focal * (length(tu) + length(tv)) / depth + 3.0;
+    // Conservative pixel radius: 3σ of both axes projected + low-pass reach,
+    // capped so a single splat can't flood the binner (oversized footprints
+    // early in training would TDR the tile kernels; caps shrink as training
+    // tightens scales anyway).
+    let r_px = min(3.0 * cam.focal * (length(tu) + length(tv)) / depth + 3.0, 64.0);
     let x0 = u32(clamp((px - r_px) / f32(TILE), 0.0, f32(cam.tiles_x - 1u)));
     let y0 = u32(clamp((py - r_px) / f32(TILE), 0.0, f32(cam.tiles_y - 1u)));
     let x1 = u32(clamp((px + r_px) / f32(TILE), 0.0, f32(cam.tiles_x - 1u)));

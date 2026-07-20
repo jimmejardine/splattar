@@ -8,7 +8,7 @@ pub mod optim;
 pub mod ssim;
 pub mod trainer;
 
-pub use init::init_from_sfm_points;
+pub use init::{init_from_sfm_points, upsample_to_budget};
 pub use normal_loss::NormalLoss;
 pub use optim::{Activation, Optimizer};
 pub use ssim::SsimLoss;
