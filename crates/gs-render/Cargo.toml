@@ -6,6 +6,10 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[features]
+# Per-stage GPU timing via wgpu timestamp queries.
+profile = ["gs-wgpu/profile"]
+
 [dependencies]
 gs-core = { workspace = true }
 gs-wgpu = { workspace = true }

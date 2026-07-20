@@ -43,6 +43,10 @@ fn main() {
     const WARMUP: usize = 30;
     const FRAMES: usize = 200;
     let mut total = std::time::Duration::ZERO;
+    #[cfg(feature = "profile")]
+    let mut timer = gs_wgpu::GpuTimer::new(&ctx, 8);
+    #[cfg(feature = "profile")]
+    let mut stage_ms: std::collections::BTreeMap<String, f64> = Default::default();
     for i in 0..WARMUP + FRAMES {
         let angle = i as f32 * 0.01;
         let eye = center + Vec3::new(angle.sin(), 0.3, angle.cos()) * 2.0 * radius;
@@ -52,18 +56,24 @@ fn main() {
         let mut encoder = ctx
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-        renderer.render(
-            &ctx,
-            &mut encoder,
-            &view,
-            &camera,
-            glam::Vec2::new(w as f32, h as f32),
-            &settings,
-        );
+        let viewport = glam::Vec2::new(w as f32, h as f32);
+        #[cfg(feature = "profile")]
+        {
+            renderer.render_profiled(&ctx, &mut encoder, &view, &camera, viewport, &settings, &mut timer);
+            timer.resolve(&mut encoder);
+        }
+        #[cfg(not(feature = "profile"))]
+        renderer.render(&ctx, &mut encoder, &view, &camera, viewport, &settings);
         ctx.queue.submit([encoder.finish()]);
         ctx.device
             .poll(wgpu::PollType::wait_indefinitely())
             .expect("poll");
+        #[cfg(feature = "profile")]
+        for (label, ms) in timer.read(&ctx) {
+            if i >= WARMUP {
+                *stage_ms.entry(label).or_default() += ms;
+            }
+        }
         if i >= WARMUP {
             total += start.elapsed();
         }
@@ -75,4 +85,8 @@ fn main() {
         avg.as_secs_f64() * 1e3,
         1.0 / avg.as_secs_f64()
     );
+    #[cfg(feature = "profile")]
+    for (label, ms) in &stage_ms {
+        println!("  {label:<12} {:.3} ms avg (GPU)", ms / FRAMES as f64);
+    }
 }

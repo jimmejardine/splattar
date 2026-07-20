@@ -253,6 +253,42 @@ impl SplatRenderer {
         viewport: Vec2,
         settings: &RenderSettings,
     ) {
+        self.write_camera(ctx, camera, viewport, settings);
+        encoder.clear_buffer(self.sorter.counts(), 0, None);
+        self.encode_preprocess(encoder, None);
+        self.sorter.encode(encoder);
+        self.encode_draw(encoder, target, settings.background, None);
+    }
+
+    /// [`render`] with per-stage GpuTimer scopes: preprocess / sort / draw.
+    #[cfg(feature = "profile")]
+    #[allow(clippy::too_many_arguments)] // mirrors render() + the timer
+    pub fn render_profiled(
+        &self,
+        ctx: &GpuContext,
+        encoder: &mut wgpu::CommandEncoder,
+        target: &wgpu::TextureView,
+        camera: &Camera,
+        viewport: Vec2,
+        settings: &RenderSettings,
+        timer: &mut gs_wgpu::GpuTimer,
+    ) {
+        self.write_camera(ctx, camera, viewport, settings);
+        encoder.clear_buffer(self.sorter.counts(), 0, None);
+        let ts = timer.compute_scope("preprocess");
+        self.encode_preprocess(encoder, ts);
+        self.sorter.encode_profiled(encoder, timer);
+        let ts = timer.render_scope("draw");
+        self.encode_draw(encoder, target, settings.background, ts);
+    }
+
+    fn write_camera(
+        &self,
+        ctx: &GpuContext,
+        camera: &Camera,
+        viewport: Vec2,
+        settings: &RenderSettings,
+    ) {
         let uniform = CameraUniform {
             view: camera.view_matrix().to_cols_array_2d(),
             proj: camera.proj_matrix(viewport.x / viewport.y).to_cols_array_2d(),
@@ -266,42 +302,51 @@ impl SplatRenderer {
         };
         ctx.queue
             .write_buffer(&self.camera_buf, 0, bytemuck::bytes_of(&uniform));
+    }
 
-        encoder.clear_buffer(self.sorter.counts(), 0, None);
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("preprocess"),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(&self.preprocess_pipeline);
-            pass.set_bind_group(0, &self.preprocess_bg, &[]);
-            pass.dispatch_workgroups(self.num_splats.div_ceil(256), 1, 1);
-            pass.set_pipeline(&self.draw_prep_pipeline);
-            pass.set_bind_group(0, &self.draw_prep_bg, &[]);
-            pass.dispatch_workgroups(1, 1, 1);
-        }
-        self.sorter.encode(encoder);
-        {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("splat-draw"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: target,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(settings.background),
-                        store: wgpu::StoreOp::Store,
-                    },
-                    depth_slice: None,
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            pass.set_pipeline(&self.render_pipeline);
-            pass.set_bind_group(0, &self.draw_bg, &[]);
-            pass.draw_indirect(&self.draw_args, 0);
-        }
+    fn encode_preprocess(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        timestamp_writes: Option<wgpu::ComputePassTimestampWrites<'_>>,
+    ) {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("preprocess"),
+            timestamp_writes,
+        });
+        pass.set_pipeline(&self.preprocess_pipeline);
+        pass.set_bind_group(0, &self.preprocess_bg, &[]);
+        pass.dispatch_workgroups(self.num_splats.div_ceil(256), 1, 1);
+        pass.set_pipeline(&self.draw_prep_pipeline);
+        pass.set_bind_group(0, &self.draw_prep_bg, &[]);
+        pass.dispatch_workgroups(1, 1, 1);
+    }
+
+    fn encode_draw(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        target: &wgpu::TextureView,
+        background: wgpu::Color,
+        timestamp_writes: Option<wgpu::RenderPassTimestampWrites<'_>>,
+    ) {
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("splat-draw"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: target,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(background),
+                    store: wgpu::StoreOp::Store,
+                },
+                depth_slice: None,
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        pass.set_pipeline(&self.render_pipeline);
+        pass.set_bind_group(0, &self.draw_bg, &[]);
+        pass.draw_indirect(&self.draw_args, 0);
     }
 }
 
