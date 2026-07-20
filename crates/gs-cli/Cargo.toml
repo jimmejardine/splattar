@@ -17,7 +17,9 @@ profile = ["gs-wgpu/profile"]
 [dependencies]
 gs-core = { workspace = true }
 gs-io = { workspace = true }
+gs-kernels = { workspace = true }
 gs-wgpu = { workspace = true }
+glam = { workspace = true }
 gs-render = { workspace = true }
 gs-viewer = { workspace = true }
 gs-train = { workspace = true }

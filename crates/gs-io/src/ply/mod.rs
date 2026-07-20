@@ -3,6 +3,7 @@
 mod header;
 mod layout;
 mod reader;
+mod writer;
 
 use std::fs::File;
 use std::io::{BufReader, Read};
@@ -12,6 +13,7 @@ use gs_core::{PointCloud, SplatCloud};
 
 pub use header::{Element, PlyHeader, Property, PropertyType};
 pub use layout::{GaussianLayout, Layout, PointsLayout};
+pub use writer::write_3dgs_ply;
 
 /// What a .ply file turned out to contain.
 #[derive(Debug)]

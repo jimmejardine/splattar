@@ -45,8 +45,22 @@ enum Command {
     Run { video: PathBuf },
     /// Extend an existing project with another video (relocalize + merge). Arrives in M8.
     Add { video: PathBuf },
-    /// Validation harness: train on a posed video-sequence dataset. Arrives in M3.
-    Train { dataset: PathBuf },
+    /// Validation harness: train on a posed COLMAP-format dataset.
+    Train {
+        /// Dataset root (contains sparse/0 and images/).
+        dataset: PathBuf,
+        #[arg(long, default_value_t = 7000)]
+        iters: u32,
+        /// Image downscale factor (prefers a pre-scaled images_N directory).
+        #[arg(long, default_value_t = 4)]
+        downscale: u32,
+        /// Hold out every Nth view for evaluation (0 = train on everything).
+        #[arg(long, default_value_t = 8)]
+        holdout: u32,
+        /// Output path for the baked compat .ply.
+        #[arg(long, default_value = "trained.ply")]
+        out: PathBuf,
+    },
     /// Export the project as baked .ply/.spz (+ scene manifest). Arrives in M7.
     Export { project: PathBuf },
 }
@@ -97,9 +111,87 @@ fn main() -> anyhow::Result<()> {
         }
         Command::Run { .. } => bail!("`run` arrives in M7 — see PLAN.md"),
         Command::Add { .. } => bail!("`add` arrives in M8 — see PLAN.md"),
-        Command::Train { .. } => bail!("`train` arrives in M3 — see PLAN.md"),
+        Command::Train {
+            dataset,
+            iters,
+            downscale,
+            holdout,
+            out,
+        } => train(&dataset, iters, downscale, holdout, &out),
         Command::Export { .. } => bail!("`export` arrives in M7 — see PLAN.md"),
     }
+}
+
+fn train(
+    dataset: &std::path::Path,
+    iters: u32,
+    downscale: u32,
+    holdout: u32,
+    out: &std::path::Path,
+) -> anyhow::Result<()> {
+    use gs_kernels::RasterCamera;
+    use gs_train::{TrainConfig, TrainView, Trainer};
+
+    let ctx = pollster::block_on(gs_wgpu::GpuContext::new(gs_wgpu::backends_from_str(None)?))?;
+    let ds = gs_io::load_colmap(dataset, downscale)?;
+
+    let mut train_views = Vec::new();
+    let mut eval_views = Vec::new();
+    for (i, v) in ds.views.iter().enumerate() {
+        let view = TrainView {
+            camera: RasterCamera {
+                center: glam::Vec3::from_array(v.center),
+                quat: glam::Quat::from_array(v.quat),
+                focal: ds.focal,
+                sh_degree: 3,
+            },
+            target: v.image.clone(),
+        };
+        if holdout > 0 && (i as u32).is_multiple_of(holdout) {
+            eval_views.push(view);
+        } else {
+            train_views.push(view);
+        }
+    }
+    log::info!(
+        "training on {} views, evaluating on {} held-out",
+        train_views.len(),
+        eval_views.len()
+    );
+
+    let init = gs_train::init_from_sfm_points(&ds.points, 0x5eed);
+    let config = TrainConfig {
+        iters,
+        log_every: 500,
+        ..Default::default()
+    };
+    let mut trainer = Trainer::new(&ctx, ds.width, ds.height, train_views, init, config);
+    let start = std::time::Instant::now();
+    trainer.train(&ctx);
+    let elapsed = start.elapsed();
+
+    if !eval_views.is_empty() {
+        let psnr = trainer.eval_psnr(&ctx, &eval_views);
+        log::info!("held-out PSNR: {psnr:.2} dB over {} views", eval_views.len());
+    }
+    log::info!(
+        "trained {iters} iters in {elapsed:.0?} ({:.1} it/s)",
+        iters as f64 / elapsed.as_secs_f64()
+    );
+
+    let scene = trainer.read_scene(&ctx);
+    gs_io::write_3dgs_ply(
+        out,
+        scene.num,
+        &scene.positions,
+        &scene.scales,
+        &scene.quats,
+        &scene.opacities,
+        &scene.sh,
+    )?;
+    log::info!("wrote {} ({} surfels, flattened compat layout)", out.display(), scene.num);
+    println!("done: {} — view it with `gs-cli view {}`", out.display(), out.display());
+    Ok(())
 }
 
 /// Headless golden regeneration: renders the three canonical poses through the

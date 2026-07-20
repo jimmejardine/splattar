@@ -47,6 +47,28 @@ ever changes.
 | GPU backward ↔ CPU analytic, all classes | ≤ 1e-4 rel target | **worst 9.1e-4, typical ≤ 1.6e-4** (f32 CAS-accumulation noise on top of f64-certified analytics; asserted at 2e-3) |
 | 50-surfel / 128×128 overfit (host Adam over GPU grads) | PSNR > 35 dB | **39.57 dB** at 3k iters (35.7 dB by iter 250) |
 
+## M3 — trainer on posed sequences (2026-07-20)
+
+| Check | Gate | Measured |
+|---|---|---|
+| Adam-in-WGSL vs CPU reference (all activation modes) | exact | pass (≤1e-5 after 5 steps, incl. exp/sigmoid chain rules) |
+| SSIM/L1 loss kernels | correct gradients | validated end-to-end by training convergence (analytic backward via 3 blurred coefficient maps; self-adjoint zero-pad blur) |
+| Synthetic posed-sequence training (300 surfels from scratch, 30 views, 128²) | held-out PSNR > 27 dB | **28.41 dB** (from 19.69 dB at init), 6k iters ≈ 45 s |
+| Compat .ply export | round-trip exact | pass (write → read → activated values match; third scale flattened) |
+
+Machinery landed: raw-space parameters (log-scales, logit-opacities) with
+in-kernel activation chains; exponential position-LR decay scaled by scene
+extent; COLMAP binary sparse loader (SIMPLE_PINHOLE/PINHOLE/SIMPLE_RADIAL,
+convention conversion documented in gs-io::colmap) + SfM-point surfel init
+(voxel-hash 3-NN scales); `gs-cli train <dataset>` → trains → held-out PSNR →
+bakes a compat .ply viewable with `gs-cli view`.
+
+**Open for real-data validation:** the "within ~1 dB of published 2DGS" and
+"30k iters ≤ 60 min" gates need a real COLMAP dataset (e.g. Mip-NeRF360
+room/counter, ~12 GB download) and M4's MCMC densification — a fixed
+SfM-initialized budget cannot reach published numbers by design. Re-measure
+after M4 with a dataset on disk.
+
 Notes: forward = explicit ray–splat intersection in camera space (Cramer on
 scalar triple products — equivalent to the 2DGS homography form, directly
 differentiable); low-pass = max(G_ray, G_screen), σ²=0.5. Backward follows the
