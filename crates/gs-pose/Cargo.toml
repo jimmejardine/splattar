@@ -6,7 +6,13 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
-# nalgebra (rust-cv ecosystem) arrives in M6 and stays quarantined in this crate;
-# convert to glam at the API boundary (see CLAUDE.md).
+# nalgebra stays quarantined in this crate; convert to glam at the API
+# boundary (see CLAUDE.md).
 [dependencies]
 gs-core = { workspace = true }
+glam = { workspace = true }
+nalgebra = { workspace = true }
+log = { workspace = true }
+
+[dev-dependencies]
+rand = { workspace = true }
