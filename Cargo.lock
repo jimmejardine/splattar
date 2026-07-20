@@ -852,10 +852,16 @@ dependencies = [
 name = "gs-train"
 version = "0.1.0"
 dependencies = [
+ "bytemuck",
+ "env_logger",
+ "glam",
  "gs-core",
  "gs-io",
  "gs-kernels",
  "gs-wgpu",
+ "log",
+ "pollster",
+ "wgpu",
 ]
 
 [[package]]

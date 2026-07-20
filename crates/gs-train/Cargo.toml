@@ -11,3 +11,11 @@ gs-core = { workspace = true }
 gs-io = { workspace = true }
 gs-wgpu = { workspace = true }
 gs-kernels = { workspace = true }
+wgpu = { workspace = true }
+bytemuck = { workspace = true }
+glam = { workspace = true }
+log = { workspace = true }
+
+[dev-dependencies]
+pollster = { workspace = true }
+env_logger = { workspace = true }
