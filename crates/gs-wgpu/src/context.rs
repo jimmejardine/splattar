@@ -51,6 +51,10 @@ impl GpuContext {
         let required_limits = wgpu::Limits {
             max_storage_buffer_binding_size: adapter_limits.max_storage_buffer_binding_size,
             max_buffer_size: adapter_limits.max_buffer_size,
+            // The viewer preprocess binds 9+ storage buffers (default limit: 8).
+            max_storage_buffers_per_shader_stage: adapter_limits
+                .max_storage_buffers_per_shader_stage
+                .min(16),
             ..wgpu::Limits::default()
         };
 

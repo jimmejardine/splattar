@@ -15,5 +15,7 @@ bytemuck = { workspace = true }
 log = { workspace = true }
 
 [dev-dependencies]
+gs-io = { workspace = true }
 image = { workspace = true }
 pollster = { workspace = true }
+env_logger = { workspace = true }

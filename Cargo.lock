@@ -830,8 +830,10 @@ name = "gs-render"
 version = "0.1.0"
 dependencies = [
  "bytemuck",
+ "env_logger",
  "glam",
  "gs-core",
+ "gs-io",
  "gs-wgpu",
  "image",
  "log",
