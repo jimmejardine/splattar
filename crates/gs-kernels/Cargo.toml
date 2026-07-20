@@ -9,3 +9,9 @@ rust-version.workspace = true
 [dependencies]
 gs-core = { workspace = true }
 gs-wgpu = { workspace = true }
+wgpu = { workspace = true }
+bytemuck = { workspace = true }
+log = { workspace = true }
+
+[dev-dependencies]
+pollster = { workspace = true }

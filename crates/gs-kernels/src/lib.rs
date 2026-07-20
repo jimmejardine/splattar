@@ -2,4 +2,9 @@
 //!
 //! Any change here must pass the gs-cpu-ref gradient checks — wrong gradients
 //! fail silently (see CLAUDE.md Verification rules). Shaders live in `src/shaders/`
-//! as `<stage>_fwd.wgsl` / `<stage>_bwd.wgsl` pairs.
+//! as `<stage>_fwd.wgsl` / `<stage>_bwd.wgsl` pairs (binning/utility kernels
+//! are exempt from the pair naming — they have no backward).
+
+pub mod binning;
+
+pub use binning::{TileBinner, TileRect};

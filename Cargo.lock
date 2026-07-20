@@ -814,8 +814,12 @@ dependencies = [
 name = "gs-kernels"
 version = "0.1.0"
 dependencies = [
+ "bytemuck",
  "gs-core",
  "gs-wgpu",
+ "log",
+ "pollster",
+ "wgpu",
 ]
 
 [[package]]
