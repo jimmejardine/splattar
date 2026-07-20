@@ -8,4 +8,11 @@ rust-version.workspace = true
 
 [dependencies]
 gs-core = { workspace = true }
+mp4 = { workspace = true }
+ash = { workspace = true }
+log = { workspace = true }
 thiserror = { workspace = true }
+
+[dev-dependencies]
+image = { workspace = true }
+env_logger = { workspace = true }

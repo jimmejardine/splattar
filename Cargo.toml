@@ -1,4 +1,4 @@
-# Splattar workspace. See PLAN.md for architecture and CLAUDE.md for conventions.
+﻿# Splattar workspace. See PLAN.md for architecture and CLAUDE.md for conventions.
 [workspace]
 resolver = "2"
 members = [
@@ -39,7 +39,7 @@ gs-pose = { path = "crates/gs-pose" }
 gs-render = { path = "crates/gs-render" }
 gs-viewer = { path = "crates/gs-viewer" }
 
-# external — pure Rust only; no crate that compiles or links C/C++ (see CLAUDE.md)
+# external â€” pure Rust only; no crate that compiles or links C/C++ (see CLAUDE.md)
 wgpu = "30"
 winit = "0.30"
 glam = { version = "0.33", features = ["bytemuck"] }
@@ -48,6 +48,11 @@ half = { version = "2", features = ["bytemuck"] }
 clap = { version = "4", features = ["derive"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 pollster = "0.4"
+mp4 = "0.14"
+# H.264 decode is HARDWARE (NVDEC via Vulkan Video through ash — pure Rust
+# bindings; the driver is a system runtime). Software bake-off outcome:
+# rusty_h264 is CAVLC-only (phones emit CABAC); NihAV decodes but is AGPL.
+ash = "0.38"
 thiserror = "2"
 anyhow = "1"
 log = "0.4"

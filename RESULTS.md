@@ -78,3 +78,50 @@ quaternion grads chain on the host from the GPU's dl/dR matrix using the same
 f64 math as the oracle. Gradients flow to: position, scales, quaternion,
 opacity, SH (deg 0–3), camera center, camera rotation, focal. Depth + normal
 render targets exist (no losses on them until M4).
+
+## M4 — 2DGS quality: aux losses, regularizers, MCMC (2026-07-20)
+
+| Check | Gate | Measured |
+|---|---|---|
+| Aux-loss gradients (depth, normal, depth-distortion), CPU FD ↔ analytic | ≤ 1e-2 rel | pass (f64 oracle; distortion via prefix-recovery reverse walk) |
+| GPU backward ↔ CPU analytic with aux losses active | agreement | **≤ 6e-3 surfel params, ≤ 3e-2 camera-global** (f32 cancellation in distortion prefix recovery + whole-image CAS sums; color-only path stays at 2e-3) |
+| Synthetic training, all M4 features on (distortion + normal loss, regularizers, progressive SH, MCMC) | no regression vs M3 baseline | **28.56 dB** (baseline same-config 28.59 dB) |
+| MCMC relocation | budget fixed, no NaN/collapse | pass (opacity-sampled relocation α'=1−√(1−α), PCG-hash noise gated by exp(−5α)) |
+
+Landed: fused L1+D-SSIM backward; depth-distortion loss (per-ray pairwise,
+prefix-recovery A_i = W_end − suffix_w − w in the reverse walk, normalized by
+pixel count — unnormalized it was 16,000× too strong and collapsed training to
+11.5 dB); normal-consistency loss (normals from unprojected-depth forward
+differences, gather adjoint second pass, alpha/orientation detached);
+opacity/scale regularizers folded into the Adam kernel's activation chain;
+progressive SH promotion; MCMC relocation + noise injection at a fixed surfel
+budget (SoA buffers never reallocate, per CLAUDE.md).
+
+Also hardened for real scenes: Windows TDR (~2 s GPU watchdog) forced two-way
+step submission splits and a 64 px cap on the binning tile-rect radius. The cap
+is part of the shipped forward model, so the CPU oracle mirrors the exact
+tile-rect truncation (`covers_pixel`) — three-way agreement re-verified after
+the change. Mip-NeRF360 `room` (311 views @ 779×519, 112k SfM points, 300k
+budget) training runs at ~0.7 it/s; end-to-end numbers to be recorded when the
+7k-iter run completes.
+
+## M5 — video ingest: MP4 demux + NVDEC H.264 + keyframes (2026-07-20)
+
+| Check | Gate | Measured |
+|---|---|---|
+| Android walkthrough decode (478×850 portrait, H.264 High, CABAC, in-hardware) | ≥ 60 frames, luma variance sane, PTS strictly increasing | **pass** — 90 frames in the gate window, full 2,323-sample stream decoded by the keyframe test, both tests in **4.7 s** total |
+| VFR-safe PTS | from sample table, never frame/fps | pass (start_time + rendering_offset over timescale) |
+| Keyframe promotion (sharpest-in-window, Laplacian variance) | ≥ 8 keyframes, ≥ 0.2 s spacing, increasing PTS | pass (0.5 s windows, 12 max) |
+| Purity audit | no C/C++ build deps, no copyleft codec code | pass — decode is Vulkan Video (NVDEC) through ash; the GPU driver is a system runtime |
+
+Decoder bake-off that led here: `rusty_h264` is CAVLC-only and silently skips
+CABAC slices (phone footage is CABAC — decoded 0 frames); `oxideav-h264` is
+I-slice-only; NihAV decodes everything but is AGPL-3.0. Decision: hardware
+decode via Vulkan Video — zero third-party codec code, works for any H.264
+the GPU supports, and the same session machinery extends to HEVC (iPhone)
+later. Implementation: full SPS/PPS/slice-header parsing in `gs-video::h264`
+(Exp-Golomb, RBSP, scaling lists, POC type 0/2), MP4 demux via the pure-Rust
+`mp4` crate, `NvDecoder` with coincide-mode NV12 DPB, sliding-window
+eviction, and per-plane readback → cropped I420. Scope is the phone subset:
+progressive 4:2:0 8-bit, I/P slices (no B-frames in phone walkthrough video —
+verified all composition offsets are 0 in the samples).
