@@ -24,6 +24,8 @@ struct AdamUniform {
     bc2_inv: f32,
     n: u32,
     activation: u32,
+    reg: f32,
+    _pad: [f32; 3],
 }
 
 #[allow(dead_code)] // moment buffers are held to keep the bind group valid
@@ -32,6 +34,8 @@ pub struct ParamClass {
     pub n: u32,
     pub activation: Activation,
     pub lr: f32,
+    /// Constant added to dL/d(activated) — L1 regularizer (λ/count).
+    pub reg: f32,
     /// Raw parameters (identity classes alias the activated buffer's content
     /// layout but live in their own buffer; `activate` copies through).
     pub raw: wgpu::Buffer,
@@ -125,6 +129,7 @@ impl Optimizer {
             n,
             activation,
             lr,
+            reg: 0.0,
             raw,
             m,
             v,
@@ -142,6 +147,22 @@ impl Optimizer {
         self.classes.iter_mut().find(|c| c.name == name).unwrap().lr = lr;
     }
 
+    pub fn set_reg(&mut self, name: &str, reg: f32) {
+        self.classes.iter_mut().find(|c| c.name == name).unwrap().reg = reg;
+    }
+
+    /// Zero the Adam moments for specific parameter indices (MCMC relocation:
+    /// moved surfels must not inherit momentum). `comps` = floats per index.
+    pub fn zero_moments(&self, ctx: &GpuContext, name: &str, indices: &[u32], comps: u32) {
+        let c = self.class(name);
+        let zeros = vec![0f32; comps as usize];
+        for &i in indices {
+            let offset = (i * comps) as u64 * 4;
+            ctx.queue.write_buffer(&c.m, offset, bytemuck::cast_slice(&zeros));
+            ctx.queue.write_buffer(&c.v, offset, bytemuck::cast_slice(&zeros));
+        }
+    }
+
     fn write_uniforms(&self, ctx: &GpuContext, t: u32) {
         let beta1 = 0.9f32;
         let beta2 = 0.999f32;
@@ -155,6 +176,8 @@ impl Optimizer {
                 bc2_inv: 1.0 / (1.0 - beta2.powi(t as i32)),
                 n: c.n,
                 activation: c.activation as u32,
+                reg: c.reg,
+                _pad: [0.0; 3],
             };
             ctx.queue.write_buffer(&c.uniform, 0, bytemuck::bytes_of(&u));
         }

@@ -3,11 +3,13 @@
 //! harness; incremental anchor-out submap building arrives in M7).
 
 pub mod init;
+pub mod normal_loss;
 pub mod optim;
 pub mod ssim;
 pub mod trainer;
 
 pub use init::init_from_sfm_points;
+pub use normal_loss::NormalLoss;
 pub use optim::{Activation, Optimizer};
 pub use ssim::SsimLoss;
 pub use trainer::{ExportScene, InitialSurfels, TrainConfig, TrainView, Trainer};

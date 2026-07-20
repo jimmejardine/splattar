@@ -15,6 +15,12 @@ struct AdamParams {
     n: u32,
     // 0 = identity, 1 = exp (scales), 2 = sigmoid (opacity).
     activation: u32,
+    // L1 regularizer on the ACTIVATED value: adds `reg` to dL/dact
+    // (host passes λ/count for a mean-based penalty; MCMC opacity/scale priors).
+    reg: f32,
+    _pad0: f32,
+    _pad1: f32,
+    _pad2: f32,
 }
 
 @group(0) @binding(0) var<uniform> ap: AdamParams;
@@ -41,7 +47,7 @@ fn adam_step(@builtin(global_invocation_id) gid: vec3<u32>) {
     if i >= ap.n {
         return;
     }
-    let g = grad_act[i] * dact(raw[i]);
+    let g = (grad_act[i] + ap.reg) * dact(raw[i]);
     let mi = ap.beta1 * m[i] + (1.0 - ap.beta1) * g;
     let vi = ap.beta2 * v[i] + (1.0 - ap.beta2) * g * g;
     m[i] = mi;
