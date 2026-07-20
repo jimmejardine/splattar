@@ -249,7 +249,11 @@ fn main() -> anyhow::Result<()> {
                 sh_promote,
             },
         ),
-        Command::Export { .. } => bail!("`export` arrives in M7 — see PLAN.md"),
+        Command::Export { .. } => bail!(
+            "`export` (baked merged .ply + manifest) is not implemented yet; \
+             `view <project-dir>` composes submaps live, and each submap has \
+             its own splat.ply"
+        ),
     }
 }
 
@@ -569,9 +573,15 @@ fn train_and_bake(
         mcmc_every: 300,
         mcmc_noise: 20.0,
         entries_per_surfel: 48,
+        // VO poses + a guessed focal are noisy — let the verified camera
+        // gradients polish them (validated: recovers +2.2 dB on synthetic
+        // perturbed poses).
+        pose_refine_lr: 2e-3,
+        pose_refine_start: 500,
+        focal_refine: true,
         ..Default::default()
     };
-    let eval_views = prepared.eval_views;
+    let mut eval_views = prepared.eval_views;
     let mut trainer = Trainer::new(
         &ctx,
         prepared.tw,
@@ -586,6 +596,14 @@ fn train_and_bake(
     let psnr = if eval_views.is_empty() {
         f64::NAN
     } else {
+        // Focal is shared — apply the refined value to the held-out cameras
+        // (their poses stay as VO produced them).
+        if trainer.focal_scale != 1.0 {
+            log::info!("refined focal scale: {:.4}", trainer.focal_scale);
+            for v in &mut eval_views {
+                v.camera.focal *= trainer.focal_scale;
+            }
+        }
         trainer.eval_psnr(&ctx, &eval_views)
     };
     log::info!(

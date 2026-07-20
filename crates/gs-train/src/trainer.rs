@@ -50,6 +50,16 @@ pub struct TrainConfig {
     pub mcmc_dead: f32,
     /// Position exploration noise multiplier (× current position LR; 0 = off).
     pub mcmc_noise: f32,
+    // --- M7: pose refinement (VO poses are noisy; the rasterizer's camera
+    // gradients are three-way verified, so let them polish the cameras) ---
+    /// Base LR for per-view pose refinement (0 = off). Rotation uses it
+    /// directly; camera center uses it × scene extent.
+    pub pose_refine_lr: f32,
+    /// Iteration at which pose refinement starts (the model must be good
+    /// enough first that pose gradients point somewhere sensible).
+    pub pose_refine_start: u32,
+    /// Also refine the (shared) focal length in log-space.
+    pub focal_refine: bool,
 }
 
 impl Default for TrainConfig {
@@ -75,6 +85,9 @@ impl Default for TrainConfig {
             mcmc_every: 0,
             mcmc_dead: 0.005,
             mcmc_noise: 0.0,
+            pose_refine_lr: 0.0,
+            pose_refine_start: 500,
+            focal_refine: false,
         }
     }
 }
@@ -103,6 +116,15 @@ pub struct Trainer {
     noise_pipeline: wgpu::ComputePipeline,
     noise_bg: wgpu::BindGroup,
     noise_uniform: wgpu::Buffer,
+    // Pose-refinement Adam state: per-view [rot(3), center(3)] + shared
+    // log-focal. Host-side — 6 params per view is nothing.
+    pose_m: Vec<[f32; 6]>,
+    pose_v: Vec<[f32; 6]>,
+    pose_t: Vec<u32>,
+    focal_state: (f32, f32, u32),
+    /// Multiplier on the initial focal (shared across views), refined in
+    /// log-space when `focal_refine` is on.
+    pub focal_scale: f32,
 }
 
 #[repr(C)]
@@ -239,6 +261,7 @@ impl Trainer {
         ctx.queue.submit([encoder.finish()]);
 
         let seed = config.seed;
+        let n_views = views.len();
         Self {
             raster,
             optim,
@@ -252,6 +275,11 @@ impl Trainer {
             noise_pipeline,
             noise_bg,
             noise_uniform,
+            pose_m: vec![[0.0; 6]; n_views],
+            pose_v: vec![[0.0; 6]; n_views],
+            pose_t: vec![0; n_views],
+            focal_state: (0.0, 0.0, 0),
+            focal_scale: 1.0,
         }
     }
 
@@ -289,6 +317,7 @@ impl Trainer {
             bytemuck::cast_slice(&self.views[view_idx].target),
         );
         let mut camera = self.views[view_idx].camera.clone();
+        camera.focal *= self.focal_scale;
         // Progressive SH unlock.
         if let Some(deg) = iter.checked_div(self.config.sh_promote_every) {
             camera.sh_degree = deg.min(camera.sh_degree);
@@ -335,6 +364,12 @@ impl Trainer {
         }
         ctx.queue.submit([encoder.finish()]);
 
+        // Pose refinement: chain the (parity-verified) camera gradients on
+        // the host and Adam-step this view's rotation/center + shared focal.
+        if self.config.pose_refine_lr > 0.0 && iter >= self.config.pose_refine_start {
+            self.refine_pose(ctx, view_idx, &camera);
+        }
+
         // Periodic dead-surfel relocation.
         if self.config.mcmc_every > 0
             && iter > 0
@@ -344,6 +379,73 @@ impl Trainer {
             self.mcmc_relocate(ctx);
         }
         view_idx
+    }
+
+    /// Host-side camera update from `grad_cam`:
+    /// layout [dl/dR (col-major 3×3), dl/dcenter (3), dl/dfocal, …].
+    /// Rotation uses the right-perturbation R' = R·exp([δ]×): the Riemannian
+    /// gradient is the antisymmetric part of B = Rᵀ·(dl/dR).
+    fn refine_pose(&mut self, ctx: &GpuContext, view_idx: usize, camera: &RasterCamera) {
+        let g: Vec<f32> = bytemuck::cast_slice(&gs_wgpu::buffers::readback(
+            &ctx.device,
+            &ctx.queue,
+            &self.raster.grad_cam,
+        ))
+        .to_vec();
+        if g.iter().take(13).any(|v| !v.is_finite()) {
+            return;
+        }
+        let a = glam::Mat3::from_cols(
+            glam::Vec3::new(g[0], g[1], g[2]),
+            glam::Vec3::new(g[3], g[4], g[5]),
+            glam::Vec3::new(g[6], g[7], g[8]),
+        );
+        let r = glam::Mat3::from_quat(camera.quat);
+        let b = r.transpose() * a;
+        let grad = [
+            b.col(1)[2] - b.col(2)[1], // B32 − B23
+            b.col(2)[0] - b.col(0)[2], // B13 − B31
+            b.col(0)[1] - b.col(1)[0], // B21 − B12
+            g[9],
+            g[10],
+            g[11],
+        ];
+
+        // Adam (β1 0.9, β2 0.999) with per-block LRs.
+        let t = self.pose_t[view_idx] + 1;
+        self.pose_t[view_idx] = t;
+        let bc1 = 1.0 - 0.9f32.powi(t as i32);
+        let bc2 = 1.0 - 0.999f32.powi(t as i32);
+        let lr_rot = self.config.pose_refine_lr;
+        let lr_cen = self.config.pose_refine_lr * self.extent;
+        let mut step = [0.0f32; 6];
+        for k in 0..6 {
+            let m = &mut self.pose_m[view_idx][k];
+            let v = &mut self.pose_v[view_idx][k];
+            *m = 0.9 * *m + 0.1 * grad[k];
+            *v = 0.999 * *v + 0.001 * grad[k] * grad[k];
+            let mhat = *m / bc1;
+            let vhat = *v / bc2;
+            let lr = if k < 3 { lr_rot } else { lr_cen };
+            step[k] = lr * mhat / (vhat.sqrt() + 1e-10);
+        }
+        let view = &mut self.views[view_idx];
+        let delta = glam::Vec3::new(-step[0], -step[1], -step[2]);
+        view.camera.quat = (view.camera.quat * glam::Quat::from_scaled_axis(delta)).normalize();
+        view.camera.center -= glam::Vec3::new(step[3], step[4], step[5]);
+
+        // Shared focal in log-space (dL/d log f = f · dL/df).
+        if self.config.focal_refine {
+            let gf = g[12] * camera.focal;
+            let (ref mut m, ref mut v, ref mut tf) = self.focal_state;
+            *tf += 1;
+            *m = 0.9 * *m + 0.1 * gf;
+            *v = 0.999 * *v + 0.001 * gf * gf;
+            let mhat = *m / (1.0 - 0.9f32.powi(*tf as i32));
+            let vhat = *v / (1.0 - 0.999f32.powi(*tf as i32));
+            let lr_f = self.config.pose_refine_lr * 0.5;
+            self.focal_scale *= (-lr_f * mhat / (vhat.sqrt() + 1e-10)).exp();
+        }
     }
 
     /// MCMC relocation: dead surfels (activated opacity below threshold) move

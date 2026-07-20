@@ -222,3 +222,99 @@ fn trains_with_m4_features_enabled() {
     eprintln!("M4-featured held-out PSNR: {psnr:.2} dB (gate: > 26 dB)");
     assert!(psnr > 26.0, "M4-featured training regressed: {psnr:.2} dB");
 }
+
+/// M7 gate: pose refinement recovers deliberately perturbed training poses.
+/// Same synthetic scene, but every training camera gets a small rotation +
+/// center error (like monocular VO noise). Without refinement this caps PSNR
+/// hard; with refinement the trainer should climb back near the clean bar.
+#[test]
+#[ignore = "slow end-to-end training (~90 s GPU); run with --ignored"]
+fn pose_refinement_recovers_perturbed_poses() {
+    let Some(ctx) = context() else { return };
+
+    let gt = random_surfels(0xfeedbeef, N_GT, 1.2, true);
+    let gt_raster = Rasterizer::new(&ctx, N_GT as u32, SIZE, SIZE, (N_GT * 64) as u32);
+    gt_raster.upload_scene(
+        &ctx,
+        &SceneInput {
+            positions: &gt.positions,
+            scales: &gt.scales,
+            quats: &gt.quats,
+            opacities: &gt.opacities,
+            sh: &gt.sh,
+            sh_coeffs: 1,
+        },
+    );
+    let render_gt = |camera: &RasterCamera| -> Vec<[f32; 4]> {
+        let mut encoder = ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        gt_raster.forward(&ctx, &mut encoder, camera, N_GT as u32);
+        ctx.queue.submit([encoder.finish()]);
+        bytemuck::cast_slice(&gs_wgpu::buffers::readback(
+            &ctx.device,
+            &ctx.queue,
+            &gt_raster.out_color,
+        ))
+        .to_vec()
+    };
+
+    // Targets rendered from TRUE poses; trainer is given PERTURBED cameras
+    // (eval poses stay true — they measure whether the model is right).
+    let mut rng = 0xabcdef123u64;
+    let mut train_views = Vec::new();
+    let mut eval_views = Vec::new();
+    for i in 0..35 {
+        let angle = i as f32 / 35.0 * std::f32::consts::TAU;
+        let camera = orbit_camera(angle, 1.0 + (i % 3) as f32 * 0.5, 4.0);
+        let target = render_gt(&camera);
+        if i % 7 == 3 {
+            eval_views.push(TrainView { target, camera });
+        } else {
+            let mut bad = camera.clone();
+            let axis = glam::Vec3::new(
+                uni(&mut rng, -1.0, 1.0),
+                uni(&mut rng, -1.0, 1.0),
+                uni(&mut rng, -1.0, 1.0),
+            )
+            .normalize();
+            bad.quat = (bad.quat * glam::Quat::from_axis_angle(axis, 0.035)).normalize();
+            bad.center += glam::Vec3::new(
+                uni(&mut rng, -0.08, 0.08),
+                uni(&mut rng, -0.08, 0.08),
+                uni(&mut rng, -0.08, 0.08),
+            );
+            train_views.push(TrainView { target, camera: bad });
+        }
+    }
+
+    let run = |pose_lr: f32| -> f64 {
+        let init = random_surfels(0x12345, N_TRAIN, 1.2, false);
+        let config = TrainConfig {
+            iters: 6000,
+            log_every: 6000,
+            pose_refine_lr: pose_lr,
+            pose_refine_start: 500,
+            ..Default::default()
+        };
+        let mut trainer = Trainer::new(
+            &ctx,
+            SIZE,
+            SIZE,
+            train_views.clone(),
+            init,
+            config,
+        );
+        trainer.train(&ctx);
+        trainer.eval_psnr(&ctx, &eval_views)
+    };
+
+    let without = run(0.0);
+    let with = run(2e-3);
+    eprintln!("perturbed poses: PSNR {without:.2} dB frozen vs {with:.2} dB refined");
+    assert!(
+        with > without + 1.5,
+        "pose refinement gained too little: {without:.2} -> {with:.2} dB"
+    );
+    assert!(with > 25.0, "refined PSNR too low: {with:.2} dB");
+}
