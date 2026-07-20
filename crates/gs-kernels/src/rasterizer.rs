@@ -63,7 +63,8 @@ pub struct Rasterizer {
     pub quats: wgpu::Buffer,
     pub opacities: wgpu::Buffer,
     pub sh: wgpu::Buffer,
-    surf_cam: wgpu::Buffer,
+    /// Kept alive by the bind groups; exposed for future debug tooling.
+    pub surf_cam: wgpu::Buffer,
     pub out_color: wgpu::Buffer,
     pub out_aux: wgpu::Buffer,
     pub out_normal: wgpu::Buffer,
@@ -73,6 +74,20 @@ pub struct Rasterizer {
     prep_bg: wgpu::BindGroup,
     fwd_pipeline: wgpu::ComputePipeline,
     fwd_bg: wgpu::BindGroup,
+    // Backward: dL/d(color image) in, parameter gradients out.
+    pub dl_dcolor: wgpu::Buffer,
+    grad_geom: wgpu::Buffer,
+    pub grad_pos: wgpu::Buffer,
+    pub grad_scales: wgpu::Buffer,
+    pub grad_quat: wgpu::Buffer,
+    pub grad_opacity: wgpu::Buffer,
+    pub grad_sh: wgpu::Buffer,
+    /// [dl_dR_cam 9, dcam_center 3, dfocal 1, pad 3] as f32 bits.
+    pub grad_cam: wgpu::Buffer,
+    bwd_pipeline: wgpu::ComputePipeline,
+    bwd_bg: wgpu::BindGroup,
+    geom_bwd_pipeline: wgpu::ComputePipeline,
+    geom_bwd_bg: wgpu::BindGroup,
 }
 
 fn bind(binding: u32, buffer: &wgpu::Buffer) -> wgpu::BindGroupEntry<'_> {
@@ -134,6 +149,25 @@ impl Rasterizer {
             include_str!("shaders/rasterize_fwd.wgsl"),
             "rasterize_fwd",
         );
+        let bwd_pipeline = make(
+            "rasterize-bwd",
+            include_str!("shaders/rasterize_bwd.wgsl"),
+            "rasterize_bwd",
+        );
+        let geom_bwd_pipeline = make(
+            "surfel-prep-bwd",
+            include_str!("shaders/surfel_prep_bwd.wgsl"),
+            "surfel_prep_bwd",
+        );
+
+        let dl_dcolor = buffers::storage_empty(device, "raster-dl-dcolor", px * 16);
+        let grad_geom = buffers::storage_empty(device, "raster-grad-geom", n * 13 * 4);
+        let grad_pos = buffers::storage_empty(device, "raster-grad-pos", n * 16);
+        let grad_scales = buffers::storage_empty(device, "raster-grad-scales", n * 8);
+        let grad_quat = buffers::storage_empty(device, "raster-grad-quat", n * 16);
+        let grad_opacity = buffers::storage_empty(device, "raster-grad-opacity", n * 4);
+        let grad_sh = buffers::storage_empty(device, "raster-grad-sh", n * SH_FLOATS as u64 * 4);
+        let grad_cam = buffers::storage_empty(device, "raster-grad-cam", 16 * 4);
 
         let prep_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("surfel-prep-bg"),
@@ -166,6 +200,42 @@ impl Rasterizer {
             ],
         });
 
+        let bwd_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("rasterize-bwd-bg"),
+            layout: &bwd_pipeline.get_bind_group_layout(0),
+            entries: &[
+                bind(0, &camera_buf),
+                bind(1, &surf_cam),
+                bind(2, binner.sorted_entries()),
+                bind(3, &binner.entry_items),
+                bind(4, &binner.ranges),
+                bind(5, &dl_dcolor),
+                bind(6, &out_aux),
+                bind(7, &out_ncontrib),
+                bind(8, &grad_geom),
+                bind(9, &grad_cam),
+            ],
+        });
+        let geom_bwd_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("surfel-prep-bwd-bg"),
+            layout: &geom_bwd_pipeline.get_bind_group_layout(0),
+            entries: &[
+                bind(0, &camera_buf),
+                bind(1, &positions),
+                bind(2, &scales),
+                bind(3, &quats),
+                bind(4, &sh),
+                bind(5, &surf_cam),
+                bind(6, &grad_geom),
+                bind(7, &grad_pos),
+                bind(8, &grad_scales),
+                bind(9, &grad_quat),
+                bind(10, &grad_opacity),
+                bind(11, &grad_sh),
+                bind(12, &grad_cam),
+            ],
+        });
+
         Self {
             capacity,
             width,
@@ -188,6 +258,48 @@ impl Rasterizer {
             prep_bg,
             fwd_pipeline,
             fwd_bg,
+            dl_dcolor,
+            grad_geom,
+            grad_pos,
+            grad_scales,
+            grad_quat,
+            grad_opacity,
+            grad_sh,
+            grad_cam,
+            bwd_pipeline,
+            bwd_bg,
+            geom_bwd_pipeline,
+            geom_bwd_bg,
+        }
+    }
+
+    /// Record the backward pass. Caller has uploaded dL/d(color) into
+    /// [`dl_dcolor`] and already recorded a matching [`forward`] this frame.
+    pub fn backward(&self, encoder: &mut wgpu::CommandEncoder, num_surfels: u32) {
+        encoder.clear_buffer(&self.grad_geom, 0, None);
+        encoder.clear_buffer(&self.grad_cam, 0, None);
+        encoder.clear_buffer(&self.grad_pos, 0, None);
+        encoder.clear_buffer(&self.grad_scales, 0, None);
+        encoder.clear_buffer(&self.grad_quat, 0, None);
+        encoder.clear_buffer(&self.grad_opacity, 0, None);
+        encoder.clear_buffer(&self.grad_sh, 0, None);
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("rasterize-bwd"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.bwd_pipeline);
+            pass.set_bind_group(0, &self.bwd_bg, &[]);
+            pass.dispatch_workgroups(self.tiles_x, self.tiles_y, 1);
+        }
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("surfel-prep-bwd"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.geom_bwd_pipeline);
+            pass.set_bind_group(0, &self.geom_bwd_bg, &[]);
+            pass.dispatch_workgroups(num_surfels.div_ceil(256), 1, 1);
         }
     }
 

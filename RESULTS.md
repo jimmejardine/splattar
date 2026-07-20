@@ -37,3 +37,22 @@ plus a tiny totals kernel: 3.2× total speedup, no digit-width change needed.
 Tile binning's correctness leans on sort *stability* (two 32-bit sorts ≡ one
 64-bit tile‖depth sort); the binning property test is the canary if the sort
 ever changes.
+
+## M2 — differentiable 2DGS rasterizer (2026-07-20)
+
+| Check | Gate | Measured |
+|---|---|---|
+| CPU analytic ↔ finite differences (f64), all parameter classes | ≤ 1e-2 rel | **worst 4.4e-7** (pos/scales/quat/opacity/SH0-3/cam center/cam quat/focal) |
+| GPU forward ↔ CPU oracle (color) | structural agreement | **max 3.3e-6**, mean ~3e-8 per channel |
+| GPU backward ↔ CPU analytic, all classes | ≤ 1e-4 rel target | **worst 9.1e-4, typical ≤ 1.6e-4** (f32 CAS-accumulation noise on top of f64-certified analytics; asserted at 2e-3) |
+| 50-surfel / 128×128 overfit (host Adam over GPU grads) | PSNR > 35 dB | **39.57 dB** at 3k iters (35.7 dB by iter 250) |
+
+Notes: forward = explicit ray–splat intersection in camera space (Cramer on
+scalar triple products — equivalent to the 2DGS homography form, directly
+differentiable); low-pass = max(G_ray, G_screen), σ²=0.5. Backward follows the
+CLAUDE.md accumulation mandate: per-tile shared-memory atomic<u32> CAS float
+adds flushed per chunk, then a per-surfel geometry chain kernel; camera
+quaternion grads chain on the host from the GPU's dl/dR matrix using the same
+f64 math as the oracle. Gradients flow to: position, scales, quaternion,
+opacity, SH (deg 0–3), camera center, camera rotation, focal. Depth + normal
+render targets exist (no losses on them until M4).
