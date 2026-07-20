@@ -1,0 +1,13 @@
+[package]
+name = "gs-io"
+description = "Project format (appendable source of truth) and export writers: .ply (3DGS + surfel layouts), .spz, scene-manifest sidecar; dataset harnesses; checkpoints."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+gs-core = { workspace = true }
+thiserror = { workspace = true }
+bytemuck = { workspace = true }
+log = { workspace = true }

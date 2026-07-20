@@ -1,0 +1,21 @@
+[package]
+name = "gs-wgpu"
+description = "Shared GPU infrastructure: device init, buffer helpers, GPU radix sort, prefix sum, timestamp-query bench harness."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[features]
+# Enables wgpu timestamp queries for per-pass GPU timing.
+profile = []
+
+[dependencies]
+wgpu = { workspace = true }
+bytemuck = { workspace = true }
+thiserror = { workspace = true }
+log = { workspace = true }
+
+[dev-dependencies]
+pollster = { workspace = true }
+rand = { workspace = true }

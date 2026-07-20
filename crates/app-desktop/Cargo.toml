@@ -1,0 +1,17 @@
+[package]
+name = "app-desktop"
+description = "Desktop app: winit + egui shell around the viewer with pipeline progress UI. Arrives after the headless pipeline works (see PLAN.md)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "app-desktop"
+path = "src/main.rs"
+
+[dependencies]
+gs-viewer = { workspace = true }
+gs-render = { workspace = true }
+gs-io = { workspace = true }
+anyhow = { workspace = true }

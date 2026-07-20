@@ -1,0 +1,16 @@
+[package]
+name = "app-vr"
+description = "VR viewer: OpenXR + Vulkan interop, stereo rendering, scale-calibration UX. Arrives in M11 (see PLAN.md)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "app-vr"
+path = "src/main.rs"
+
+[dependencies]
+gs-viewer = { workspace = true }
+gs-render = { workspace = true }
+anyhow = { workspace = true }

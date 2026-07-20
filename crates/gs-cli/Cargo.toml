@@ -1,0 +1,31 @@
+[package]
+name = "gs-cli"
+description = "Headless pipeline driver: run / add / train / export / view. The primary dev entry point — every stage works here before any GUI."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "gs-cli"
+path = "src/main.rs"
+
+[features]
+# Per-pass GPU timing via wgpu timestamp queries.
+profile = ["gs-wgpu/profile"]
+
+[dependencies]
+gs-core = { workspace = true }
+gs-io = { workspace = true }
+gs-wgpu = { workspace = true }
+gs-render = { workspace = true }
+gs-viewer = { workspace = true }
+gs-train = { workspace = true }
+gs-video = { workspace = true }
+gs-pose = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
+pollster = { workspace = true }
+image = { workspace = true }
+log = { workspace = true }
+env_logger = { workspace = true }

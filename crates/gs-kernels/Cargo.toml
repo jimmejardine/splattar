@@ -1,0 +1,11 @@
+[package]
+name = "gs-kernels"
+description = "WGSL training kernels: project/cull, tile binning, differentiable ray-splat forward + hand-derived backward, SSIM, Adam, MCMC relocation."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+gs-core = { workspace = true }
+gs-wgpu = { workspace = true }

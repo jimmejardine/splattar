@@ -1,0 +1,11 @@
+[package]
+name = "gs-video"
+description = "Streaming MP4/.mov demux + H.264/HEVC software decode (PTS everywhere), YUV→RGB/tone map, sharpness scoring, keyframe promotion, zoom detection signal."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+gs-core = { workspace = true }
+thiserror = { workspace = true }

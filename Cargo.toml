@@ -1,0 +1,65 @@
+# Splattar workspace. See PLAN.md for architecture and CLAUDE.md for conventions.
+[workspace]
+resolver = "2"
+members = [
+    "crates/gs-core",
+    "crates/gs-io",
+    "crates/gs-wgpu",
+    "crates/gs-kernels",
+    "crates/gs-cpu-ref",
+    "crates/gs-train",
+    "crates/gs-video",
+    "crates/gs-pose",
+    "crates/gs-render",
+    "crates/gs-viewer",
+    "crates/gs-cli",
+    "crates/app-desktop",
+    "crates/app-vr",
+]
+# app-web builds only for wasm32-unknown-unknown (via trunk/wasm-pack) and has its
+# own [workspace] table; excluding it keeps native workspace commands green.
+exclude = ["crates/app-web"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+rust-version = "1.95"
+
+[workspace.dependencies]
+# internal crates
+gs-core = { path = "crates/gs-core" }
+gs-io = { path = "crates/gs-io" }
+gs-wgpu = { path = "crates/gs-wgpu" }
+gs-kernels = { path = "crates/gs-kernels" }
+gs-cpu-ref = { path = "crates/gs-cpu-ref" }
+gs-train = { path = "crates/gs-train" }
+gs-video = { path = "crates/gs-video" }
+gs-pose = { path = "crates/gs-pose" }
+gs-render = { path = "crates/gs-render" }
+gs-viewer = { path = "crates/gs-viewer" }
+
+# external — pure Rust only; no crate that compiles or links C/C++ (see CLAUDE.md)
+wgpu = "30"
+winit = "0.30"
+glam = { version = "0.33", features = ["bytemuck"] }
+bytemuck = { version = "1", features = ["derive"] }
+half = { version = "2", features = ["bytemuck"] }
+clap = { version = "4", features = ["derive"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
+pollster = "0.4"
+thiserror = "2"
+anyhow = "1"
+log = "0.4"
+env_logger = "0.11"
+rand = "0.9"
+
+# Loading a 435 MB ply in unoptimized dev builds is painful; keep deps optimized.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+debug = true

@@ -1,0 +1,13 @@
+[package]
+name = "gs-train"
+description = "Training loop: losses and regularizers, MCMC controller, submap building/merging, global refinement, eval (PSNR/SSIM)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+gs-core = { workspace = true }
+gs-io = { workspace = true }
+gs-wgpu = { workspace = true }
+gs-kernels = { workspace = true }

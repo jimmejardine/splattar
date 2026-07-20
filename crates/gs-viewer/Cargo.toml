@@ -1,0 +1,20 @@
+[package]
+name = "gs-viewer"
+description = "Viewer core: fly/walk camera, input state, scene management, render-loop orchestration (surface-agnostic; winit windowing behind a default feature)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[features]
+default = ["winit"]
+# Native windowing/event loop. Disabled for wasm/VR hosts that bring their own surface.
+winit = ["dep:winit"]
+
+[dependencies]
+gs-core = { workspace = true }
+gs-render = { workspace = true }
+gs-wgpu = { workspace = true }
+glam = { workspace = true }
+log = { workspace = true }
+winit = { workspace = true, optional = true }

@@ -1,0 +1,19 @@
+[package]
+name = "gs-render"
+description = "Real-time forward-only splat renderer: depth radix sort, instanced quad rasterization, SH deg 0–3, LOD. Loads both 3DGS and surfel layouts."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+gs-core = { workspace = true }
+gs-wgpu = { workspace = true }
+wgpu = { workspace = true }
+glam = { workspace = true }
+bytemuck = { workspace = true }
+log = { workspace = true }
+
+[dev-dependencies]
+image = { workspace = true }
+pollster = { workspace = true }

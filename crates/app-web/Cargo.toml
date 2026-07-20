@@ -1,0 +1,16 @@
+# app-web builds only for wasm32-unknown-unknown (via trunk or wasm-pack) and is
+# excluded from the native workspace; this empty [workspace] table makes it
+# standalone so native `cargo build --workspace` never touches it.
+[workspace]
+
+[package]
+name = "app-web"
+description = "Shareable web viewer: wasm32 + WebGPU, progressive .spz streaming + scene-manifest support. Arrives in M10 (see PLAN.md)."
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]

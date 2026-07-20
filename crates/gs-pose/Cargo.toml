@@ -1,0 +1,12 @@
+[package]
+name = "gs-pose"
+description = "VO front-end: KLT tracking, five-point bootstrap, continuous-time SE(3) spline, sliding-window BA, relocalization DB, Sim(3) submap registration."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+# nalgebra (rust-cv ecosystem) arrives in M6 and stays quarantined in this crate;
+# convert to glam at the API boundary (see CLAUDE.md).
+[dependencies]
+gs-core = { workspace = true }
