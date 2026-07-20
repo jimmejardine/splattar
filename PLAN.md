@@ -126,7 +126,7 @@ Because mapping is incremental and submaps are independent by construction, a li
 
 ## Test assets
 
-`samples/ply/cactus-{low,med,high}.ply` — standard 3DGS .ply (binary LE; x/y/z, f_dc_0..2, f_rest_0..44 = SH deg 3, opacity, scale_0..2, rot_0..3; no normals) at ~139k / ~700k / ~1.9M splats. `cactus-low` = golden-test fixture; `cactus-high` = M0 perf fixture. `samples/ply/tree.ply` is a plain xyz+RGB point cloud (CloudCompare export), **not** a splat file — point-cloud loader tests only. Never write derived outputs into `samples/`.
+`samples/ply/cactus-{low,med,high}.ply` — standard 3DGS .ply (binary LE; x/y/z, f_dc_0..2, f_rest_0..44 = SH deg 3, opacity, scale_0..2, rot_0..3; no normals) at 139,410 / ~700k / 1,935,120 splats. `cactus-low` = golden-test fixture; `cactus-high` = M0 perf fixture. `samples/video/prinsengracht-494-android/{1,2}.mp4` — real Android walkthrough clips for ingest/VO/end-to-end work from M5 on (two videos of one location → also an M8 multi-video fixture). Samples are gitignored; never write derived outputs into `samples/`.
 
 ## Starting point
 

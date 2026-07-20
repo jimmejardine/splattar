@@ -8,6 +8,10 @@ rust-version.workspace = true
 
 [dependencies]
 gs-core = { workspace = true }
+glam = { workspace = true }
 thiserror = { workspace = true }
 bytemuck = { workspace = true }
 log = { workspace = true }
+
+[dev-dependencies]
+env_logger = { workspace = true }

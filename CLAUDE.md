@@ -35,7 +35,7 @@ cargo clippy --workspace -- -D warnings
 
 ## Test assets
 
-`samples/ply/cactus-{low,med,high}.ply` are standard 3DGS splat files (binary little-endian; x/y/z, `f_dc_0..2`, `f_rest_0..44` = SH degree 3, opacity, 3 scales, quaternion; no normals): ~139k / ~700k / ~1.9M splats. Use `cactus-low` for fast iteration and golden tests, `cactus-high` as the M0 performance fixture. `samples/ply/tree.ply` is **not** a splat file — it is a plain xyz+RGB point cloud (CloudCompare export); only useful for point-cloud loader tests. These files are large — never write derived outputs into `samples/`.
+`samples/ply/cactus-{low,med,high}.ply` are standard 3DGS splat files (binary little-endian; x/y/z, `f_dc_0..2`, `f_rest_0..44` = SH degree 3, opacity, 3 scales, quaternion; no normals): 139,410 / ~700k / 1,935,120 splats. Use `cactus-low` for fast iteration and golden tests, `cactus-high` as the M0 performance fixture. `samples/video/prinsengracht-494-android/{1,2}.mp4` are real Android walkthrough clips — ingest/VO/end-to-end fixtures from M5 on. Samples are gitignored and large — never write derived outputs into `samples/`.
 
 ## Verification rules
 
