@@ -19,3 +19,8 @@ log = { workspace = true }
 [dev-dependencies]
 pollster = { workspace = true }
 rand = { workspace = true }
+env_logger = { workspace = true }
+
+[[example]]
+name = "bench_sort"
+required-features = ["profile"]

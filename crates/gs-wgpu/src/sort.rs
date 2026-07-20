@@ -24,7 +24,8 @@ pub struct RadixSorter {
     prep_bind_group: wgpu::BindGroup,
     prep_pipeline: wgpu::ComputePipeline,
     histogram_pipeline: wgpu::ComputePipeline,
-    scan_pipeline: wgpu::ComputePipeline,
+    scan_columns_pipeline: wgpu::ComputePipeline,
+    scan_totals_pipeline: wgpu::ComputePipeline,
     scatter_pipeline: wgpu::ComputePipeline,
 }
 
@@ -66,6 +67,12 @@ impl RadixSorter {
             usage: wgpu::BufferUsages::STORAGE,
             mapped_at_creation: false,
         });
+        let digit_totals = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("sort-digit-totals"),
+            size: DIGITS * 4,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
         let dispatch_args = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("sort-dispatch-args"),
             size: 12,
@@ -100,6 +107,7 @@ impl RadixSorter {
                 storage_entry(5, false), // payload_out
                 storage_entry(6, false), // block_hists
                 storage_entry(7, false), // digit_offsets
+                storage_entry(8, false), // digit_totals
             ],
         });
 
@@ -123,6 +131,7 @@ impl RadixSorter {
                     bind(5, &payloads[out_idx]),
                     bind(6, &block_hists),
                     bind(7, &digit_offsets),
+                    bind(8, &digit_totals),
                 ],
             })
         };
@@ -148,7 +157,8 @@ impl RadixSorter {
             })
         };
         let histogram_pipeline = make_pipeline("histogram");
-        let scan_pipeline = make_pipeline("scan");
+        let scan_columns_pipeline = make_pipeline("scan_columns");
+        let scan_totals_pipeline = make_pipeline("scan_totals");
         let scatter_pipeline = make_pipeline("scatter");
 
         // prep_dispatch has its own tiny layout (counts + args).
@@ -189,7 +199,8 @@ impl RadixSorter {
             prep_bind_group,
             prep_pipeline,
             histogram_pipeline,
-            scan_pipeline,
+            scan_columns_pipeline,
+            scan_totals_pipeline,
             scatter_pipeline,
         }
     }
@@ -215,18 +226,91 @@ impl RadixSorter {
 
     /// Records the full sort. Caller submits the encoder.
     pub fn encode(&self, encoder: &mut wgpu::CommandEncoder) {
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("sort-prep"),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(&self.prep_pipeline);
-            pass.set_bind_group(0, &self.prep_bind_group, &[]);
-            pass.dispatch_workgroups(1, 1, 1);
+        self.encode_inner(encoder, None, None);
+    }
+
+    /// Like [`encode`], with the two passes wrapped in GpuTimer scopes.
+    #[cfg(feature = "profile")]
+    pub fn encode_profiled(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        timer: &mut crate::GpuTimer,
+    ) {
+        let prep = timer.compute_scope("sort-prep");
+        // Scopes borrow the timer serially; materialize prep first.
+        self.encode_prep(encoder, prep);
+        let main = timer.compute_scope("sort");
+        self.encode_main(encoder, main);
+    }
+
+    /// Diagnostic encoding: every stage of every digit pass in its own
+    /// timestamped compute pass. Slower than `encode` (pass overhead) — for
+    /// attributing cost only, never for production timing.
+    #[cfg(feature = "profile")]
+    pub fn encode_stage_profiled(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        timer: &mut crate::GpuTimer,
+    ) {
+        let ts = timer.compute_scope("prep");
+        self.encode_prep(encoder, ts);
+        for p in 0..PASSES {
+            let offset = (p as u64 * UNIFORM_STRIDE) as u32;
+            let bg = &self.bind_groups[(p % 2) as usize];
+            for (stage, pipeline) in [
+                ("histogram", &self.histogram_pipeline),
+                ("scan", &self.scan_columns_pipeline),
+                ("totals", &self.scan_totals_pipeline),
+                ("scatter", &self.scatter_pipeline),
+            ] {
+                let ts = timer.compute_scope(&format!("{stage}{p}"));
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some(stage),
+                    timestamp_writes: ts,
+                });
+                pass.set_bind_group(0, bg, &[offset]);
+                pass.set_pipeline(pipeline);
+                match stage {
+                    "scan" => pass.dispatch_workgroups(DIGITS as u32, 1, 1),
+                    "totals" => pass.dispatch_workgroups(1, 1, 1),
+                    _ => pass.dispatch_workgroups_indirect(&self.dispatch_args, 0),
+                }
+            }
         }
+    }
+
+    fn encode_inner(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        prep_ts: Option<wgpu::ComputePassTimestampWrites<'_>>,
+        main_ts: Option<wgpu::ComputePassTimestampWrites<'_>>,
+    ) {
+        self.encode_prep(encoder, prep_ts);
+        self.encode_main(encoder, main_ts);
+    }
+
+    fn encode_prep(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        timestamp_writes: Option<wgpu::ComputePassTimestampWrites<'_>>,
+    ) {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("sort-prep"),
+            timestamp_writes,
+        });
+        pass.set_pipeline(&self.prep_pipeline);
+        pass.set_bind_group(0, &self.prep_bind_group, &[]);
+        pass.dispatch_workgroups(1, 1, 1);
+    }
+
+    fn encode_main(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        timestamp_writes: Option<wgpu::ComputePassTimestampWrites<'_>>,
+    ) {
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("radix-sort"),
-            timestamp_writes: None,
+            timestamp_writes,
         });
         for p in 0..PASSES {
             let offset = (p as u64 * UNIFORM_STRIDE) as u32;
@@ -234,7 +318,9 @@ impl RadixSorter {
             pass.set_bind_group(0, bg, &[offset]);
             pass.set_pipeline(&self.histogram_pipeline);
             pass.dispatch_workgroups_indirect(&self.dispatch_args, 0);
-            pass.set_pipeline(&self.scan_pipeline);
+            pass.set_pipeline(&self.scan_columns_pipeline);
+            pass.dispatch_workgroups(DIGITS as u32, 1, 1);
+            pass.set_pipeline(&self.scan_totals_pipeline);
             pass.dispatch_workgroups(1, 1, 1);
             pass.set_pipeline(&self.scatter_pipeline);
             pass.dispatch_workgroups_indirect(&self.dispatch_args, 0);

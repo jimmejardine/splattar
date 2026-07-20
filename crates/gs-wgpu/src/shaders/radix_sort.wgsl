@@ -28,6 +28,8 @@ struct SortParams { shift: u32 }
 @group(0) @binding(6) var<storage, read_write> block_hists: array<u32>;
 // digit_offsets[d]: exclusive scan of global digit totals.
 @group(0) @binding(7) var<storage, read_write> digit_offsets: array<u32>;
+// digit_totals[d]: per-digit column totals (scan_columns → scan_totals).
+@group(0) @binding(8) var<storage, read_write> digit_totals: array<u32>;
 
 fn digit_of(key: u32) -> u32 {
     return (key >> params.shift) & 0xfu;
@@ -61,30 +63,63 @@ fn histogram(
 }
 
 // --------------------------------------------------------------------- scan
-// Single workgroup; thread d owns digit d. Serially prefixes that digit's
-// column across all blocks (fine at M0 scale; M1 hardens), then thread 0
-// exclusive-scans the 16 totals.
-var<workgroup> totals: array<u32, DIGITS>;
+// Parallelized in two kernels (the M0 serial version cost ~4.7 ms of the
+// 5.4 ms total at 4M keys):
+//   scan_columns — one workgroup per digit; 256 threads chunk-scan that
+//   digit's column across all blocks (shared Hillis–Steele + running carry),
+//   leaving per-block exclusive bases in block_hists and the column total in
+//   digit_totals.
+//   scan_totals — one tiny workgroup exclusive-scans the 16 totals.
+const SCAN_WG: u32 = 256u;
+var<workgroup> chunk: array<u32, SCAN_WG>;
 
-@compute @workgroup_size(DIGITS)
-fn scan(@builtin(local_invocation_id) lid: vec3<u32>) {
-    let d = lid.x;
+@compute @workgroup_size(SCAN_WG)
+fn scan_columns(
+    @builtin(workgroup_id) wg_id: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>,
+) {
+    let d = wg_id.x; // digit column owned by this workgroup
+    let t = lid.x;
     let num_blocks = (counts.n + BLOCK - 1u) / BLOCK;
-    var sum = 0u;
-    for (var b = 0u; b < num_blocks; b++) {
-        let v = block_hists[b * DIGITS + d];
-        block_hists[b * DIGITS + d] = sum;
-        sum += v;
-    }
-    totals[d] = sum;
-    workgroupBarrier();
-
-    if d == 0u {
-        var acc = 0u;
-        for (var i = 0u; i < DIGITS; i++) {
-            digit_offsets[i] = acc;
-            acc += totals[i];
+    var carry = 0u;
+    var base = 0u;
+    while base < num_blocks {
+        let b = base + t;
+        var v = 0u;
+        if b < num_blocks {
+            v = block_hists[b * DIGITS + d];
         }
+        chunk[t] = v;
+        workgroupBarrier();
+        // Inclusive Hillis–Steele scan over the chunk.
+        for (var step = 1u; step < SCAN_WG; step = step << 1u) {
+            var add = 0u;
+            if t >= step {
+                add = chunk[t - step];
+            }
+            workgroupBarrier();
+            chunk[t] += add;
+            workgroupBarrier();
+        }
+        if b < num_blocks {
+            // Exclusive base = inclusive - own value, plus carry from prior chunks.
+            block_hists[b * DIGITS + d] = carry + chunk[t] - v;
+        }
+        carry += chunk[SCAN_WG - 1u];
+        workgroupBarrier();
+        base += SCAN_WG;
+    }
+    if t == 0u {
+        digit_totals[d] = carry;
+    }
+}
+
+@compute @workgroup_size(1)
+fn scan_totals() {
+    var acc = 0u;
+    for (var i = 0u; i < DIGITS; i++) {
+        digit_offsets[i] = acc;
+        acc += digit_totals[i];
     }
 }
 

@@ -27,10 +27,12 @@ fn xorshift(state: &mut u32) -> u32 {
 #[test]
 fn sorts_match_cpu_stable_sort() {
     let Some(ctx) = context() else { return };
-    const CAPACITY: u32 = 2_000_000;
+    const CAPACITY: u32 = 10_000_000;
     let sorter = RadixSorter::new(&ctx, CAPACITY);
 
-    for &n in &[0u32, 1, 255, 256, 1024, 4097, 100_000, 2_000_000] {
+    for &n in &[
+        0u32, 1, 255, 256, 1024, 4097, 100_000, 1_000_003, 2_000_000, 4_194_304, 10_000_000,
+    ] {
         let mut rng = 0x1234_5678u32 ^ n.wrapping_mul(2654435761);
         // Heavy duplicates (key % 8192) so stability is actually exercised;
         // payload = original index makes stability checkable exactly.

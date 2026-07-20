@@ -6,9 +6,13 @@
 
 pub mod buffers;
 pub mod context;
+#[cfg(feature = "profile")]
+pub mod profile;
 pub mod sort;
 
 pub use context::{GpuContext, backends_from_str};
+#[cfg(feature = "profile")]
+pub use profile::GpuTimer;
 pub use sort::RadixSorter;
 
 #[derive(Debug, thiserror::Error)]
