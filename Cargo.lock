@@ -816,7 +816,9 @@ name = "gs-kernels"
 version = "0.1.0"
 dependencies = [
  "bytemuck",
+ "glam",
  "gs-core",
+ "gs-cpu-ref",
  "gs-wgpu",
  "log",
  "pollster",

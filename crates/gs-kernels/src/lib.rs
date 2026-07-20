@@ -6,5 +6,7 @@
 //! are exempt from the pair naming — they have no backward).
 
 pub mod binning;
+pub mod rasterizer;
 
 pub use binning::{TileBinner, TileRect};
+pub use rasterizer::{RasterCamera, Rasterizer, SceneInput};

@@ -19,6 +19,8 @@ struct PlainCount { n: u32 }
 @group(0) @binding(4) var<storage, read_write> tile_keys: array<u32>;
 @group(0) @binding(5) var<storage, read_write> sort_keys: array<u32>;
 @group(0) @binding(6) var<storage, read_write> sort_payloads: array<u32>;
+// entry → source item id (consumers map sorted entries back to items).
+@group(0) @binding(9) var<storage, read_write> entry_items: array<u32>;
 
 // ---------------------------------------------------------------- counting
 // counts[i] = number of tiles item i overlaps (written into the PrefixSum
@@ -57,6 +59,7 @@ fn expand(@builtin(global_invocation_id) gid: vec3<u32>) {
             tile_keys[e] = ty * params.tiles_x + tx;
             sort_keys[e] = depths[i];
             sort_payloads[e] = e;
+            entry_items[e] = i;
             e += 1u;
         }
     }

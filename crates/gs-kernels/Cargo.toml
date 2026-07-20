@@ -11,7 +11,9 @@ gs-core = { workspace = true }
 gs-wgpu = { workspace = true }
 wgpu = { workspace = true }
 bytemuck = { workspace = true }
+glam = { workspace = true }
 log = { workspace = true }
 
 [dev-dependencies]
+gs-cpu-ref = { workspace = true }
 pollster = { workspace = true }

@@ -26,6 +26,8 @@ pub struct TileBinner {
     params: wgpu::Buffer,
     pub rects: wgpu::Buffer,
     pub depths: wgpu::Buffer,
+    /// entry index → source item id (indexed through `sorted_entries`).
+    pub entry_items: wgpu::Buffer,
     /// (start, end) per tile after `encode`.
     pub ranges: wgpu::Buffer,
     prefix: PrefixSum,
@@ -60,6 +62,8 @@ impl TileBinner {
         let depths = gs_wgpu::buffers::storage_empty(device, "binning-depths", max_items as u64 * 4);
         let tile_keys =
             gs_wgpu::buffers::storage_empty(device, "binning-tile-keys", max_entries as u64 * 4);
+        let entry_items =
+            gs_wgpu::buffers::storage_empty(device, "binning-entry-items", max_entries as u64 * 4);
         let ranges =
             gs_wgpu::buffers::storage_empty(device, "binning-ranges", num_tiles as u64 * 8);
 
@@ -99,6 +103,7 @@ impl TileBinner {
                 bind(4, &tile_keys),
                 bind(5, sorter.keys()),
                 bind(6, sorter.payloads()),
+                bind(9, &entry_items),
             ],
         });
         let gather_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -124,6 +129,7 @@ impl TileBinner {
             params,
             rects,
             depths,
+            entry_items,
             ranges,
             prefix,
             sorter,
