@@ -62,6 +62,11 @@ pub struct VoConfig {
     pub boot_min_parallax: f64,
     /// Bootstrap acceptance: minimum inlier count.
     pub boot_min_inliers: usize,
+    /// Bootstrap pair selection: extend the pair (ka, kb) forward until the
+    /// RMS residual of a global affine fit reaches this many pixels. Raw flow
+    /// is useless here — panning creates huge flow with zero baseline; the
+    /// affine residual only responds to parallax (depth structure).
+    pub boot_parallax_px: f64,
     /// Sliding-window size for local BA during expansion.
     pub ba_window: usize,
     /// Keyframes this close to the segment ends are not anchor candidates
@@ -81,12 +86,15 @@ impl Default for VoConfig {
             klt: KltConfig::default(),
             detect: DetectConfig::default(),
             kf_flow_px: 15.0,
-            kf_survival: 0.7,
+            // Per-frame attrition compounds between keyframes (~0.9^k on
+            // handheld footage); 0.5 keeps promotion driven by flow, not churn.
+            kf_survival: 0.5,
             min_tracks: 150,
             ransac_px: 1.5,
             ransac_iters: 300,
             boot_min_parallax: 1.0f64.to_radians(),
             boot_min_inliers: 30,
+            boot_parallax_px: 4.0,
             ba_window: 6,
             anchor_margin: 0.1,
         }
@@ -231,9 +239,16 @@ impl VoFrontEnd {
             for tr in &mut self.tracks {
                 if let Some(p) = tr.cur {
                     tr.obs.push((kf_idx, p));
-                    tr.at_last_kf = Some(p);
                 }
+                // Dead tracks must drop out of the survival statistics, or
+                // the ratio decays monotonically and every frame becomes a
+                // keyframe (seen on real footage).
+                tr.at_last_kf = tr.cur;
             }
+            // Drop dead tracks that never got a second observation — they
+            // can't contribute geometry and bloat the causal pass.
+            self.tracks
+                .retain(|t| t.cur.is_some() || t.obs.len() >= 2);
             // Spawn fresh corners away from live tracks.
             let existing: Vec<(f32, f32)> =
                 self.tracks.iter().filter_map(|t| t.cur).collect();
@@ -303,27 +318,38 @@ impl VoFrontEnd {
         }
         let thresh = self.cfg.ransac_px / self.cfg.intrinsics.focal;
 
-        // Rank adjacent keyframe pairs by conditioning, skipping the margins.
+        // Candidate anchor pairs: from each start keyframe, extend forward
+        // until the shared tracks carry enough flow for a well-conditioned
+        // two-view solve (adjacent keyframes rarely have the baseline).
         let margin = ((n_kf as f64 * self.cfg.anchor_margin) as usize).min(n_kf / 4);
         let lo = margin;
-        let hi = n_kf - 1 - margin;
-        let mut candidates: Vec<(f64, usize)> = (lo..hi.max(lo + 1).min(n_kf - 1))
-            .map(|k| {
-                let (m, _) = self.kf_matches(k, k + 1);
-                let mut d: Vec<f64> = m
-                    .iter()
-                    .map(|mm| {
-                        let dx = (mm.b.0 - mm.a.0) * self.cfg.intrinsics.focal;
-                        let dy = (mm.b.1 - mm.a.1) * self.cfg.intrinsics.focal;
-                        (dx * dx + dy * dy).sqrt()
-                    })
-                    .collect();
-                d.sort_by(f64::total_cmp);
-                let med = if d.is_empty() { 0.0 } else { d[d.len() / 2] };
-                let sharp = self.keyframes[k]
-                    .sharpness
-                    .min(self.keyframes[k + 1].sharpness) as f64;
-                (m.len() as f64 * med * sharp, k)
+        let hi = (n_kf - 1 - margin).max(lo + 1).min(n_kf - 1);
+        // Sample candidate starts — scanning every keyframe is O(n²) in
+        // track lookups and adds nothing once the pool is a few dozen.
+        let step = ((hi - lo) / 48).max(1);
+        let mut candidates: Vec<(f64, usize, usize)> = (lo..hi)
+            .step_by(step)
+            .filter_map(|ka| {
+                let mut chosen: Option<(usize, usize, f64)> = None;
+                for kb in ka + 1..n_kf {
+                    let (m, _) = self.kf_matches(ka, kb);
+                    if m.len() < self.cfg.boot_min_inliers {
+                        break;
+                    }
+                    let res = affine_residual_px(&m, self.cfg.intrinsics.focal);
+                    if chosen.as_ref().is_none_or(|c| res > c.2) {
+                        chosen = Some((kb, m.len(), res));
+                    }
+                    if res >= self.cfg.boot_parallax_px {
+                        break;
+                    }
+                }
+                chosen.map(|(kb, n_shared, res)| {
+                    let sharp = self.keyframes[ka]
+                        .sharpness
+                        .min(self.keyframes[kb].sharpness) as f64;
+                    (n_shared as f64 * res * sharp, ka, kb)
+                })
             })
             .collect();
         candidates.sort_by(|a, b| b.0.total_cmp(&a.0));
@@ -332,23 +358,30 @@ impl VoFrontEnd {
         let mut poses: Vec<Option<Se3>> = vec![None; n_kf];
         let mut landmarks: Vec<Vector3<f64>> = Vec::new();
         let mut anchor = usize::MAX;
-        for &(_, ka) in candidates.iter().take(8) {
-            let kb = ka + 1;
+        for &(score, ka, kb) in candidates.iter().take(12) {
             let (matches, track_ids) = self.kf_matches(ka, kb);
             if matches.len() < self.cfg.boot_min_inliers {
+                log::debug!("boot ({ka},{kb}) score {score:.0}: too few matches {}", matches.len());
                 continue;
             }
             let Some(rr) =
                 ransac_essential(&matches, self.cfg.ransac_iters, thresh, 0xC0FFEE)
             else {
+                log::debug!("boot ({ka},{kb}): RANSAC found no model");
                 continue;
             };
             if rr.inliers.len() < self.cfg.boot_min_inliers
                 || rr.inliers.len() * 2 < matches.len()
             {
+                log::debug!(
+                    "boot ({ka},{kb}): weak consensus {}/{}",
+                    rr.inliers.len(),
+                    matches.len()
+                );
                 continue;
             }
             let Some(boot) = recover_pose(&rr.e, &matches, &rr.inliers) else {
+                log::debug!("boot ({ka},{kb}): cheirality ambiguous");
                 continue;
             };
             // Parallax gate: median angle between rays of triangulated points.
@@ -360,8 +393,17 @@ impl VoFrontEnd {
                 .collect();
             angs.sort_by(f64::total_cmp);
             if angs.is_empty() || angs[angs.len() / 2] < self.cfg.boot_min_parallax {
+                log::debug!(
+                    "boot ({ka},{kb}): median parallax {:.2}° below gate",
+                    angs.get(angs.len() / 2).copied().unwrap_or(0.0).to_degrees()
+                );
                 continue;
             }
+            log::info!(
+                "bootstrap at keyframes ({ka},{kb}): {} inliers, median parallax {:.2}°",
+                rr.inliers.len(),
+                angs[angs.len() / 2].to_degrees()
+            );
             poses[ka] = Some(Se3::identity());
             poses[kb] = Some(boot.pose_ba);
             for (mi, p) in &boot.points {
@@ -376,27 +418,10 @@ impl VoFrontEnd {
             return None;
         }
 
-        // Anchor-out expansion order: kb+1, ka−1, kb+2, ka−2, …
-        let kb = anchor + 1;
-        let mut order = Vec::new();
-        let mut fwd = kb + 1;
-        let mut back = anchor as isize - 1;
-        loop {
-            let mut any = false;
-            if fwd < n_kf {
-                order.push(fwd);
-                fwd += 1;
-                any = true;
-            }
-            if back >= 0 {
-                order.push(back as usize);
-                back -= 1;
-                any = true;
-            }
-            if !any {
-                break;
-            }
-        }
+        // Anchor-out expansion: everything outside the (solved) anchor pair,
+        // nearest-to-anchor first, alternating temporal directions.
+        let mut order: Vec<usize> = (0..n_kf).filter(|&k| poses[k].is_none()).collect();
+        order.sort_by_key(|&k| k.abs_diff(anchor));
 
         for k in order {
             // PnP from tracks with landmarks observed at keyframe k.
@@ -443,8 +468,11 @@ impl VoFrontEnd {
                 }
             }
 
-            // Sliding-window BA around k.
-            self.local_ba(&mut poses, &mut landmarks, k);
+            // Sliding-window BA around k (every other keyframe — the window
+            // overlaps heavily and the final global pass polishes the rest).
+            if k % 2 == 0 {
+                self.local_ba(&mut poses, &mut landmarks, k);
+            }
         }
 
         // Final polish: full BA with the anchor pair fixed (cheap at VO scale).
@@ -557,6 +585,38 @@ impl VoFrontEnd {
             landmarks[l] = prob.landmarks[pl];
         }
     }
+}
+
+/// RMS residual (px) of the best global affine warp a→b over the matches.
+/// Rotation and zoom are (nearly) affine at video field-of-view; what's left
+/// is parallax, i.e. usable baseline.
+fn affine_residual_px(matches: &[Match2], focal: f64) -> f64 {
+    let n = matches.len();
+    if n < 6 {
+        return 0.0;
+    }
+    let mut m = nalgebra::Matrix3::<f64>::zeros();
+    let mut bx = Vector3::zeros();
+    let mut by = Vector3::zeros();
+    for mm in matches {
+        let v = Vector3::new(mm.a.0, mm.a.1, 1.0);
+        m += v * v.transpose();
+        bx += v * mm.b.0;
+        by += v * mm.b.1;
+    }
+    let Some(minv) = m.try_inverse() else {
+        return 0.0;
+    };
+    let px = minv * bx;
+    let py = minv * by;
+    let mut ss = 0.0;
+    for mm in matches {
+        let v = Vector3::new(mm.a.0, mm.a.1, 1.0);
+        let rx = px.dot(&v) - mm.b.0;
+        let ry = py.dot(&v) - mm.b.1;
+        ss += rx * rx + ry * ry;
+    }
+    (ss / n as f64).sqrt() * focal
 }
 
 fn nearest_pose(poses: &[Option<Se3>], k: usize) -> Option<Se3> {

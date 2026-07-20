@@ -1,6 +1,6 @@
 # Splattar — Architecture & Roadmap
 
-> **Status (2026-07-20): M0–M5 complete** (measured gates in [RESULTS.md](RESULTS.md)). M5 decode went **hardware** — Vulkan Video (NVDEC) via ash instead of a software decoder (every pure-Rust H.264 crate failed the bake-off: CAVLC-only, I-only, or AGPL). Next up: **M6 — video odometry front-end**. Real-dataset parity gates (published-2DGS ±1 dB) are being measured on Mip-NeRF360 `room` now that M4's MCMC landed.
+> **Status (2026-07-21): M0–M6 core complete** (measured gates in [RESULTS.md](RESULTS.md)). M5 decode went **hardware** — Vulkan Video (NVDEC) via ash (every pure-Rust H.264 crate failed the bake-off: CAVLC-only, I-only, or AGPL). M6 VO passes ATE < 1% / RPE < 0.5° on synthetic GT and solves 404/404 keyframes on real Android footage (`gs-cli pose`); the AKAZE/Sim(3) relocalization primitive is deferred to M8 prep. Next up: **M7 — video-native training end-to-end**. Real-dataset parity gates (published-2DGS ±1 dB) are being measured on Mip-NeRF360 `room` now that M4's MCMC landed.
 
 ## Goal
 

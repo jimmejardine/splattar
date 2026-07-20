@@ -125,3 +125,28 @@ later. Implementation: full SPS/PPS/slice-header parsing in `gs-video::h264`
 eviction, and per-plane readback → cropped I420. Scope is the phone subset:
 progressive 4:2:0 8-bit, I/P slices (no B-frames in phone walkthrough video —
 verified all composition offsets are 0 in the samples).
+
+## M6 — VO front-end (2026-07-21)
+
+| Check | Gate | Measured |
+|---|---|---|
+| KLT tracker on synthetic warps | sub-pixel + FB rejection | pass (< 0.35 px on ±7 px translation; zero-mean matching survives exposure offsets) |
+| Two-view / PnP / BA geometry vs synthetic GT | recover known poses | pass (8-pt RANSAC through 25% outliers, rot err < 5e-3 rad; BA to < 1e-14 cost noiseless, gauge-fixed) |
+| Full VO on analytic two-plane scene (50 frames, 400×300) | **ATE < 1%** of trajectory, **RPE < 0.5°** | **ATE 0.91%**, RPE rot < 0.5° per pair, zoom signal flat under constant focal |
+| Full VO on real Android walkthrough (600 frames, 478×850, NVDEC decode) | bootstrap + solve succeed | **404/404 keyframes solved**, 9,028 landmarks, bootstrap median parallax 1.26°, trajectory finite/smooth (`gs-cli pose`) |
+| Frame-to-frame KLT survival on real footage | healthy | 81–98% FB-verified per frame (diagnostic test, first 40 frames) |
+
+Architecture notes: causal pass (constant-velocity KLT, flow/survival keyframe
+promotion, radial-flow zoom signal) is separate from the anchor-out solve, per
+PLAN. Two real-footage lessons are now encoded in the code: (1) survival
+statistics must drop dead tracks at each keyframe or promotion runs away;
+(2) bootstrap pair selection must measure parallax via a **global-affine
+residual**, not raw flow — panning creates hundreds of pixels of flow with
+zero baseline, and every flow-selected pair failed the 1° parallax gate.
+Monocular scale stays a free per-segment gauge (global BA fixes only the
+anchor pose). nalgebra is quarantined in gs-pose; the public API speaks glam.
+
+Deferred from M6 (tracked for M8 prep): AKAZE-style descriptor DB + Sim(3)
+relocalization primitive, TUM RGB-D ATE benchmark (dataset not on disk), VO
+solve perf (188 s for 404 keyframes in a dev build — local-BA cadence and
+match indexing are the known hotspots).

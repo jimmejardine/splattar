@@ -43,6 +43,21 @@ enum Command {
     },
     /// Full pipeline: video → splat model (creates a project). Arrives in M7.
     Run { video: PathBuf },
+    /// Visual odometry: decode a video, track, solve keyframe poses, and
+    /// write the trajectory + sparse landmarks as CSV next to the video.
+    Pose {
+        /// Path to an H.264 .mp4 walkthrough video.
+        video: PathBuf,
+        /// Focal length guess in pixels (default: 0.85 × the long side).
+        #[arg(long)]
+        focal: Option<f64>,
+        /// Stop after this many decoded frames (0 = whole video).
+        #[arg(long, default_value_t = 0)]
+        max_frames: u32,
+        /// Output CSV path (default: <video>.trajectory.csv).
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
     /// Extend an existing project with another video (relocalize + merge). Arrives in M8.
     Add { video: PathBuf },
     /// Validation harness: train on a posed COLMAP-format dataset.
@@ -128,6 +143,12 @@ fn main() -> anyhow::Result<()> {
             gs_viewer::windowed::run(cloud, options).map_err(|e| anyhow::anyhow!(e))
         }
         Command::Run { .. } => bail!("`run` arrives in M7 — see PLAN.md"),
+        Command::Pose {
+            video,
+            focal,
+            max_frames,
+            out,
+        } => run_pose(&video, focal, max_frames, out),
         Command::Add { .. } => bail!("`add` arrives in M8 — see PLAN.md"),
         Command::Train {
             dataset,
@@ -158,6 +179,88 @@ fn main() -> anyhow::Result<()> {
         ),
         Command::Export { .. } => bail!("`export` arrives in M7 — see PLAN.md"),
     }
+}
+
+fn run_pose(
+    video: &std::path::Path,
+    focal: Option<f64>,
+    max_frames: u32,
+    out: Option<PathBuf>,
+) -> anyhow::Result<()> {
+    use gs_pose::vo::{Intrinsics, VoConfig, VoFrontEnd};
+    let mut reader = gs_video::Mp4H264Reader::open(video).context("open video")?;
+    let t0 = std::time::Instant::now();
+
+    let mut vo: Option<VoFrontEnd> = None;
+    let mut n = 0u32;
+    while let Some(frame) = reader.next_frame().context("decode")? {
+        let fe = vo.get_or_insert_with(|| {
+            let f = focal.unwrap_or(0.85 * frame.width.max(frame.height) as f64);
+            log::info!(
+                "video {}x{}, focal guess {f:.0}px",
+                frame.width,
+                frame.height
+            );
+            VoFrontEnd::new(VoConfig {
+                intrinsics: Intrinsics {
+                    focal: f,
+                    cx: frame.width as f64 / 2.0,
+                    cy: frame.height as f64 / 2.0,
+                },
+                ..Default::default()
+            })
+        });
+        let gray = gs_pose::GrayImage::from_luma8(
+            &frame.y,
+            frame.width as usize,
+            frame.height as usize,
+        );
+        fe.push_frame(gray, frame.pts);
+        n += 1;
+        if n.is_multiple_of(200) {
+            log::info!("tracked {n} frames, {} keyframes", fe.keyframes.len());
+        }
+        if max_frames > 0 && n >= max_frames {
+            break;
+        }
+    }
+    let mut fe = vo.context("no frames decoded")?;
+    let decode_track_s = t0.elapsed().as_secs_f64();
+    log::info!(
+        "causal pass: {n} frames, {} keyframes, {:.1} fps",
+        fe.keyframes.len(),
+        n as f64 / decode_track_s
+    );
+
+    let t1 = std::time::Instant::now();
+    let result = fe.solve().context("VO solve failed (not enough parallax?)")?;
+    let solved: Vec<_> = result.keyframe_poses.iter().flatten().collect();
+    log::info!(
+        "anchor-out solve: {}/{} keyframes solved (anchor at kf {}), {} landmarks, {:.2}s",
+        solved.len(),
+        result.keyframe_poses.len(),
+        result.anchor,
+        result.landmarks.len(),
+        t1.elapsed().as_secs_f64()
+    );
+
+    let out = out.unwrap_or_else(|| {
+        let mut p = video.to_path_buf();
+        p.set_extension("trajectory.csv");
+        p
+    });
+    let mut csv = String::from("pts,cx,cy,cz,qw,qx,qy,qz\n");
+    for kp in &solved {
+        let c = kp.pose.center();
+        let q = kp.pose.r.inverse(); // camera-to-world rotation
+        csv.push_str(&format!(
+            "{:.6},{:.6},{:.6},{:.6},{:.8},{:.8},{:.8},{:.8}\n",
+            kp.pts, c[0], c[1], c[2], q.w, q.i, q.j, q.k
+        ));
+    }
+    std::fs::write(&out, csv)?;
+    log::info!("trajectory written to {}", out.display());
+    Ok(())
 }
 
 struct TrainCliOpts {
