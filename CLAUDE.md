@@ -22,14 +22,19 @@ Conventions:
 ## Commands
 
 ```
-cargo build --workspace                 # native build (excludes app-web)
-cargo test --workspace                  # unit + property + gradient-check tests
-cargo run -p gs-cli -- view <file.ply>  # render a splat file
-cargo run -p gs-cli -- run <video.mp4>  # full pipeline: video → splat model (creates a project)
-cargo run -p gs-cli -- add <video.mp4>  # extend an existing project with a patch video (relocalize + merge)
-cargo run -p gs-cli -- train <dataset>  # validation harness: posed video-sequence datasets only
+cargo build --workspace                    # native build (excludes app-web)
+cargo test --workspace                     # fast gates; slow GPU/real-video tests need -- --ignored
+cargo run -p gs-cli -- view <ply|project>  # render a splat file, or compose a project dir (islands offset)
+cargo run -p gs-cli -- run <video.mp4>     # full pipeline: video → VO → train → project dir + baked splat
+cargo run -p gs-cli -- add <video.mp4> --project <dir>  # extend a project (register via Sim(3) or island)
+cargo run -p gs-cli -- pose <video.mp4>    # VO only: keyframe trajectory CSV
+cargo run -p gs-cli -- train <dataset>     # validation harness: posed COLMAP datasets only
 cargo clippy --workspace -- -D warnings
 ```
+
+Use `--release` for anything touching real video or training (KLT and the
+trainer are unusable in dev profile; gs-pose gets opt-level 3 in dev via a
+profile override, the rest does not).
 
 `app-web` builds only for `wasm32-unknown-unknown` (via trunk or wasm-pack); exclude it from native workspace commands if it breaks them.
 
@@ -63,3 +68,7 @@ cargo clippy --workspace -- -D warnings
 - Video decode is **hardware-only**: Vulkan Video (NVDEC) via raw ash FFI in `gs-video::nvdec`. The M5 bake-off rejected every software decoder (`rusty_h264` CAVLC-only — phone footage is CABAC; `oxideav-h264` I-slices only; NihAV works but is AGPL-3.0) — never add software codec crates, and beware parser-only crates that sound like decoders (`media-codec-h265`, `scuffle-h26x`, `h264-reader`). iPhone HEVC (10-bit Main 10, HLG/Dolby Vision in .mov) needs a `video_decode_h265` session on the same machinery (not yet written) + tone mapping; the image-folder input path is the supported fallback until then.
 - ash 0.38 has no high-level wrappers for video extensions: calls go through `fns.fp().xxx_khr` raw function pointers, and bindgen `StdVideo*` structs must be built with `std::mem::zeroed()` + bitfield setter methods — never positional `new_bitfield_1`.
 - iPhone video is Variable Frame Rate. Never compute timing as frame_index / fps — use the per-frame PTS from the demuxer, preserved through decode → keyframe promotion → trajectory spline.
+- VO on real footage (all learned the hard way, all now encoded in `gs-pose`): keyframe survival statistics must drop dead tracks at each promotion or the ratio decays monotonically and every frame becomes a keyframe; bootstrap pair selection must measure parallax via a **global-affine residual**, never raw flow (panning creates hundreds of px of flow with zero baseline); dense keyframes during fast pans are correct behavior, not a bug. KLT matching is zero-mean (survives auto-exposure) — keep it that way.
+- Trainer pose refinement (M7): the camera-center LR scales with the view's **median scene depth** (probe cloud), never scene extent — a walkthrough's extent is ~30× the room depth and extent-scaled steps destabilize training. Held-out eval must photometrically align eval poses to the frozen model before scoring (`eval_psnr_refined`, BARF-style): training legitimately drifts the monocular gauge, and frozen-VO-pose eval measures that drift, not model quality. Focal is one shared per-submap parameter refined in log-space.
+- Cross-video registration (M8): landmarks must be spatially voxel-deduped and descriptor matches cross-checked before Sim(3) RANSAC — KLT respawns re-triangulate the same physical corner ~20× per video, and coincident duplicates let a degenerate scale→0 transform out-vote the true model. Guard every Sim(3) acceptance with scale bounds AND an inlier-spread gate. Current single-scale non-oriented BRIEF descriptors are insufficient across viewpoint change (the flat pair lands as an island); AKAZE-class descriptors are the open upgrade — don't spend time retuning thresholds instead.
+- Geometry losses currently cost >10× per iteration at real resolutions (open perf task); `gs-cli run` keeps them disabled (`geo_start` past `iters`) until profiled. Don't re-enable them in the product path without fixing that first.
