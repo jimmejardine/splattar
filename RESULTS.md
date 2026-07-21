@@ -506,3 +506,55 @@ VO→trainer seam at all. Two green suites, one non-converging pipeline.
    configs dropped 21.2 → 16.6 dB while synthetic gates stayed green). Run
    `train datasets/room` at the pre-async commit; that is a clean A/B the
    earlier investigation never had.
+
+### ROOT CAUSE: normal-consistency loss over-weighted by the pixel count (2026-07-21)
+
+The convergence failure is a one-line weighting bug in `gs-train/src/trainer.rs`.
+The geometry losses sum over rays, so their weights must be divided by the pixel
+count to be comparable with the mean-normalized color loss — the trainer does
+this for `lambda_dist` and the normal kernel's `lambda` uniform is documented as
+"includes 1/N normalization", but `set_lambda` was passed the RAW config value.
+The normal loss therefore ran ~4e5× (779×519) too strong from `geo_start` on.
+
+Because it phases in at iteration 1500, training improved to ~iter 1500 and then
+degraded — which is why MORE iterations made things WORSE and why every tuning
+knob looked inert.
+
+Isolation ladder (mip-NeRF360 room, perfect COLMAP poses, single view, 150k
+surfels, MCMC off — a fixed target that gradient descent cannot get worse on):
+
+| config | 8k iters |
+|---|---|
+| no geo losses (baseline) | 34.23 dB |
+| lambda_normal 0.05, raw (as shipped) | 23.95 dB |
+| **lambda_normal 0.05, /n_px (fixed)** | **34.18 dB** |
+| lambda_dist 0.01 (normalized, as shipped) | 29.49 dB |
+| lambda_dist 0.001 | 33.39 dB |
+
+Normal-loss cost: −10.3 dB → −0.05 dB, matching the ~0.2 dB the 2DGS paper
+reports. `lambda_dist` default also lowered 0.01 → 0.001 (0.01 costs ~5 dB even
+when correctly normalized).
+
+End-to-end on the back-room clip (`add`, 600 frames, pose-aligned held-out):
+
+| state | PSNR |
+|---|---|
+| as found | 14.88 dB |
+| + c2w camera fix | 15.74 dB |
+| + geo losses off, 3k iters | 19.50 dB |
+| **+ geo losses off, 10k iters** | **20.39 dB** |
+| + geo at fixed weights (0.001/0.05), 10k | 19.33 dB |
+
+The render is now unmistakably the room (desk, monitors, armchair, framed
+canvas, curtains) instead of unrecognizable mush.
+
+**Diagnostic added:** `SPLATTAR_DUMP=<dir>` writes render/target PNG pairs from
+`train` and `add`. Every scalar-only hypothesis in the previous investigation
+was wrong; the first look at an actual render located the problem in minutes.
+
+**Why the tests missed it:** `train_synthetic.rs` (300 surfels, 128²) leaves
+`lambda_normal` at its 0.0 default, so no test ever enabled this loss during
+training. The `gs-cpu-ref` aux-loss gradient check verifies the kernel against a
+CPU port of the SAME convention, so a weighting-contract violation between
+trainer and kernel is invisible to it. Needed: a training test with geo losses
+ON asserting PSNR stays within ~0.5 dB of the geo-off baseline.

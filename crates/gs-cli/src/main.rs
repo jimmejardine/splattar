@@ -112,7 +112,7 @@ enum Command {
         #[arg(long, default_value_t = 300_000)]
         budget: u32,
         /// Depth-distortion loss weight (per-pixel normalized).
-        #[arg(long, default_value_t = 0.01)]
+        #[arg(long, default_value_t = 0.001)]
         lambda_dist: f32,
         /// Normal-consistency loss weight.
         #[arg(long, default_value_t = 0.05)]
@@ -358,6 +358,17 @@ struct PrepFrame {
     pyr: gs_pose::Pyramid,
     sharpness: f32,
     pts: f64,
+    /// FNV of the tracking-res luma when SPLATTAR_KF_TRACE is set (isolates
+    /// pixel nondeterminism from tracking nondeterminism per frame).
+    luma_fnv: u64,
+}
+
+fn fnv64(bytes: &[u8]) -> u64 {
+    let mut h = 0xcbf29ce484222325u64;
+    for &b in bytes {
+        h = (h ^ b as u64).wrapping_mul(0x100000001b3);
+    }
+    h
 }
 
 fn run_vo(
@@ -396,20 +407,37 @@ fn run_vo(
                     // Tracking-resolution cap is a pure function of the frame
                     // size, so workers need no shared state.
                     let s = width.max(height).div_ceil(TRACK_MAX_SIDE) as usize;
-                    let gray = if s > 1 {
-                        gs_pose::GrayImage::from_luma8(
-                            &downscale_luma(&y, width as usize, s),
-                            width as usize / s,
-                            height as usize / s,
+                    let trace = std::env::var_os("SPLATTAR_KF_TRACE").is_some();
+                    let (gray, luma_fnv) = if s > 1 {
+                        let small = downscale_luma(&y, width as usize, s);
+                        let h = if trace { fnv64(&small) } else { 0 };
+                        (
+                            gs_pose::GrayImage::from_luma8(
+                                &small,
+                                width as usize / s,
+                                height as usize / s,
+                            ),
+                            h,
                         )
                     } else {
-                        gs_pose::GrayImage::from_luma8(&y, width as usize, height as usize)
+                        let h = if trace { fnv64(&y) } else { 0 };
+                        (
+                            gs_pose::GrayImage::from_luma8(
+                                &y,
+                                width as usize,
+                                height as usize,
+                            ),
+                            h,
+                        )
                     };
                     let pyr = gs_pose::Pyramid::build(gray, n_levels);
                     let sharpness = gs_pose::vo::gradient_energy(
                         &pyr.levels[1.min(pyr.levels.len() - 1)],
                     );
-                    if tx.send((idx, PrepFrame { pyr, sharpness, pts })).is_err() {
+                    if tx
+                        .send((idx, PrepFrame { pyr, sharpness, pts, luma_fnv }))
+                        .is_err()
+                    {
                         break;
                     }
                 }
@@ -423,9 +451,11 @@ fn run_vo(
         let mut pending: std::collections::HashMap<u64, PrepFrame> =
             std::collections::HashMap::new();
         let mut next = 0u64;
+        let mut luma_fnvs: Vec<u64> = Vec::new();
         while let Ok((idx, frame)) = prep_rx.recv() {
             pending.insert(idx, frame);
             while let Some(f) = pending.remove(&next) {
+                luma_fnvs.push(f.luma_fnv);
                 let fe = fe.get_or_insert_with(|| {
                     let (tw, th) = (f.pyr.levels[0].width, f.pyr.levels[0].height);
                     let fpx = focal.unwrap_or(0.85 * tw.max(th) as f64);
@@ -454,7 +484,7 @@ fn run_vo(
                 }
             }
         }
-        (fe, next)
+        (fe, next, luma_fnvs)
     });
 
     let mut sent = 0u64;
@@ -505,7 +535,7 @@ fn run_vo(
     for w in prep_pool {
         w.join().expect("prep worker panicked");
     }
-    let (vo, n) = spine.join().expect("tracking spine panicked");
+    let (vo, n, luma_fnvs) = spine.join().expect("tracking spine panicked");
     let mut fe = vo.context("no frames decoded")?;
     let intrinsics = fe.intrinsics();
     let track_scale = video_size.0.max(video_size.1).div_ceil(TRACK_MAX_SIDE);
@@ -528,10 +558,14 @@ fn run_vo(
     if let (Ok(path), Some(trace)) = (std::env::var("SPLATTAR_KF_TRACE"), &fe.kf_trace) {
         let mut s = String::new();
         for (i, (flow, surv, live)) in trace.iter().enumerate() {
-            s.push_str(&format!("{i},{flow},{surv},{live}\n"));
+            let fnv = luma_fnvs.get(i).copied().unwrap_or(0);
+            s.push_str(&format!("{i},{flow},{surv},{live},{fnv:016x}\n"));
         }
         let _ = std::fs::write(&path, s);
         log::info!("kf trace written to {path}");
+    }
+    if std::env::var_os("SPLATTAR_CAUSAL_ONLY").is_some() {
+        anyhow::bail!("causal-only run (SPLATTAR_CAUSAL_ONLY set) — no solve");
     }
 
     let t1 = std::time::Instant::now();
@@ -864,7 +898,8 @@ fn train_and_bake(
         // the earlier room-run collapse tracks scene evolution, not these
         // kernels — watch it/s in logs, not this config.
         geo_start: 1500,
-        lambda_dist: 0.01,
+        // 0.01 costs ~5 dB even correctly normalized (RESULTS.md).
+        lambda_dist: 0.001,
         lambda_normal: 0.05,
         reg_opacity: 0.01,
         reg_scale: 0.005,

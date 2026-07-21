@@ -574,9 +574,14 @@ impl Trainer {
         if let Some(deg) = iter.checked_div(self.config.sh_promote_every) {
             camera.sh_degree = deg.min(camera.sh_degree);
         }
+        // Same per-pixel normalization as lambda_dist above: the kernel sums
+        // over rays and its `lambda` uniform is documented as carrying the
+        // 1/N. Passing the raw config value over-weighted this loss by the
+        // pixel count (~4e5 at 779×519) and cost ~10 dB — measured in
+        // RESULTS.md; it is the reason models never converged.
         self.normal_loss.set_lambda(
             ctx,
-            if geo_on { self.config.lambda_normal } else { 0.0 },
+            if geo_on { self.config.lambda_normal / n_px } else { 0.0 },
             camera.focal,
         );
 
