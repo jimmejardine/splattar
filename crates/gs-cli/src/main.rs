@@ -44,34 +44,6 @@ enum Command {
         #[arg(long, value_name = "DIR")]
         render_golden: Option<PathBuf>,
     },
-    /// Full pipeline: video → VO → train → baked .ply splat model.
-    Run {
-        /// Path to an H.264 .mp4 walkthrough video.
-        video: PathBuf,
-        /// Focal length guess in pixels (default: 0.85 × the long side).
-        #[arg(long)]
-        focal: Option<f64>,
-        /// Stop after this many decoded frames (0 = whole video).
-        #[arg(long, default_value_t = 0)]
-        max_frames: u32,
-        #[arg(long, default_value_t = 4000)]
-        iters: u32,
-        #[arg(long, default_value_t = 150_000)]
-        budget: u32,
-        /// Integer downscale applied to training images.
-        #[arg(long, default_value_t = 2)]
-        downscale: u32,
-        /// Cap on training views (sharpest-per-window selection).
-        #[arg(long, default_value_t = 120)]
-        max_views: u32,
-        /// Fraction of training during which pose refinement runs (1.0 =
-        /// full run; the LR decays on the position schedule either way).
-        #[arg(long, default_value_t = 1.0)]
-        pose_window: f32,
-        /// Output path for the baked compat .ply.
-        #[arg(long)]
-        out: Option<PathBuf>,
-    },
     /// Visual odometry: decode a video, track, solve keyframe poses, and
     /// write the trajectory + sparse landmarks as CSV next to the video.
     Pose {
@@ -93,14 +65,15 @@ enum Command {
         /// Path to an H.264/H.265 .mp4 video.
         video: PathBuf,
     },
-    /// Extend an existing project with another video: VO, cross-video Sim(3)
-    /// registration against the project landmarks, train, persist as a new
-    /// submap (registered, or an island if no overlap is found).
+    /// Ingest a video into a project (created on first use): VO → per-segment
+    /// Sim(3) edge registration or island → train → new submap(s). The only
+    /// ingestion command — order of adds doesn't matter (no submap has a
+    /// privileged gauge; placement is resolved per connected component).
     Add {
-        /// Path to an H.264 .mp4 walkthrough video.
+        /// Path to an H.264/H.265 .mp4 walkthrough video.
         video: PathBuf,
-        /// Project directory created by `run`.
-        #[arg(long)]
+        /// Project directory (created if absent).
+        #[arg(long, default_value = "gs-project")]
         project: PathBuf,
         #[arg(long)]
         focal: Option<f64>,
@@ -114,6 +87,10 @@ enum Command {
         downscale: u32,
         #[arg(long, default_value_t = 120)]
         max_views: u32,
+        /// Fraction of training during which pose refinement runs (1.0 =
+        /// full run; the LR decays on the position schedule either way).
+        #[arg(long, default_value_t = 1.0)]
+        pose_window: f32,
     },
     /// Validation harness: train on a posed COLMAP-format dataset.
     Train {
@@ -240,19 +217,6 @@ fn main() -> anyhow::Result<()> {
             };
             gs_viewer::windowed::run(cloud, options).map_err(|e| anyhow::anyhow!(e))
         }
-        Command::Run {
-            video,
-            focal,
-            max_frames,
-            iters,
-            budget,
-            downscale,
-            max_views,
-            pose_window,
-            out,
-        } => run_pipeline(
-            &video, focal, max_frames, iters, budget, downscale, max_views, pose_window, out,
-        ),
         Command::Pose {
             video,
             focal,
@@ -269,8 +233,10 @@ fn main() -> anyhow::Result<()> {
             budget,
             downscale,
             max_views,
+            pose_window,
         } => run_add(
             &video, &project, focal, max_frames, iters, budget, downscale, max_views,
+            pose_window,
         ),
         Command::Train {
             dataset,
@@ -843,81 +809,13 @@ fn load_seg_poses(
     Ok(out)
 }
 
-/// M7 pipeline: video -> VO -> train -> project dir with submap-0 + baked ply.
-#[allow(clippy::too_many_arguments)]
-fn run_pipeline(
-    video: &std::path::Path,
-    focal: Option<f64>,
-    max_frames: u32,
-    iters: u32,
-    budget: u32,
-    downscale: u32,
-    max_views: u32,
-    pose_window: f32,
-    out: Option<PathBuf>,
-) -> anyhow::Result<()> {
-    let vo = run_vo(video, focal, max_frames)?;
-    // Largest segment becomes submap-0 (its gauge = project world); the
-    // clip beyond track-continuity breaks goes through the same
-    // register-or-island path another video would.
-    let mut order: Vec<usize> = (0..vo.segments.len()).collect();
-    order.sort_by_key(|&i| std::cmp::Reverse(solved_count(&vo.segments[i])));
-    let primary = &vo.segments[order[0]];
-    let prepared = prepare_training(video, &vo, primary, downscale, max_views)?;
-
-    // Project layout: submap-0 in its own gauge (= project world).
-    let project_root = video.with_extension("project");
-    let (idx, dir) = project::Project::next_submap_dir(&project_root)?;
-    anyhow::ensure!(idx == 0, "project {} already exists — use `add`", project_root.display());
-    project::write_meta(
-        &dir.join("meta.txt"),
-        &project::SubmapMeta {
-            video: video.display().to_string(),
-            focal: vo.intrinsics.focal,
-            width: vo.video_size.0,
-            height: vo.video_size.1,
-            kf_range: seg_kf_range(primary),
-            focal_refined: None,
-            world_from_submap: Some(project::WorldFromSubmap::identity()),
-        },
-    )?;
-    project::write_landmarks(&dir.join("landmarks.bin"), &prepared.landmarks)?;
-    write_trajectory_csv(&dir.join("trajectory.csv"), &vo)?;
-    write_seg_poses(&dir.join("poses.csv"), primary)?;
-    write_thumbs(&dir, &vo.thumbs, seg_kf_range(primary))?;
-
-    let ply = dir.join("splat.ply");
-    let (psnr, num, fscale) = train_and_bake(prepared, iters, budget, pose_window, &ply)?;
-    update_refined_focal(&dir, fscale)?;
-    if let Some(extra) = out {
-        std::fs::copy(&ply, &extra)?;
-    }
-    for &si in &order[1..] {
-        if let Err(e) = add_segment_submap(
-            &project_root,
-            video,
-            &vo,
-            &vo.segments[si],
-            iters,
-            budget,
-            downscale,
-            max_views,
-        ) {
-            log::warn!("segment {si}: skipped ({e:#})");
-        }
-    }
-    println!(
-        "done: {} ({} submap(s), submap-0: {num} surfels, held-out PSNR {psnr:.2} dB) — walk it with `gs-cli view {}`",
-        project_root.display(),
-        order.len(),
-        project_root.display()
-    );
-    Ok(())
-}
-
-/// M8: extend a project with another video — each VO segment is registered
-/// via descriptor-matched 3D-3D landmark correspondences (RANSAC Sim(3)),
-/// or persisted as an island.
+/// The ingestion command: video → VO → per-segment registration-or-island →
+/// train → new submap(s). Creates the project directory on first use. No
+/// submap has a privileged gauge; each successful registration is stored as
+/// a pairwise Sim(3) EDGE to a concrete existing submap, and world placement
+/// is resolved per connected component at compose time — so the order in
+/// which videos are added doesn't matter (submap indices and archipelago
+/// layout follow add order, which is presentation-only).
 #[allow(clippy::too_many_arguments)]
 fn run_add(
     video: &std::path::Path,
@@ -928,6 +826,7 @@ fn run_add(
     budget: u32,
     downscale: u32,
     max_views: u32,
+    pose_window: f32,
 ) -> anyhow::Result<()> {
     let vo = run_vo(video, focal, max_frames)?;
     // Largest segment first: it has the best registration odds and, once
@@ -944,18 +843,75 @@ fn run_add(
             budget,
             downscale,
             max_views,
+            pose_window,
         ) {
             log::warn!("segment {si}: skipped ({e:#})");
         }
     }
-    println!("view the composed project with `gs-cli view {}`", project_root.display());
+    let proj = project::Project::load_or_empty(project_root)?;
+    let placements = project::resolve_placements(&proj);
+    let components = placements.iter().map(|p| p.component).max().map_or(0, |c| c + 1);
+    println!(
+        "project {}: {} submap(s) in {} component(s) — walk it with `gs-cli view {}`",
+        project_root.display(),
+        proj.submaps.len(),
+        components,
+        project_root.display()
+    );
     Ok(())
 }
 
-/// Register one VO segment against the project's pooled landmark DB and
-/// persist it as a new trained submap (or an island when no overlap is
-/// found). Reloads the project each call so segments landed earlier extend
-/// the DB for later ones.
+/// Load every submap's landmarks in LOCAL coordinates, deduped per submap.
+fn load_project_landmarks(
+    project_root: &std::path::Path,
+    proj: &project::Project,
+) -> anyhow::Result<Vec<Vec<DbLandmark>>> {
+    let mut locals = Vec::with_capacity(proj.submaps.len());
+    for i in 0..proj.submaps.len() {
+        let lms = project::read_landmarks(
+            &project::Project::submap_dir(project_root, i).join("landmarks.bin"),
+        )?;
+        let entries: Vec<DbLandmark> = lms
+            .into_iter()
+            .map(|l| DbLandmark {
+                pos: glam::DVec3::new(l.pos[0] as f64, l.pos[1] as f64, l.pos[2] as f64),
+                desc: l.desc,
+                kf: l.kf,
+                obs: (l.obs[0], l.obs[1]),
+                submap: i,
+            })
+            .collect();
+        locals.push(dedup_db_landmarks(entries));
+    }
+    Ok(locals)
+}
+
+/// Pool every submap's landmarks (islands included — no privileged gauge)
+/// into its component-root frame via the resolved placements.
+fn build_component_db(
+    locals: &[Vec<DbLandmark>],
+    placements: &[project::Placement],
+) -> Vec<DbLandmark> {
+    let mut db = Vec::new();
+    for (i, lms) in locals.iter().enumerate() {
+        for l in lms {
+            db.push(DbLandmark {
+                pos: placements[i].world.apply(l.pos),
+                desc: l.desc,
+                kf: l.kf,
+                obs: l.obs,
+                submap: i,
+            });
+        }
+    }
+    db
+}
+
+/// Register one VO segment against the project and persist it as a new
+/// trained submap — with a pairwise Sim(3) edge to an existing submap when
+/// registration succeeds, as an island otherwise. Reloads the project each
+/// call so segments landed earlier are bridge targets for later ones. The
+/// first submap of a fresh project is trivially an island.
 #[allow(clippy::too_many_arguments)]
 fn add_segment_submap(
     project_root: &std::path::Path,
@@ -966,41 +922,19 @@ fn add_segment_submap(
     budget: u32,
     downscale: u32,
     max_views: u32,
+    pose_window: f32,
 ) -> anyhow::Result<()> {
     use glam::DVec3;
-    use gs_pose::sim3::Sim3G;
 
-    let proj = project::Project::load(project_root)?;
-
-    // Registered submaps' landmarks in project-world coordinates, retaining
-    // per-submap identity + keyframe index (both matter for registration
-    // strategies), spatially deduped per submap (KLT respawns re-triangulate
-    // the same corner dozens of times; coincident duplicates let a collapse
-    // transform out-vote the true registration).
-    let mut world: Vec<DbLandmark> = Vec::new();
-    for (i, meta) in proj.submaps.iter().enumerate() {
-        let Some(w) = &meta.world_from_submap else { continue };
-        let lms = project::read_landmarks(
-            &project::Project::submap_dir(project_root, i).join("landmarks.bin"),
-        )?;
-        let s = Sim3G {
-            scale: w.scale,
-            rot: glam::DQuat::from_xyzw(w.quat[1], w.quat[2], w.quat[3], w.quat[0]),
-            trans: DVec3::from_array(w.trans),
-        };
-        let entries: Vec<DbLandmark> = lms
-            .into_iter()
-            .map(|l| DbLandmark {
-                pos: s.apply(DVec3::new(l.pos[0] as f64, l.pos[1] as f64, l.pos[2] as f64)),
-                desc: l.desc,
-                kf: l.kf,
-                obs: (l.obs[0], l.obs[1]),
-                submap: i,
-            })
-            .collect();
-        world.extend(dedup_db_landmarks(entries));
-    }
-    log::info!("project DB: {} registered landmarks after dedup", world.len());
+    let proj = project::Project::load_or_empty(project_root)?;
+    let placements = project::resolve_placements(&proj);
+    // Per-submap LOCAL landmarks (bridge targets) + the component-frame DB
+    // (global matching). Spatial dedup per submap: KLT respawns
+    // re-triangulate the same corner dozens of times, and coincident
+    // duplicates let a collapse transform out-vote the true registration.
+    let locals = load_project_landmarks(project_root, &proj)?;
+    let db = build_component_db(&locals, &placements);
+    log::info!("project DB: {} landmarks after dedup", db.len());
 
     let prepared = prepare_training(video, vo, seg, downscale, max_views)?;
 
@@ -1018,22 +952,26 @@ fn add_segment_submap(
     let new = dedup_db_landmarks(new_all);
 
     // Strategy ladder: temporal bridge (same-video neighbor segments — small
-    // viewpoint change, descriptors reliable), then covisibility-voted global
-    // matching. No success → island (first-class, per PLAN).
+    // viewpoint change, descriptors reliable; yields a seg→submap-local edge
+    // directly), then covisibility-voted global matching (yields a
+    // seg→component-root transform, folded to an edge on the winning
+    // submap). No success → island (first-class, per PLAN).
     let seg_range = seg_kf_range(seg);
-    let mut registration =
-        try_bridge_registration(&proj, video, seg, &vo.intrinsics, seg_range, &world, &new);
+    let mut registration: Option<(usize, gs_pose::sim3::Sim3G)> =
+        try_bridge_registration(&proj, video, seg, &vo.intrinsics, seg_range, &locals);
     if registration.is_none() {
-        registration = try_global_registration(&world, &new);
+        registration = try_global_registration(&db, &new, &placements).map(|(target, s)| {
+            // s maps seg → component-root frame; the stored edge must map
+            // seg → target-submap-local.
+            (target, placements[target].world.inverse().compose(&s))
+        });
     }
 
     let (idx, dir) = project::Project::next_submap_dir(project_root)?;
-    let world_from_submap = registration.map(|s| project::WorldFromSubmap {
-        scale: s.scale,
-        quat: [s.rot.w, s.rot.x, s.rot.y, s.rot.z],
-        trans: s.trans.to_array(),
-    });
-    let registered = world_from_submap.is_some();
+    let edges = registration
+        .map(|(to, s)| vec![project::Sim3Edge::from_sim3(to as u32, &s)])
+        .unwrap_or_default();
+    let edge_to = edges.first().map(|e| e.to);
     project::write_meta(
         &dir.join("meta.txt"),
         &project::SubmapMeta {
@@ -1043,7 +981,7 @@ fn add_segment_submap(
             height: vo.video_size.1,
             kf_range: seg_kf_range(seg),
             focal_refined: None,
-            world_from_submap,
+            edges,
         },
     )?;
     project::write_landmarks(&dir.join("landmarks.bin"), &prepared.landmarks)?;
@@ -1052,14 +990,13 @@ fn add_segment_submap(
     write_thumbs(&dir, &vo.thumbs, seg_kf_range(seg))?;
 
     let ply = dir.join("splat.ply");
-    let (psnr, num, fscale) = train_and_bake(prepared, iters, budget, 1.0, &ply)?;
+    let (psnr, num, fscale) = train_and_bake(prepared, iters, budget, pose_window, &ply)?;
     update_refined_focal(&dir, fscale)?;
     println!(
         "submap-{idx}: {num} surfels, held-out PSNR {psnr:.2} dB — {}",
-        if registered {
-            "REGISTERED into the project world (overlap found)"
-        } else {
-            "no overlap found: kept as an ISLAND (film a bridge clip to connect it)"
+        match edge_to {
+            Some(t) => format!("EDGE to submap-{t} (overlap found)"),
+            None => "no overlap found: ISLAND (film a bridge clip to connect it)".into(),
         }
     );
     Ok(())
@@ -1119,7 +1056,7 @@ fn attempt_sim3(
     thresh_frac: f64,
     min_inliers: usize,
     label: &str,
-) -> Option<gs_pose::sim3::Sim3G> {
+) -> Option<(gs_pose::sim3::Sim3G, Vec<usize>)> {
     // Same phone, comparable walking pace: cross-submap gauge scale beyond
     // [0.2, 5] is physically implausible, and unconstrained search lets
     // near-collapse models out-vote the truth on ambiguous pools.
@@ -1149,23 +1086,24 @@ fn attempt_sim3(
     (inliers.len() >= min_inliers
         && (0.05..=20.0).contains(&sim3.scale)
         && spread > 4.0 * thresh)
-        .then_some(sim3)
+        .then_some((sim3, inliers))
 }
 
 /// Temporal bridge: consecutive segments of the SAME video are separated by
 /// a track-loss cut, but their boundary keyframes view the same space seconds
 /// apart — small viewpoint change, where the patch descriptors are reliable.
 /// Match only boundary-window landmarks against each temporally adjacent
-/// registered submap.
+/// submap (islands included — no privileged gauge). Candidate landmarks are
+/// in submap-LOCAL coordinates, so a success is directly the pairwise edge
+/// (segment coords → submap-i coords).
 fn try_bridge_registration(
     proj: &project::Project,
     video: &std::path::Path,
     seg: &gs_pose::VoResult,
     intr: &gs_pose::vo::Intrinsics,
     seg_range: Option<(u32, u32)>,
-    world: &[DbLandmark],
-    _new: &[DbLandmark],
-) -> Option<gs_pose::sim3::Sim3G> {
+    locals: &[Vec<DbLandmark>],
+) -> Option<(usize, gs_pose::sim3::Sim3G)> {
     use gs_pose::descriptor::match_descriptors;
     const WINDOW: u32 = 60; // keyframes each side of the cut
     const MAX_GAP: u32 = 200; // dropped stretches between segments can be long
@@ -1173,7 +1111,7 @@ fn try_bridge_registration(
     let (s0, s1) = seg_range?;
     let video_str = video.display().to_string();
     for (i, meta) in proj.submaps.iter().enumerate() {
-        if meta.world_from_submap.is_none() || meta.video != video_str {
+        if meta.video != video_str {
             continue;
         }
         let Some((o0, o1)) = meta.kf_range else { continue };
@@ -1185,9 +1123,9 @@ fn try_bridge_registration(
         } else {
             continue;
         };
-        let w_sub: Vec<&DbLandmark> = world
+        let w_sub: Vec<&DbLandmark> = locals[i]
             .iter()
-            .filter(|l| l.submap == i && l.kf.abs_diff(world_edge) <= WINDOW)
+            .filter(|l| l.kf.abs_diff(world_edge) <= WINDOW)
             .collect();
         // New side straight from the segment (indices retained — the 2D stage
         // needs each landmark's full observation list).
@@ -1220,8 +1158,8 @@ fn try_bridge_registration(
         if pairs.len() >= 8 {
             let a: Vec<glam::DVec3> = pairs.iter().map(|&(x, _)| n_sub[x].1).collect();
             let b: Vec<glam::DVec3> = pairs.iter().map(|&(_, y)| w_sub[y].pos).collect();
-            if let Some(s) = attempt_sim3(&a, &b, 0.15, 8, &format!("bridge s{i}")) {
-                return Some(s);
+            if let Some((s, _)) = attempt_sim3(&a, &b, 0.15, 8, &format!("bridge s{i}")) {
+                return Some((i, s));
             }
         }
         // 2D bridge: boundary landmarks on the new side come from short
@@ -1292,7 +1230,7 @@ fn try_bridge_registration(
                             s.scale
                         );
                         if inl >= min_obs && (0.05..=20.0).contains(&s.scale) {
-                            return Some(s);
+                            return Some((i, s));
                         }
                     }
                     None => {
@@ -1311,11 +1249,15 @@ fn try_bridge_registration(
 /// Covisibility-voted global matching: match everything loosely, then keep
 /// only matches whose (new-kf, world-kf) neighborhood pair gathers multiple
 /// independent votes — genuine overlap concentrates on covisible keyframe
-/// pairs, noise scatters. This replaces blind pooled matching.
+/// pairs, noise scatters. The Sim(3) is estimated PER COMPONENT (pooling
+/// across components would feed points from unrelated frames into one
+/// RANSAC). Returns the target submap (mode of the inliers' owners) and the
+/// transform seg → that submap's COMPONENT-ROOT frame.
 fn try_global_registration(
     world: &[DbLandmark],
     new: &[DbLandmark],
-) -> Option<gs_pose::sim3::Sim3G> {
+    placements: &[project::Placement],
+) -> Option<(usize, gs_pose::sim3::Sim3G)> {
     use gs_pose::descriptor::match_descriptors;
     const BUCKET: u32 = 8; // keyframes per vote bucket
     const MIN_VOTES: usize = 5;
@@ -1359,9 +1301,40 @@ fn try_global_registration(
     if filtered.len() < 20 {
         return None;
     }
-    let a: Vec<glam::DVec3> = filtered.iter().map(|&(x, _)| new[x].pos).collect();
-    let b: Vec<glam::DVec3> = filtered.iter().map(|&(_, y)| world[y].pos).collect();
-    attempt_sim3(&a, &b, 0.05, 25, "covis")
+    // Group by connected component, biggest match pool first.
+    let mut by_comp: std::collections::HashMap<usize, Vec<(usize, usize)>> =
+        std::collections::HashMap::new();
+    for &(x, y) in &filtered {
+        by_comp
+            .entry(placements[world[y].submap].component)
+            .or_default()
+            .push((x, y));
+    }
+    let mut comps: Vec<(usize, Vec<(usize, usize)>)> = by_comp.into_iter().collect();
+    comps.sort_by_key(|(c, v)| (std::cmp::Reverse(v.len()), *c));
+    for (comp, set) in comps {
+        if set.len() < 20 {
+            continue;
+        }
+        let a: Vec<glam::DVec3> = set.iter().map(|&(x, _)| new[x].pos).collect();
+        let b: Vec<glam::DVec3> = set.iter().map(|&(_, y)| world[y].pos).collect();
+        if let Some((sim3, inliers)) =
+            attempt_sim3(&a, &b, 0.05, 25, &format!("covis c{comp}"))
+        {
+            // Target = the submap owning the most inlier landmarks.
+            let mut counts: std::collections::HashMap<usize, usize> =
+                std::collections::HashMap::new();
+            for &i in &inliers {
+                *counts.entry(world[set[i].1].submap).or_default() += 1;
+            }
+            let target = counts
+                .into_iter()
+                .max_by_key(|&(s, n)| (n, std::cmp::Reverse(s)))
+                .map(|(s, _)| s)?;
+            return Some((target, sim3));
+        }
+    }
+    None
 }
 
 /// Record the trainer-measured focal in the submap meta (geometry itself
@@ -1486,28 +1459,25 @@ fn run_register(
 
     let proj = project::Project::load(project_root)?;
     anyhow::ensure!(submap < proj.submaps.len(), "no submap-{submap}");
+    let placements = project::resolve_placements(&proj);
 
     let load = |i: usize| -> anyhow::Result<Vec<project::Landmark>> {
         project::read_landmarks(
             &project::Project::submap_dir(project_root, i).join("landmarks.bin"),
         )
     };
-    // World: all registered submaps except the target. Raw per-submap lists
-    // are retained for observation snapping in the pairwise stage.
+    // World: every other submap (islands included), each placed in its
+    // component-root frame. Raw per-submap lists are retained for
+    // observation snapping in the pairwise stage.
     let mut world: Vec<DbLandmark> = Vec::new();
     let mut world_raw: Vec<(usize, Vec<project::Landmark>)> = Vec::new();
     let mut world_sims: std::collections::HashMap<usize, Sim3G> =
         std::collections::HashMap::new();
-    for (i, meta) in proj.submaps.iter().enumerate() {
+    for (i, pl) in placements.iter().enumerate() {
         if i == submap {
             continue;
         }
-        let Some(w) = &meta.world_from_submap else { continue };
-        let s = Sim3G {
-            scale: w.scale,
-            rot: glam::DQuat::from_xyzw(w.quat[1], w.quat[2], w.quat[3], w.quat[0]),
-            trans: DVec3::from_array(w.trans),
-        };
+        let s = pl.world;
         let raw = load(i)?;
         let entries: Vec<DbLandmark> = raw
             .iter()
@@ -1601,11 +1571,46 @@ fn run_register(
         .collect();
     println!("covis-filtered: {} matches in {} buckets", filtered.len(), good.len());
 
-    let mut registration = None;
+    // Registration result: (target submap, Sim3 submap-local → target's
+    // component-root frame).
+    let mut registration: Option<(usize, Sim3G)> = None;
     if filtered.len() >= 15 {
-        let a: Vec<DVec3> = filtered.iter().map(|&(x, _)| new_pts[x]).collect();
-        let b: Vec<DVec3> = filtered.iter().map(|&(_, y)| world[y].pos).collect();
-        registration = attempt_sim3(&a, &b, 0.05, 15, "register-lab 3D");
+        // Per-component RANSAC — pooling across components would mix
+        // unrelated placement frames into one model.
+        let mut by_comp: std::collections::HashMap<usize, Vec<(usize, usize)>> =
+            std::collections::HashMap::new();
+        for &(x, y) in &filtered {
+            by_comp
+                .entry(placements[world[y].submap].component)
+                .or_default()
+                .push((x, y));
+        }
+        let mut comps: Vec<_> = by_comp.into_iter().collect();
+        comps.sort_by_key(|(c, v)| (std::cmp::Reverse(v.len()), *c));
+        for (comp, set) in comps {
+            if set.len() < 15 {
+                continue;
+            }
+            let a: Vec<DVec3> = set.iter().map(|&(x, _)| new_pts[x]).collect();
+            let b: Vec<DVec3> = set.iter().map(|&(_, y)| world[y].pos).collect();
+            if let Some((s, inliers)) =
+                attempt_sim3(&a, &b, 0.05, 15, &format!("register-lab 3D c{comp}"))
+            {
+                let mut counts: std::collections::HashMap<usize, usize> =
+                    std::collections::HashMap::new();
+                for &i in &inliers {
+                    *counts.entry(world[set[i].1].submap).or_default() += 1;
+                }
+                if let Some(target) = counts
+                    .into_iter()
+                    .max_by_key(|&(t, n)| (n, std::cmp::Reverse(t)))
+                    .map(|(t, _)| t)
+                {
+                    registration = Some((target, s));
+                    break;
+                }
+            }
+        }
     }
 
     // 2D stage: DLT-PnP a covisible keyframe of the target submap against
@@ -1676,7 +1681,7 @@ fn run_register(
                         s.scale
                     );
                     if inl >= 10 && (0.05..=20.0).contains(&s.scale) {
-                        registration = Some(s);
+                        registration = Some((dom.0, s));
                         break;
                     }
                 }
@@ -1870,9 +1875,9 @@ fn run_register(
                 bridge_by_kn.entry(kn).or_default().extend(bridge);
             }
             if a3.len() >= 8
-                && let Some(s) = attempt_sim3(&a3, &b3, 0.08, 8, "pairwise 3D")
+                && let Some((s, _)) = attempt_sim3(&a3, &b3, 0.08, 8, "pairwise 3D")
             {
-                registration = Some(s);
+                registration = Some((ws, s));
                 break 'regions;
             }
             } // kw
@@ -1895,8 +1900,16 @@ fn run_register(
                     .map(|p| (*p - cen).length())
                     .fold(0.0f64, f64::max)
                     .max(1.0);
-                if rms < 0.08 * scene && (0.2..=5.0).contains(&s.scale) {
-                    registration = Some(s);
+                // Rel-pair collection is gated to a single world submap, so
+                // pool_submap is the attribution. NOTE: the rms gate scales
+                // off that single submap's extent — if the single-submap
+                // gate is ever loosened, per-component monocular scales
+                // break this silently.
+                if rms < 0.08 * scene
+                    && (0.2..=5.0).contains(&s.scale)
+                    && let Some(ps) = pool_submap
+                {
+                    registration = Some((ps, s));
                 }
             } else {
                 println!(
@@ -1908,9 +1921,13 @@ fn run_register(
 
         // Pooled attempts across all regions: 3D Umeyama first, then the 2D
         // depth-ratio bridge per new-side keyframe with enough observations.
-        if registration.is_none() && pool_a.len() >= 10 {
+        if registration.is_none()
+            && pool_a.len() >= 10
+            && let Some(ps) = pool_submap
+        {
             println!("pooled pairwise: {} pairs across regions", pool_a.len());
-            registration = attempt_sim3(&pool_a, &pool_b, 0.18, 8, "pairwise pooled");
+            registration = attempt_sim3(&pool_a, &pool_b, 0.18, 8, "pairwise pooled")
+                .map(|(s, _)| (ps, s));
         }
         if registration.is_none() {
             let mut kns: Vec<_> = bridge_by_kn.iter().collect();
@@ -1932,8 +1949,11 @@ fn run_register(
                         bridge.len(),
                         s.scale
                     );
-                    if inl >= 8 && (0.2..=5.0).contains(&s.scale) {
-                        registration = Some(s);
+                    if inl >= 8
+                        && (0.2..=5.0).contains(&s.scale)
+                        && let Some(ps) = pool_submap
+                    {
+                        registration = Some((ps, s));
                         break;
                     }
                 }
@@ -1942,21 +1962,20 @@ fn run_register(
     }
 
     match &registration {
-        Some(s) => println!("REGISTERED: scale {:.3}", s.scale),
+        Some((t, s)) => println!("REGISTERED to submap-{t}: scale {:.3}", s.scale),
         None => println!("no registration"),
     }
     if write
-        && let Some(s) = registration
+        && let Some((t, s)) = registration
     {
+        // s maps submap-local → target's component-root frame; fold the
+        // target's own placement out to get the pairwise edge submap → t.
+        let edge = placements[t].world.inverse().compose(&s);
         let dir = project::Project::submap_dir(project_root, submap);
         let mut meta = project::read_meta(&dir.join("meta.txt"))?;
-        meta.world_from_submap = Some(project::WorldFromSubmap {
-            scale: s.scale,
-            quat: [s.rot.w, s.rot.x, s.rot.y, s.rot.z],
-            trans: s.trans.to_array(),
-        });
+        meta.edges = vec![project::Sim3Edge::from_sim3(t as u32, &edge)];
         project::write_meta(&dir.join("meta.txt"), &meta)?;
-        println!("written to submap-{submap}/meta.txt");
+        println!("edge to submap-{t} written to submap-{submap}/meta.txt");
     }
     Ok(())
 }
@@ -1992,14 +2011,14 @@ fn run_export(project_root: &std::path::Path, out: Option<PathBuf>) -> anyhow::R
     let mut manifest = String::from("{\n  \"submaps\": [\n");
     for (k, pl) in placements.iter().enumerate() {
         manifest.push_str(&format!(
-            "    {{\"video\": {:?}, \"registered\": {}, \"surfel_start\": {}, \
-             \"surfel_count\": {}, \"island_offset_x\": {:.4}, \
+            "    {{\"video\": {:?}, \"component\": {}, \"surfel_start\": {}, \
+             \"surfel_count\": {}, \"offset_x\": {:.4}, \
              \"bbox_min\": [{:.4}, {:.4}, {:.4}], \"bbox_max\": [{:.4}, {:.4}, {:.4}]}}{}\n",
             pl.video,
-            pl.registered,
+            pl.component,
             pl.surfels.start,
             pl.surfels.len(),
-            pl.island_offset_x,
+            pl.offset_x,
             pl.bbox.0[0], pl.bbox.0[1], pl.bbox.0[2],
             pl.bbox.1[0], pl.bbox.1[1], pl.bbox.1[2],
             if k + 1 < placements.len() { "," } else { "" }
@@ -2020,29 +2039,34 @@ fn run_export(project_root: &std::path::Path, out: Option<PathBuf>) -> anyhow::R
 /// Per-submap placement info produced during composition (for the manifest).
 struct SubmapPlacement {
     video: String,
-    registered: bool,
+    /// Connected component this submap belongs to (archipelago view).
+    component: usize,
     surfels: std::ops::Range<usize>,
-    /// Presentation x-offset applied to islands (0 for registered submaps).
-    island_offset_x: f32,
-    /// World-space AABB after placement.
+    /// Presentation x-offset applied to this submap's whole component
+    /// (0 for component 0; never stored — recomputed every composition).
+    offset_x: f32,
+    /// World-space AABB after placement (offset included).
     bbox: ([f32; 3], [f32; 3]),
 }
 
-/// Compose a project's submaps into one SplatCloud: registered submaps go
-/// through their Sim(3) into the shared world; islands are placed side by
-/// side along +x (presentation-only offset, never stored — per the two-tier
-/// data-model rule).
+/// Compose a project's submaps into one SplatCloud: each submap goes through
+/// its resolved placement into its component-root frame; connected
+/// components are then laid side by side along +x (presentation-only offset,
+/// never stored — per the two-tier data-model rule).
 fn compose_project(
     root: &std::path::Path,
 ) -> anyhow::Result<(gs_core::SplatCloud, Vec<SubmapPlacement>)> {
-    use glam::{DQuat, DVec3, Quat, Vec3};
+    use glam::{Quat, Vec3};
 
     let proj = project::Project::load(root)?;
-    let mut merged: Option<gs_core::SplatCloud> = None;
-    let mut island_cursor: Option<f32> = None; // starts at world max x + gap
-    let mut placements: Vec<SubmapPlacement> = Vec::new();
+    let resolved = project::resolve_placements(&proj);
 
-    for (i, meta) in proj.submaps.iter().enumerate() {
+    // Pass 1: load every submap, apply its placement transform, gather
+    // per-component x extents for the archipelago layout.
+    let mut clouds: Vec<gs_core::SplatCloud> = Vec::new();
+    let mut comp_extent: std::collections::BTreeMap<usize, (f32, f32)> =
+        std::collections::BTreeMap::new();
+    for (i, pl) in resolved.iter().enumerate() {
         let ply = project::Project::submap_dir(root, i).join("splat.ply");
         let contents = gs_io::load_ply(&ply)
             .with_context(|| format!("loading {}", ply.display()))?;
@@ -2050,63 +2074,69 @@ fn compose_project(
             bail!("{} is not a splat file", ply.display());
         };
 
-        // Transform into the world (or island placement).
-        let mut island_offset_x = 0.0f32;
-        match &meta.world_from_submap {
-            Some(w) => {
-                let s = w.scale as f32;
-                let rot = Quat::from_xyzw(
-                    w.quat[1] as f32,
-                    w.quat[2] as f32,
-                    w.quat[3] as f32,
-                    w.quat[0] as f32,
-                );
-                let t = Vec3::new(
-                    w.trans[0] as f32,
-                    w.trans[1] as f32,
-                    w.trans[2] as f32,
-                );
-                let _ = (DQuat::IDENTITY, DVec3::ZERO); // (glam f64 kept for future precision)
-                for p in &mut cloud.positions {
-                    *p = s * (rot * *p) + t;
-                }
-                for q in &mut cloud.rotations {
-                    *q = rot * *q;
-                }
-                for sc in &mut cloud.scales {
-                    *sc *= s;
-                }
-                // Note: SH bands deg>0 are not rotated (v1 simplification) —
-                // view-dependent color is slightly wrong for rotated submaps.
+        let w = &pl.world;
+        let s = w.scale as f32;
+        let rot = Quat::from_xyzw(
+            w.rot.x as f32,
+            w.rot.y as f32,
+            w.rot.z as f32,
+            w.rot.w as f32,
+        );
+        let t = Vec3::new(w.trans.x as f32, w.trans.y as f32, w.trans.z as f32);
+        for p in &mut cloud.positions {
+            *p = s * (rot * *p) + t;
+        }
+        for q in &mut cloud.rotations {
+            *q = rot * *q;
+        }
+        for sc in &mut cloud.scales {
+            *sc *= s;
+        }
+        // Note: SH bands deg>0 are not rotated (v1 simplification) —
+        // view-dependent color is slightly wrong for rotated submaps.
+
+        let e = comp_extent
+            .entry(pl.component)
+            .or_insert((f32::MAX, f32::MIN));
+        for p in &cloud.positions {
+            e.0 = e.0.min(p.x);
+            e.1 = e.1.max(p.x);
+        }
+        clouds.push(cloud);
+    }
+
+    // Component layout: component 0 keeps its frame; each further component
+    // is shifted so its min-x sits one gap past the previous one's max-x.
+    let mut comp_offset: std::collections::HashMap<usize, f32> =
+        std::collections::HashMap::new();
+    let mut cursor: Option<f32> = None;
+    for (&c, &(min_x, max_x)) in &comp_extent {
+        let width = (max_x - min_x).max(0.0);
+        let dx = match cursor {
+            None => 0.0,
+            Some(right) => {
+                let gap = width * 0.15 + 1.0;
+                right + gap - min_x
             }
-            None => {
-                // Island: normalize to sit next to the current world extent.
-                let (mut min_x, mut max_x) = (f32::MAX, f32::MIN);
-                for p in &cloud.positions {
-                    min_x = min_x.min(p.x);
-                    max_x = max_x.max(p.x);
-                }
-                let world_max = island_cursor.unwrap_or_else(|| {
-                    merged
-                        .as_ref()
-                        .map(|m| {
-                            m.positions
-                                .iter()
-                                .fold(f32::MIN, |acc, p| acc.max(p.x))
-                        })
-                        .unwrap_or(0.0)
-                });
-                let gap = (max_x - min_x) * 0.15 + 1.0;
-                let dx = world_max + gap - min_x;
-                for p in &mut cloud.positions {
-                    p.x += dx;
-                }
-                island_cursor = Some(world_max + gap + (max_x - min_x));
-                island_offset_x = dx;
-                log::info!("submap-{i} is an unregistered island — placed at +x offset {dx:.1}");
+        };
+        comp_offset.insert(c, dx);
+        cursor = Some(max_x + dx);
+        if dx != 0.0 {
+            log::info!("component {c} placed at +x offset {dx:.1} (archipelago view)");
+        }
+    }
+
+    // Pass 2: apply offsets, merge in submap order, record placements.
+    let mut merged: Option<gs_core::SplatCloud> = None;
+    let mut placements: Vec<SubmapPlacement> = Vec::new();
+    for (i, mut cloud) in clouds.into_iter().enumerate() {
+        let comp = resolved[i].component;
+        let dx = comp_offset[&comp];
+        if dx != 0.0 {
+            for p in &mut cloud.positions {
+                p.x += dx;
             }
         }
-
         let start = merged.as_ref().map_or(0, |m| m.positions.len());
         let mut bbox = ([f32::MAX; 3], [f32::MIN; 3]);
         for p in &cloud.positions {
@@ -2116,10 +2146,10 @@ fn compose_project(
             }
         }
         placements.push(SubmapPlacement {
-            video: meta.video.clone(),
-            registered: meta.world_from_submap.is_some(),
+            video: proj.submaps[i].video.clone(),
+            component: comp,
             surfels: start..start + cloud.positions.len(),
-            island_offset_x,
+            offset_x: dx,
             bbox,
         });
 

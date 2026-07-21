@@ -265,12 +265,8 @@ fn run_grad_parity_full(
         glam::DVec3::new(g_cam[6] as f64, g_cam[7] as f64, g_cam[8] as f64),
     );
     let gpu_cam_quat = gs_cpu_ref::math::quat_grad(scene.camera.quat, &dl_dr);
-    for dim in 0..4 {
-        cam_ck.check(
-            &format!("cam_quat[{dim}]"),
-            gpu_cam_quat[dim],
-            cpu.cam_quat[dim],
-        );
+    for (dim, g) in gpu_cam_quat.iter().enumerate() {
+        cam_ck.check(&format!("cam_quat[{dim}]"), *g, cpu.cam_quat[dim]);
     }
     eprintln!(
         "grad parity seed={seed} n={n} deg={deg} aux={aux}: worst rel {:.2e} at {} (cam {:.2e} at {})",

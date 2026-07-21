@@ -1,13 +1,18 @@
 //! Project persistence (M8): a project directory holds one submap per
-//! ingested video. Submap surfels and landmarks stay in submap-local
-//! coordinates forever (CLAUDE.md two-tier rule); each submap carries an
-//! optional Sim(3) into the project world (= submap 0's gauge). Islands are
-//! submaps without a registration — presentation offsets are computed at
-//! view/export time, never stored.
+//! ingested video segment. Submap surfels and landmarks stay in submap-local
+//! coordinates forever (CLAUDE.md two-tier rule). Connectivity is stored as
+//! **pairwise Sim(3) edges** between submaps — no submap has a privileged
+//! gauge, so ingestion order doesn't matter. World placement is resolved per
+//! connected component at compose time ([`resolve_placements`]): component
+//! root = lowest submap index, transforms chained along edges; per-component
+//! presentation offsets are computed at view/export time, never stored.
+//! Submaps with no edges are islands.
 //!
 //! Formats are deliberately tiny and hand-rolled (no serde in the workspace):
 //! `meta.txt` is `key=value` lines; `landmarks.bin` is a fixed-record binary
-//! with a magic header.
+//! with a magic header. Legacy metas carrying an absolute `sim3=` line (the
+//! old submap-0-gauge model) are migrated on read: identity → no edge (that
+//! was the old gauge marker), anything else → an edge to submap 0.
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -41,21 +46,33 @@ pub struct Landmark {
     pub obs_all: Vec<(u32, [f32; 2])>,
 }
 
-/// Sim(3) mapping submap coordinates into project-world coordinates.
+/// One pairwise Sim(3) constraint: maps THIS submap's coordinates into
+/// submap `to`'s coordinates. Never an identity gauge marker — a submap
+/// with no edges is an island.
 #[derive(Debug, Clone, Copy)]
-pub struct WorldFromSubmap {
+pub struct Sim3Edge {
+    pub to: u32,
     pub scale: f64,
     /// Unit quaternion, wxyz.
     pub quat: [f64; 4],
     pub trans: [f64; 3],
 }
 
-impl WorldFromSubmap {
-    pub fn identity() -> Self {
+impl Sim3Edge {
+    pub fn to_sim3(self) -> gs_pose::sim3::Sim3G {
+        gs_pose::sim3::Sim3G {
+            scale: self.scale,
+            rot: glam::DQuat::from_xyzw(self.quat[1], self.quat[2], self.quat[3], self.quat[0]),
+            trans: glam::DVec3::from_array(self.trans),
+        }
+    }
+
+    pub fn from_sim3(to: u32, s: &gs_pose::sim3::Sim3G) -> Self {
         Self {
-            scale: 1.0,
-            quat: [1.0, 0.0, 0.0, 0.0],
-            trans: [0.0; 3],
+            to,
+            scale: s.scale,
+            quat: [s.rot.w, s.rot.x, s.rot.y, s.rot.z],
+            trans: s.trans.to_array(),
         }
     }
 }
@@ -72,12 +89,93 @@ pub struct SubmapMeta {
     /// When it differs from `focal`, the persisted geometry still carries
     /// the guess-focal warp until `gs-cli refocal` re-bundles it.
     pub focal_refined: Option<f64>,
-    /// None = unregistered island.
-    pub world_from_submap: Option<WorldFromSubmap>,
+    /// Pairwise Sim(3) constraints to other submaps. Empty = island.
+    pub edges: Vec<Sim3Edge>,
 }
 
 pub struct Project {
     pub submaps: Vec<SubmapMeta>,
+}
+
+/// Resolved world placement of one submap: `world` maps its local
+/// coordinates into its connected component's root frame. Presentation
+/// layout (side-by-side component offsets) is computed by the composer,
+/// not here — this is pure graph algebra.
+pub struct Placement {
+    /// Component number, ordered by ascending root index.
+    pub component: usize,
+    /// Lowest submap index in the component (the frame `world` maps into).
+    pub root: usize,
+    pub world: gs_pose::sim3::Sim3G,
+}
+
+/// Union-find + BFS transform chaining over the pairwise edge graph.
+/// Deterministic: components ordered by root (lowest member index);
+/// neighbors visited in ascending index; first BFS visit wins on redundant
+/// edges/cycles. Self-loops and out-of-range edge targets are ignored.
+pub fn resolve_placements(proj: &Project) -> Vec<Placement> {
+    let n = proj.submaps.len();
+    // Undirected adjacency: (neighbor, edge sim3, edge_is_from_this_node).
+    let mut adj: Vec<Vec<(usize, gs_pose::sim3::Sim3G, bool)>> = vec![Vec::new(); n];
+    for (i, m) in proj.submaps.iter().enumerate() {
+        for e in &m.edges {
+            let t = e.to as usize;
+            if t == i || t >= n {
+                continue;
+            }
+            let s = e.to_sim3();
+            adj[i].push((t, s, true));
+            adj[t].push((i, s, false));
+        }
+    }
+    for a in &mut adj {
+        a.sort_by_key(|&(t, ..)| t);
+    }
+
+    let mut component = vec![usize::MAX; n];
+    let mut placements: Vec<Placement> = (0..n)
+        .map(|i| Placement {
+            component: 0,
+            root: i,
+            world: gs_pose::sim3::Sim3G::identity(),
+        })
+        .collect();
+    let mut next_component = 0;
+    for root in 0..n {
+        if component[root] != usize::MAX {
+            continue;
+        }
+        let comp = next_component;
+        next_component += 1;
+        let mut queue = std::collections::VecDeque::from([root]);
+        component[root] = comp;
+        placements[root].component = comp;
+        placements[root].root = root;
+        placements[root].world = gs_pose::sim3::Sim3G::identity();
+        while let Some(i) = queue.pop_front() {
+            let world_i = placements[i].world;
+            for &(t, s, forward) in &adj[i] {
+                if component[t] != usize::MAX {
+                    continue;
+                }
+                component[t] = comp;
+                placements[t].component = comp;
+                placements[t].root = root;
+                // We are at placed node `i` visiting neighbor `t`.
+                // forward: the edge is owned by `i` and maps i→t, so
+                //   t→root = (i→root) ∘ (t→i) = world_i ∘ s⁻¹.
+                // reverse: the edge is owned by `t` and maps t→i, so
+                //   t→root = world_i ∘ s.
+                placements[t].world = if forward {
+                    world_i.compose(&s.inverse())
+                } else {
+                    world_i.compose(&s)
+                };
+                queue.push_back(t);
+            }
+        }
+    }
+    placements
 }
 
 impl Project {
@@ -86,6 +184,16 @@ impl Project {
     }
 
     pub fn load(root: &Path) -> anyhow::Result<Project> {
+        let proj = Self::load_or_empty(root)?;
+        if proj.submaps.is_empty() {
+            bail!("no submaps found in {}", root.display());
+        }
+        Ok(proj)
+    }
+
+    /// Like [`Project::load`] but an absent/empty project is fine — the
+    /// first `add` starts from nothing.
+    pub fn load_or_empty(root: &Path) -> anyhow::Result<Project> {
         let mut submaps = Vec::new();
         for idx in 0.. {
             let dir = Self::submap_dir(root, idx);
@@ -93,9 +201,6 @@ impl Project {
                 break;
             }
             submaps.push(read_meta(&dir.join("meta.txt"))?);
-        }
-        if submaps.is_empty() {
-            bail!("no submaps found in {}", root.display());
         }
         Ok(Project { submaps })
     }
@@ -125,17 +230,18 @@ pub fn write_meta(path: &Path, meta: &SubmapMeta) -> anyhow::Result<()> {
     if let Some(f) = meta.focal_refined {
         s.push_str(&format!("focal_refined={f}\n"));
     }
-    if let Some(w) = &meta.world_from_submap {
+    for e in &meta.edges {
         s.push_str(&format!(
-            "sim3={} {} {} {} {} {} {} {}\n",
-            w.scale,
-            w.quat[0],
-            w.quat[1],
-            w.quat[2],
-            w.quat[3],
-            w.trans[0],
-            w.trans[1],
-            w.trans[2]
+            "edge={} {} {} {} {} {} {} {} {}\n",
+            e.to,
+            e.scale,
+            e.quat[0],
+            e.quat[1],
+            e.quat[2],
+            e.quat[3],
+            e.trans[0],
+            e.trans[1],
+            e.trans[2]
         ));
     }
     std::fs::write(path, s)?;
@@ -148,7 +254,7 @@ pub fn read_meta(path: &Path) -> anyhow::Result<SubmapMeta> {
     let mut video = String::new();
     let mut focal = 0.0f64;
     let (mut width, mut height) = (0u32, 0u32);
-    let mut sim3 = None;
+    let mut edges = Vec::new();
     let mut kf_range = None;
     let mut focal_refined = None;
     for line in text.lines() {
@@ -164,6 +270,25 @@ pub fn read_meta(path: &Path) -> anyhow::Result<SubmapMeta> {
                 }
             }
             "focal_refined" => focal_refined = v.parse().ok(),
+            "edge" => {
+                let nums: Vec<f64> = v
+                    .split_whitespace()
+                    .map(str::parse)
+                    .collect::<Result<_, _>>()?;
+                if nums.len() != 9 {
+                    bail!("bad edge line in {}", path.display());
+                }
+                edges.push(Sim3Edge {
+                    to: nums[0] as u32,
+                    scale: nums[1],
+                    quat: [nums[2], nums[3], nums[4], nums[5]],
+                    trans: [nums[6], nums[7], nums[8]],
+                });
+            }
+            // Legacy absolute submap→world transform (world = submap-0's
+            // gauge). Identity was the old privileged-gauge marker on
+            // submap 0 → no edge; anything else migrates to an edge → 0.
+            // (Exact float compare is safe: identity was written verbatim.)
             "sim3" => {
                 let nums: Vec<f64> = v
                     .split_whitespace()
@@ -172,11 +297,15 @@ pub fn read_meta(path: &Path) -> anyhow::Result<SubmapMeta> {
                 if nums.len() != 8 {
                     bail!("bad sim3 line in {}", path.display());
                 }
-                sim3 = Some(WorldFromSubmap {
-                    scale: nums[0],
-                    quat: [nums[1], nums[2], nums[3], nums[4]],
-                    trans: [nums[5], nums[6], nums[7]],
-                });
+                let identity = nums == [1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+                if !identity {
+                    edges.push(Sim3Edge {
+                        to: 0,
+                        scale: nums[0],
+                        quat: [nums[1], nums[2], nums[3], nums[4]],
+                        trans: [nums[5], nums[6], nums[7]],
+                    });
+                }
             }
             _ => {}
         }
@@ -191,7 +320,7 @@ pub fn read_meta(path: &Path) -> anyhow::Result<SubmapMeta> {
         height,
         kf_range,
         focal_refined,
-        world_from_submap: sim3,
+        edges,
     })
 }
 
@@ -316,7 +445,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn meta_roundtrip() {
+    fn meta_roundtrip_with_edges() {
         let dir = std::env::temp_dir().join("splattar-meta-test");
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("meta.txt");
@@ -327,20 +456,119 @@ mod tests {
             height: 850,
             kf_range: Some((535, 1290)),
             focal_refined: Some(769.4),
-            world_from_submap: Some(WorldFromSubmap {
-                scale: 2.5,
-                quat: [0.9, 0.1, -0.2, 0.3],
-                trans: [1.0, -2.0, 3.0],
-            }),
+            edges: vec![
+                Sim3Edge {
+                    to: 0,
+                    scale: 2.5,
+                    quat: [0.9, 0.1, -0.2, 0.3],
+                    trans: [1.0, -2.0, 3.0],
+                },
+                Sim3Edge {
+                    to: 3,
+                    scale: 0.7,
+                    quat: [1.0, 0.0, 0.0, 0.0],
+                    trans: [-4.5, 0.0, 0.25],
+                },
+            ],
         };
         write_meta(&p, &meta).unwrap();
         let back = read_meta(&p).unwrap();
         assert_eq!(back.video, meta.video);
         assert_eq!(back.width, 478);
         assert_eq!(back.kf_range, Some((535, 1290)));
-        let w = back.world_from_submap.unwrap();
-        assert_eq!(w.scale, 2.5);
-        assert_eq!(w.trans, [1.0, -2.0, 3.0]);
+        assert_eq!(back.edges.len(), 2);
+        assert_eq!(back.edges[0].to, 0);
+        assert_eq!(back.edges[0].scale, 2.5);
+        assert_eq!(back.edges[1].to, 3);
+        assert_eq!(back.edges[1].trans, [-4.5, 0.0, 0.25]);
+
+        // Island: no edges, no edge= lines.
+        let island = SubmapMeta { edges: Vec::new(), ..meta };
+        write_meta(&p, &island).unwrap();
+        assert!(!std::fs::read_to_string(&p).unwrap().contains("edge="));
+        assert!(read_meta(&p).unwrap().edges.is_empty());
+    }
+
+    #[test]
+    fn legacy_sim3_migration() {
+        let dir = std::env::temp_dir().join("splattar-meta-migrate");
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("meta.txt");
+        // Non-identity legacy transform → edge to submap 0.
+        std::fs::write(
+            &p,
+            "video=x.mp4\nfocal=700\nwidth=100\nheight=100\nsim3=2 0.9 0.1 -0.2 0.3 1 -2 3\n",
+        )
+        .unwrap();
+        let back = read_meta(&p).unwrap();
+        assert_eq!(back.edges.len(), 1);
+        assert_eq!(back.edges[0].to, 0);
+        assert_eq!(back.edges[0].scale, 2.0);
+        assert_eq!(back.edges[0].trans, [1.0, -2.0, 3.0]);
+        // Identity legacy transform = the old submap-0 gauge marker → no edge.
+        std::fs::write(
+            &p,
+            "video=x.mp4\nfocal=700\nwidth=100\nheight=100\nsim3=1 1 0 0 0 0 0 0\n",
+        )
+        .unwrap();
+        assert!(read_meta(&p).unwrap().edges.is_empty());
+    }
+
+    fn dummy_meta(edges: Vec<Sim3Edge>) -> SubmapMeta {
+        SubmapMeta {
+            video: "v.mp4".into(),
+            focal: 700.0,
+            width: 100,
+            height: 100,
+            kf_range: None,
+            focal_refined: None,
+            edges,
+        }
+    }
+
+    #[test]
+    fn resolver_components_and_transforms() {
+        use gs_pose::sim3::Sim3G;
+        let sa = Sim3G {
+            scale: 2.0,
+            rot: glam::DQuat::from_axis_angle(glam::DVec3::Z, 0.7),
+            trans: glam::DVec3::new(1.0, -2.0, 0.5),
+        };
+        let sb = Sim3G {
+            scale: 0.5,
+            rot: glam::DQuat::from_axis_angle(glam::DVec3::Y, -0.4),
+            trans: glam::DVec3::new(0.0, 3.0, -1.0),
+        };
+        // Submap 1 carries edges to 0 (sa: 1→0) and to 2 (sb: 1→2);
+        // submap 3 is an island.
+        let proj = Project {
+            submaps: vec![
+                dummy_meta(vec![]),
+                dummy_meta(vec![
+                    Sim3Edge::from_sim3(0, &sa),
+                    Sim3Edge::from_sim3(2, &sb),
+                ]),
+                dummy_meta(vec![]),
+                dummy_meta(vec![]),
+            ],
+        };
+        let pl = resolve_placements(&proj);
+        assert_eq!(pl.len(), 4);
+        // Components: {0,1,2} rooted at 0, {3} rooted at 3.
+        assert_eq!(
+            (pl[0].component, pl[1].component, pl[2].component, pl[3].component),
+            (0, 0, 0, 1)
+        );
+        assert_eq!((pl[0].root, pl[2].root, pl[3].root), (0, 0, 3));
+        let p = glam::DVec3::new(0.3, 1.7, -0.9);
+        // world[1] maps 1-local → 0-frame = sa.
+        assert!((pl[1].world.apply(p) - sa.apply(p)).length() < 1e-12);
+        // world[2] maps 2-local → 0-frame = sa ∘ sb⁻¹.
+        let expect = sa.compose(&sb.inverse());
+        assert!((pl[2].world.apply(p) - expect.apply(p)).length() < 1e-12);
+        // Roots are identity.
+        assert!((pl[0].world.apply(p) - p).length() < 1e-15);
+        assert!((pl[3].world.apply(p) - p).length() < 1e-15);
     }
 
     #[test]

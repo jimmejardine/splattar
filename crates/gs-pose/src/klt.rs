@@ -207,10 +207,10 @@ mod tests {
                 continue;
             }
             if let Some((tx, ty)) = track_point_fb(&prev, &next, (c.x, c.y), (c.x, c.y), &cfg)
+                && (tx - c.x - 3.0).abs() < 0.5
+                && (ty - c.y - 2.0).abs() < 0.5
             {
-                if (tx - c.x - 3.0).abs() < 0.5 && (ty - c.y - 2.0).abs() < 0.5 {
-                    ok += 1;
-                }
+                ok += 1;
             }
         }
         assert!(ok > 15, "too few tracks under brightness shift: {ok}");

@@ -500,6 +500,7 @@ mod tests {
     #[test]
     fn exp_golomb() {
         // 1 → 0; 010 → 1; 011 → 2; 00100 → 3
+        #[allow(clippy::unusual_byte_groupings)] // grouped by codeword, not nibble
         let data = [0b1_010_011_0, 0b0100_0000];
         let mut r = BitReader::new(&data);
         assert_eq!(r.ue().unwrap(), 0);

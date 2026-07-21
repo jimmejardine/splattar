@@ -363,3 +363,19 @@ Nistér–Stewénius five-point solver (631a5bb) is robust in that motion
 regime in both frames: the clip now solves 223/223 keyframes rotated AND
 unrotated. `SPLATTAR_NO_ROTATION=1` remains as a debug isolation flag; the
 rotation bake is unconditionally correct and on by default.
+
+### Order-independent project model: pairwise Sim(3) edges (2026-07-21)
+
+`gs-cli run` is gone; `add <video>` is the only ingestion command and
+creates `./gs-project` by default (`--project` overrides). The absolute
+`sim3=` world transform in submap meta.txt is replaced by zero-or-more
+pairwise `edge=` lines (this submap's coords → target submap's coords; no
+edges = island; legacy metas migrate on read: identity `sim3=` drops, any
+other becomes an edge to submap 0). No submap has a privileged gauge:
+placement is resolved at compose/register time by union-find + BFS from
+each component's lowest-index submap, and connected components are laid
+out along +x (presentation-only, never stored). Cross-component
+registration RANSACs per component — pooling matches across components
+would mix unrelated gauges into one model. Ingestion order now affects
+only submap indices and layout, never connectivity; the
+`order_independence_cross_video` e2e test pins this on the Android pair.

@@ -170,6 +170,33 @@ impl Sim3G {
     pub fn apply(&self, p: glam::DVec3) -> glam::DVec3 {
         self.scale * (self.rot * p) + self.trans
     }
+
+    pub fn identity() -> Sim3G {
+        Sim3G {
+            scale: 1.0,
+            rot: glam::DQuat::IDENTITY,
+            trans: glam::DVec3::ZERO,
+        }
+    }
+
+    pub fn inverse(&self) -> Sim3G {
+        let s = 1.0 / self.scale;
+        let r = self.rot.conjugate();
+        Sim3G {
+            scale: s,
+            rot: r,
+            trans: -(s * (r * self.trans)),
+        }
+    }
+
+    /// Composition: `a.compose(&b).apply(p) == a.apply(b.apply(p))`.
+    pub fn compose(&self, b: &Sim3G) -> Sim3G {
+        Sim3G {
+            scale: self.scale * b.scale,
+            rot: self.rot * b.rot,
+            trans: self.scale * (self.rot * b.trans) + self.trans,
+        }
+    }
 }
 
 /// RANSAC Sim(3) between corresponding glam point sets (a → b). Returns the
@@ -648,5 +675,36 @@ mod tests {
         let p = Vector3::new(0.3, -1.1, 2.0);
         let back = m.inverse().apply(&m.apply(&p));
         assert!((back - p).norm() < 1e-12);
+    }
+
+    #[test]
+    fn sim3g_inverse_and_compose() {
+        let a = Sim3G {
+            scale: 2.3,
+            rot: glam::DQuat::from_axis_angle(
+                glam::DVec3::new(0.2, -0.7, 0.5).normalize(),
+                0.9,
+            ),
+            trans: glam::DVec3::new(1.5, -0.3, 4.1),
+        };
+        let b = Sim3G {
+            scale: 0.4,
+            rot: glam::DQuat::from_axis_angle(
+                glam::DVec3::new(-0.6, 0.1, 0.8).normalize(),
+                -1.7,
+            ),
+            trans: glam::DVec3::new(-2.0, 0.9, 0.2),
+        };
+        let p = glam::DVec3::new(0.7, -2.2, 3.3);
+        // Inverse round-trips.
+        let back = a.inverse().apply(a.apply(p));
+        assert!((back - p).length() < 1e-12, "inverse: {back:?}");
+        // Composition matches sequential application.
+        let seq = a.apply(b.apply(p));
+        let comp = a.compose(&b).apply(p);
+        assert!((seq - comp).length() < 1e-12, "compose: {seq:?} vs {comp:?}");
+        // compose with inverse is identity.
+        let idp = a.compose(&a.inverse()).apply(p);
+        assert!((idp - p).length() < 1e-12);
     }
 }

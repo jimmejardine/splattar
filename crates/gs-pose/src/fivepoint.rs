@@ -500,10 +500,10 @@ mod tests {
         let mut rng = Rng64::new(41);
         let mut r = |s: f64| (rng.next_u64() as f64 / u64::MAX as f64 * 2.0 - 1.0) * s;
         let n = matches.len();
-        for i in 0..n {
+        for (i, m) in matches.iter_mut().enumerate() {
             if i % 5 != 0 {
                 // 80% gross outliers.
-                matches[i].b = (r(0.6), r(0.6));
+                m.b = (r(0.6), r(0.6));
             }
         }
         let res = ransac_essential_5pt(&matches, 4000, 1e-4, 5).expect("5pt ransac");

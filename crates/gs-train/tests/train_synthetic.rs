@@ -368,8 +368,8 @@ fn appearance_compensation_recovers_exposure_swings() {
             let gain = 1.0 + uni(&mut rng, -0.25, 0.35);
             let bias = uni(&mut rng, -0.06, 0.06);
             for p in &mut target {
-                for ch in 0..3 {
-                    p[ch] = (p[ch] * gain + bias).clamp(0.0, 1.0);
+                for c in p.iter_mut().take(3) {
+                    *c = (*c * gain + bias).clamp(0.0, 1.0);
                 }
             }
             train_views.push(TrainView { target, camera });

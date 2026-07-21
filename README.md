@@ -18,7 +18,7 @@ rasterizer and trainer are written from scratch, and video decode is hardware
 | M4 quality (MCMC, geo losses) | ✅ | aux-loss gradients verified; fixed-budget MCMC; TDR-safe |
 | M5 video ingest | ✅ | hardware H.264 decode; 2,323 frames + keyframes in <5 s |
 | M6 VO front-end | ✅ | ATE 0.91% / RPE <0.5° synthetic; 404/404 kf on real footage |
-| M7 `run`: video → walkable splat | 🔶 | end-to-end works (~40 min); 20.3 dB vs 24 dB gate — appearance model next |
+| M7 `add`: video → walkable splat | 🔶 | end-to-end works (~40 min); 20.3 dB vs 24 dB gate — appearance model next |
 | M8 multi-video projects | 🔶 | persistence, `add`, Sim(3), islands work; merging awaits AKAZE-class descriptors |
 | M9–M12 mesh/web/VR | — | not started |
 
@@ -33,13 +33,14 @@ cargo build --workspace --release
 cargo run --release -p gs-cli -- view samples/ply/cactus-high.ply
 
 # Full pipeline: walkthrough video → project + walkable splat
-cargo run --release -p gs-cli -- run walkthrough.mp4
+# (creates ./gs-project on first use; add order doesn't matter)
+cargo run --release -p gs-cli -- add walkthrough.mp4
 
 # Extend the project with another video (registers or becomes an island)
-cargo run --release -p gs-cli -- add patch.mp4 --project walkthrough.project
+cargo run --release -p gs-cli -- add patch.mp4
 
-# View the composed project (registered submaps merged, islands side by side)
-cargo run --release -p gs-cli -- view walkthrough.project
+# View the composed project (connected submaps merged, islands side by side)
+cargo run --release -p gs-cli -- view gs-project
 
 # Visual odometry only: trajectory CSV from a video
 cargo run --release -p gs-cli -- pose walkthrough.mp4

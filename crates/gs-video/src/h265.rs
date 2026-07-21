@@ -695,7 +695,7 @@ mod tests {
         }
         fn bytes(mut self) -> Vec<u8> {
             self.bits.push(true); // rbsp_stop_one_bit
-            while self.bits.len() % 8 != 0 {
+            while !self.bits.len().is_multiple_of(8) {
                 self.bits.push(false);
             }
             self.bits
