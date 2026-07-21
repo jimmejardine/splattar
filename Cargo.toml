@@ -42,6 +42,8 @@ gs-viewer = { path = "crates/gs-viewer" }
 # external â€” pure Rust only; no crate that compiles or links C/C++ (see CLAUDE.md)
 wgpu = "30"
 winit = "0.30"
+# CPU pixel blit for the debug video player (pure Rust).
+softbuffer = "0.4"
 glam = { version = "0.33", features = ["bytemuck"] }
 bytemuck = { version = "1", features = ["derive"] }
 half = { version = "2", features = ["bytemuck"] }

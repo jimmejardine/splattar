@@ -6,6 +6,8 @@ pub mod camera;
 pub mod input;
 #[cfg(feature = "winit")]
 pub mod windowed;
+#[cfg(feature = "winit")]
+pub mod frame_player;
 
 pub use camera::FlyCamera;
 pub use input::InputState;

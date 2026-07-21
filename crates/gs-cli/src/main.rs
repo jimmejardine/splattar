@@ -4,6 +4,7 @@ use anyhow::{bail, Context};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
+mod play;
 mod project;
 
 #[derive(Parser)]
@@ -85,6 +86,12 @@ enum Command {
         /// Output CSV path (default: <video>.trajectory.csv).
         #[arg(long)]
         out: Option<PathBuf>,
+    },
+    /// Sanity-check player: step through decoded frames in a window
+    /// (→ +1 frame, Shift+→ +10, ↑ +1 s, Shift+↑ +10 s, R restart, Esc quit).
+    Play {
+        /// Path to an H.264/H.265 .mp4 video.
+        video: PathBuf,
     },
     /// Extend an existing project with another video: VO, cross-video Sim(3)
     /// registration against the project landmarks, train, persist as a new
@@ -241,6 +248,7 @@ fn main() -> anyhow::Result<()> {
             max_frames,
             out,
         } => run_pose(&video, focal, max_frames, out),
+        Command::Play { video } => play::run_play(video),
         Command::Add {
             video,
             project,
