@@ -422,3 +422,29 @@ serial flow, NVDEC is a separate engine) is the recorded next lever if
 the causal pass needs another 4×+; a faster linear-algebra library is
 not — the big solve already runs on faer, and the rest is small
 fixed-size ops where keyframe count, not the library, is the multiplier.
+
+### Causal pass round 2: pipelined prep, faster detect — and the wall moves (2026-07-21)
+
+Restructured `run_vo` into a three-stage pipeline: decode thread → prep
+worker pool (pyramid + sharpness per frame — pure functions, built
+serially per frame with parallelism ACROSS frames) → tracking spine
+consuming strictly in index order (results identical to the serial
+loop; back-room reproduces its keyframe count exactly). The spine now
+logs its phase split (klt/desc/detect). Corner detection was rewritten
+with separable sliding box sums computed lazily over unoccupied-cell
+runs (7.5 → 6.1 s on the flat clip). Negative result, kept out:
+`with_min_len(32)` on the per-track KLT fan-out — LK effort varies
+wildly per track and fixed chunks defeat rayon's work-stealing
+(measured 3× KLT regression; reverted).
+
+Where things stand vs this morning's 12 fps complaint:
+- H.264 478×850 flat clip: **76.5 fps** causal (spine-bound; split:
+  klt 14.5 s / desc 7.9 s / detect 6.1 s of 30 s wall).
+- HEVC 720×1280 back-room: **45.6 fps** causal — now **decode-bound**:
+  spine work sums to ~39 s of the 95 s wall; NVDEC H.265 delivers ~46
+  fps and no CPU-side work moves this clip. Solve 745 → 130 s.
+
+Next levers, in order of what the profiles say: (1) NVDEC H.265
+pipelining (frames in flight) for HEVC-bound clips; (2) GPU KLT (WGSL
+LK) for the spine-bound half; (3) descriptor cadence (obs_desc every
+keyframe is 25% of the spine and mostly unused downstream).

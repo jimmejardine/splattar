@@ -184,6 +184,14 @@ pub struct PromotionStats {
     pub tracks: u32,
 }
 
+/// Accumulated wall time per causal-pass phase (diagnostic).
+#[derive(Default, Debug, Clone, Copy)]
+pub struct CausalTiming {
+    pub klt_s: f64,
+    pub desc_s: f64,
+    pub detect_s: f64,
+}
+
 pub struct VoFrontEnd {
     cfg: VoConfig,
     prev: Option<Pyramid>,
@@ -199,6 +207,7 @@ pub struct VoFrontEnd {
     /// kf_flow_frac resolved to pixels from the first frame's diagonal.
     kf_flow_px: f32,
     pub promotions: PromotionStats,
+    pub timing: CausalTiming,
 }
 
 impl VoFrontEnd {
@@ -215,25 +224,36 @@ impl VoFrontEnd {
             thumbs: Vec::new(),
             kf_flow_px: 0.0,
             promotions: PromotionStats::default(),
+            timing: CausalTiming::default(),
         }
     }
 
-    /// Causal pass: feed frames in decode order with their PTS.
+    /// Causal pass: feed frames in decode order with their PTS. Convenience
+    /// wrapper — pyramid + sharpness can also be precomputed off-thread and
+    /// fed via [`Self::push_prepared`] (they are pure per-frame functions).
     pub fn push_frame(&mut self, gray: GrayImage, pts: f64) {
-        if self.n_frames == 0 {
-            let diag =
-                ((gray.width * gray.width + gray.height * gray.height) as f32).sqrt();
-            self.kf_flow_px = self.cfg.kf_flow_frac * diag;
-        }
         let pyr = Pyramid::build(gray, self.cfg.pyramid_levels);
         // Sharpness from the half-res pyramid level: scores are only compared
         // relatively across frames, and this skips a full-res pass per frame.
         let sharpness = gradient_energy(&pyr.levels[1.min(pyr.levels.len() - 1)]);
+        self.push_prepared(pyr, sharpness, pts);
+    }
+
+    /// Causal pass with a prebuilt pyramid (see [`Self::push_frame`]). The
+    /// pyramid must be built with `cfg.pyramid_levels` and the sharpness
+    /// convention must match across all frames of a run.
+    pub fn push_prepared(&mut self, pyr: Pyramid, sharpness: f32, pts: f64) {
+        if self.n_frames == 0 {
+            let (w, h) = (pyr.levels[0].width, pyr.levels[0].height);
+            let diag = ((w * w + h * h) as f32).sqrt();
+            self.kf_flow_px = self.cfg.kf_flow_frac * diag;
+        }
         let frame_idx = self.n_frames;
         self.n_frames += 1;
         self.frame_pts.push(pts);
 
         let mut zoom = 0.0f64;
+        let t_klt = std::time::Instant::now();
         if let Some(prev) = &self.prev {
             // Track with constant-velocity prediction (median of last flow).
             let (mfx, mfy) = self.prev_median_flow;
@@ -290,6 +310,7 @@ impl VoFrontEnd {
                 self.prev_median_flow = (xs[xs.len() / 2], ys[ys.len() / 2]);
             }
         }
+        self.timing.klt_s += t_klt.elapsed().as_secs_f64();
         self.zoom_log_scale.push(zoom);
 
         // Keyframe decision (reasons counted for the causal summary log).
@@ -334,6 +355,7 @@ impl VoFrontEnd {
             // Descriptor extraction fans out over tracks (indexed map applied
             // in track order — deterministic under any thread count); it was
             // the dominant serial per-keyframe cost.
+            let t_desc = std::time::Instant::now();
             let descs: Vec<Option<crate::descriptor::MultiDescriptor>> = self
                 .tracks
                 .par_iter()
@@ -356,14 +378,19 @@ impl VoFrontEnd {
             // can't contribute geometry and bloat the causal pass.
             self.tracks
                 .retain(|t| t.cur.is_some() || t.obs.len() >= 2);
+            self.timing.desc_s += t_desc.elapsed().as_secs_f64();
             // Spawn fresh corners away from live tracks.
+            let t_detect = std::time::Instant::now();
             let existing: Vec<(f32, f32)> =
                 self.tracks.iter().filter_map(|t| t.cur).collect();
             let corners = detect(&pyr.levels[0], &self.cfg.detect, &existing);
+            self.timing.detect_s += t_detect.elapsed().as_secs_f64();
+            let t_desc = std::time::Instant::now();
             let corner_descs: Vec<crate::descriptor::MultiDescriptor> = corners
                 .par_iter()
                 .map(|c| crate::descriptor::describe_multi(&pyr, c.x, c.y))
                 .collect();
+            self.timing.desc_s += t_desc.elapsed().as_secs_f64();
             for (c, d) in corners.into_iter().zip(corner_descs) {
                 self.tracks.push(Track {
                     cur: Some((c.x, c.y)),
@@ -375,6 +402,11 @@ impl VoFrontEnd {
             }
         }
         self.prev = Some(pyr);
+    }
+
+    /// The intrinsics this front-end was configured with (tracking-res).
+    pub fn intrinsics(&self) -> Intrinsics {
+        self.cfg.intrinsics
     }
 
     fn live_count(&self) -> usize {
@@ -872,8 +904,10 @@ fn nearest_pose(poses: &[Option<Se3>], k: usize) -> Option<Se3> {
         .and_then(|i| poses[i])
 }
 
-/// Cheap sharpness proxy: mean squared central-difference gradient.
-fn gradient_energy(img: &GrayImage) -> f32 {
+/// Cheap sharpness proxy: mean squared central-difference gradient. Public
+/// so prep pipelines can precompute it for [`VoFrontEnd::push_prepared`]
+/// (use pyramid level 1 to match `push_frame`'s convention).
+pub fn gradient_energy(img: &GrayImage) -> f32 {
     let (w, h) = (img.width, img.height);
     let mut sum = 0.0f64;
     let mut n = 0u64;

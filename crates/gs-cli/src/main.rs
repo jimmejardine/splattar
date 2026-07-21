@@ -352,99 +352,153 @@ fn downscale_luma(y: &[u8], w: usize, f: usize) -> Vec<u8> {
     out
 }
 
+/// Pure per-frame prep (everything the tracker needs that does NOT depend
+/// on tracking state): decimated pyramid + sharpness.
+struct PrepFrame {
+    pyr: gs_pose::Pyramid,
+    sharpness: f32,
+    pts: f64,
+}
+
 fn run_vo(
     video: &std::path::Path,
     focal: Option<f64>,
     max_frames: u32,
 ) -> anyhow::Result<VoOutput> {
     use gs_pose::vo::{Intrinsics, VoConfig, VoFrontEnd};
+    use std::sync::{Arc, Mutex, mpsc};
     let mut reader = gs_video::Mp4H264Reader::open(video).context("open video")?;
     let t0 = std::time::Instant::now();
 
-    // Decode and tracking overlap: NVDEC decode (mostly blocking GPU fence
-    // waits) stays on this thread — the Vulkan session isn't Send — while
-    // KLT tracking runs on a worker fed through a small bounded channel, so
-    // causal-pass wall clock is max(decode, track) instead of their sum.
-    let (tx, rx) = std::sync::mpsc::sync_channel::<(Vec<u8>, u32, u32, f64)>(3);
-    let worker = std::thread::spawn(move || {
-        let mut vo: Option<(VoFrontEnd, Intrinsics, (u32, u32), u32)> = None;
-        let mut n = 0u32;
-        while let Ok((y, width, height, pts)) = rx.recv() {
-            let (fe, _, _, scale) = vo.get_or_insert_with(|| {
-                // VO doesn't need full decode resolution — cap the tracked
-                // long side (subpixel KLT at this scale is standard SLAM
-                // practice) and run the whole front-end in tracking coords.
-                let scale = width.max(height).div_ceil(TRACK_MAX_SIDE);
-                let (tw, th) = (width / scale, height / scale);
-                let f = focal.unwrap_or(0.85 * tw.max(th) as f64);
-                log::info!(
-                    "video {width}x{height}, tracking at {tw}x{th} (1/{scale}), focal guess {f:.0}px"
-                );
-                let intr = Intrinsics {
-                    focal: f,
-                    cx: tw as f64 / 2.0,
-                    cy: th as f64 / 2.0,
-                };
-                let mut cfg = VoConfig {
-                    intrinsics: intr,
-                    ..Default::default()
-                };
-                // Tuning override for keyframe density experiments.
-                if let Ok(v) = std::env::var("SPLATTAR_KF_FLOW_FRAC")
-                    && let Ok(frac) = v.parse::<f32>()
-                {
-                    log::info!("kf_flow_frac override: {frac}");
-                    cfg.kf_flow_frac = frac;
+    // Three-stage pipeline: NVDEC decode stays on this thread (the Vulkan
+    // session isn't Send) → a pool of prep workers builds each frame's
+    // pyramid + sharpness (pure per-frame work, serial per frame — the
+    // parallelism is ACROSS frames) → the tracking spine consumes prepared
+    // frames strictly in index order, so results are identical to the old
+    // serial loop. Only the KLT step truly depends on the previous frame.
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(8)
+        .saturating_sub(2)
+        .clamp(1, 12);
+    let (raw_tx, raw_rx) = mpsc::sync_channel::<(u64, Vec<u8>, u32, u32, f64)>(workers * 2);
+    let raw_rx = Arc::new(Mutex::new(raw_rx));
+    let (prep_tx, prep_rx) = mpsc::sync_channel::<(u64, PrepFrame)>(workers * 2);
+    let n_levels = VoConfig::default().pyramid_levels;
+    let prep_pool: Vec<_> = (0..workers)
+        .map(|_| {
+            let rx = Arc::clone(&raw_rx);
+            let tx = prep_tx.clone();
+            std::thread::spawn(move || {
+                loop {
+                    let msg = { rx.lock().unwrap().recv() };
+                    let Ok((idx, y, width, height, pts)) = msg else { break };
+                    // Tracking-resolution cap is a pure function of the frame
+                    // size, so workers need no shared state.
+                    let s = width.max(height).div_ceil(TRACK_MAX_SIDE) as usize;
+                    let gray = if s > 1 {
+                        gs_pose::GrayImage::from_luma8(
+                            &downscale_luma(&y, width as usize, s),
+                            width as usize / s,
+                            height as usize / s,
+                        )
+                    } else {
+                        gs_pose::GrayImage::from_luma8(&y, width as usize, height as usize)
+                    };
+                    let pyr = gs_pose::Pyramid::build(gray, n_levels);
+                    let sharpness = gs_pose::vo::gradient_energy(
+                        &pyr.levels[1.min(pyr.levels.len() - 1)],
+                    );
+                    if tx.send((idx, PrepFrame { pyr, sharpness, pts })).is_err() {
+                        break;
+                    }
                 }
-                (VoFrontEnd::new(cfg), intr, (tw, th), scale)
-            });
-            let s = *scale as usize;
-            let gray = if s > 1 {
-                let (tw, th) = (width as usize / s, height as usize / s);
-                gs_pose::GrayImage::from_luma8(
-                    &downscale_luma(&y, width as usize, s),
-                    tw,
-                    th,
-                )
-            } else {
-                gs_pose::GrayImage::from_luma8(&y, width as usize, height as usize)
-            };
-            fe.push_frame(gray, pts);
-            n += 1;
-            if n.is_multiple_of(200) {
-                log::info!("tracked {n} frames, {} keyframes", fe.keyframes.len());
+            })
+        })
+        .collect();
+    drop(prep_tx); // spine's channel closes when the last worker exits
+
+    let spine = std::thread::spawn(move || {
+        let mut fe: Option<VoFrontEnd> = None;
+        let mut pending: std::collections::HashMap<u64, PrepFrame> =
+            std::collections::HashMap::new();
+        let mut next = 0u64;
+        while let Ok((idx, frame)) = prep_rx.recv() {
+            pending.insert(idx, frame);
+            while let Some(f) = pending.remove(&next) {
+                let fe = fe.get_or_insert_with(|| {
+                    let (tw, th) = (f.pyr.levels[0].width, f.pyr.levels[0].height);
+                    let fpx = focal.unwrap_or(0.85 * tw.max(th) as f64);
+                    log::info!("tracking at {tw}x{th}, focal guess {fpx:.0}px");
+                    let mut cfg = VoConfig {
+                        intrinsics: Intrinsics {
+                            focal: fpx,
+                            cx: tw as f64 / 2.0,
+                            cy: th as f64 / 2.0,
+                        },
+                        ..Default::default()
+                    };
+                    // Tuning override for keyframe density experiments.
+                    if let Ok(v) = std::env::var("SPLATTAR_KF_FLOW_FRAC")
+                        && let Ok(frac) = v.parse::<f32>()
+                    {
+                        log::info!("kf_flow_frac override: {frac}");
+                        cfg.kf_flow_frac = frac;
+                    }
+                    VoFrontEnd::new(cfg)
+                });
+                fe.push_prepared(f.pyr, f.sharpness, f.pts);
+                next += 1;
+                if next.is_multiple_of(200) {
+                    log::info!("tracked {next} frames, {} keyframes", fe.keyframes.len());
+                }
             }
         }
-        (vo, n)
+        (fe, next)
     });
-    let mut sent = 0u32;
+
+    let mut sent = 0u64;
     let mut sent_size = (0u32, 0u32);
     while let Some(frame) = reader.next_frame().context("decode")? {
         sent_size = (frame.width, frame.height);
-        if tx
-            .send((frame.y, frame.width, frame.height, frame.pts))
+        if sent == 0 {
+            log::info!("video {}x{}", frame.width, frame.height);
+        }
+        if raw_tx
+            .send((sent, frame.y, frame.width, frame.height, frame.pts))
             .is_err()
         {
-            break; // worker died; its panic resurfaces at join
+            break; // pipeline died; the panic resurfaces at join
         }
         sent += 1;
-        if max_frames > 0 && sent >= max_frames {
+        if max_frames > 0 && sent >= max_frames as u64 {
             break;
         }
     }
     let video_size = (sent_size.0, sent_size.1);
-    drop(tx);
-    let (vo, n) = worker.join().expect("tracking worker panicked");
-    let (mut fe, intrinsics, track_size, track_scale) = vo.context("no frames decoded")?;
+    drop(raw_tx);
+    for w in prep_pool {
+        w.join().expect("prep worker panicked");
+    }
+    let (vo, n) = spine.join().expect("tracking spine panicked");
+    let mut fe = vo.context("no frames decoded")?;
+    let intrinsics = fe.intrinsics();
+    let track_scale = video_size.0.max(video_size.1).div_ceil(TRACK_MAX_SIDE);
+    let track_size = (video_size.0 / track_scale, video_size.1 / track_scale);
     let decode_track_s = t0.elapsed().as_secs_f64();
     let p = fe.promotions;
+    let tm = fe.timing;
     log::info!(
-        "causal pass: {n} frames, {} keyframes ({} flow / {} survival / {} low-tracks), {:.1} fps",
+        "causal pass: {n} frames, {} keyframes ({} flow / {} survival / {} low-tracks), {:.1} fps \
+         [spine: klt {:.1}s, desc {:.1}s, detect {:.1}s]",
         fe.keyframes.len(),
         p.flow,
         p.survival,
         p.tracks,
-        n as f64 / decode_track_s
+        n as f64 / decode_track_s,
+        tm.klt_s,
+        tm.desc_s,
+        tm.detect_s
     );
 
     let t1 = std::time::Instant::now();

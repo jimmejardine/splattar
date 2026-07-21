@@ -88,42 +88,104 @@ pub fn detect(img: &GrayImage, cfg: &DetectConfig, existing: &[(f32, f32)]) -> V
     }
     // One cell row per band, computed in parallel — each cell's best is an
     // ordered scan of its own pixels, so results are thread-count-invariant.
+    // Structure-tensor box sums are separable (sliding sums, ~6 adds/px
+    // instead of 3·(2hw+1)² multiplies) and are computed lazily, only over
+    // contiguous runs of UNOCCUPIED cells — with healthy track coverage most
+    // cells are occupied and skip all work.
     best.par_chunks_mut(cells_x).enumerate().for_each(|(cy, row)| {
         let y0 = (cy * cfg.cell).max(margin);
         let y1 = ((cy + 1) * cfg.cell).min(h - margin);
-        for y in y0..y1 {
-            for x in margin..w - margin {
-                let cx = x / cfg.cell;
-                if occupied[cy * cells_x + cx] {
-                    continue;
-                }
-                // Structure tensor over the window.
-                let (mut a, mut b, mut c) = (0.0f32, 0.0f32, 0.0f32);
-                for wy in y - hw..=y + hw {
-                    for wx in x - hw..=x + hw {
-                        let ix = gx[wy * w + wx];
-                        let iy = gy[wy * w + wx];
-                        a += ix * ix;
-                        b += ix * iy;
-                        c += iy * iy;
+        if y0 >= y1 {
+            return;
+        }
+        let occ_row = &occupied[cy * cells_x..(cy + 1) * cells_x];
+        let mut cx0 = 0usize;
+        while cx0 < cells_x {
+            if occ_row[cx0] {
+                cx0 += 1;
+                continue;
+            }
+            let mut cx1 = cx0;
+            while cx1 + 1 < cells_x && !occ_row[cx1 + 1] {
+                cx1 += 1;
+            }
+            // Pixel-column span of this unoccupied run.
+            let x0 = (cx0 * cfg.cell).max(margin);
+            let x1 = ((cx1 + 1) * cfg.cell).min(w - margin);
+            if x0 < x1 {
+                let span = x1 - x0;
+                // Horizontal sliding tensor sums for the run's rows.
+                let rows = y1 + hw - (y0 - hw);
+                let mut ha = vec![0.0f32; rows * span];
+                let mut hb = vec![0.0f32; rows * span];
+                let mut hc = vec![0.0f32; rows * span];
+                for (ry, wy) in (y0 - hw..y1 + hw).enumerate() {
+                    let r = wy * w;
+                    let (mut sa, mut sb, mut sc) = (0.0f32, 0.0f32, 0.0f32);
+                    for x in x0 - hw..=x0 + hw {
+                        let (ix, iy) = (gx[r + x], gy[r + x]);
+                        sa += ix * ix;
+                        sb += ix * iy;
+                        sc += iy * iy;
+                    }
+                    for i in 0..span {
+                        ha[ry * span + i] = sa;
+                        hb[ry * span + i] = sb;
+                        hc[ry * span + i] = sc;
+                        let x = x0 + i;
+                        if x + hw + 1 < w {
+                            let (ax, ay) = (gx[r + x + hw + 1], gy[r + x + hw + 1]);
+                            let (dx, dy) = (gx[r + x - hw], gy[r + x - hw]);
+                            sa += ax * ax - dx * dx;
+                            sb += ax * ay - dx * dy;
+                            sc += ay * ay - dy * dy;
+                        }
                     }
                 }
-                // min eigenvalue of [[a,b],[b,c]]
-                let tr = 0.5 * (a + c);
-                let det = a * c - b * b;
-                let disc = (tr * tr - det).max(0.0).sqrt();
-                let lmin = tr - disc;
-                if lmin < cfg.min_score {
-                    continue;
+                // Vertical sliding sums over the run's columns.
+                let mut va = vec![0.0f32; span];
+                let mut vb = vec![0.0f32; span];
+                let mut vc = vec![0.0f32; span];
+                for ry in 0..2 * hw + 1 {
+                    for i in 0..span {
+                        va[i] += ha[ry * span + i];
+                        vb[i] += hb[ry * span + i];
+                        vc[i] += hc[ry * span + i];
+                    }
                 }
-                if row[cx].is_none_or(|prev| lmin > prev.score) {
-                    row[cx] = Some(Corner {
-                        x: x as f32,
-                        y: y as f32,
-                        score: lmin,
-                    });
+                for y in y0..y1 {
+                    for i in 0..span {
+                        let x = x0 + i;
+                        let cx = x / cfg.cell;
+                        let (a, b, c) = (va[i], vb[i], vc[i]);
+                        // min eigenvalue of [[a,b],[b,c]]
+                        let tr = 0.5 * (a + c);
+                        let det = a * c - b * b;
+                        let disc = (tr * tr - det).max(0.0).sqrt();
+                        let lmin = tr - disc;
+                        if lmin < cfg.min_score {
+                            continue;
+                        }
+                        if row[cx].is_none_or(|prev| lmin > prev.score) {
+                            row[cx] = Some(Corner {
+                                x: x as f32,
+                                y: y as f32,
+                                score: lmin,
+                            });
+                        }
+                    }
+                    if y + 1 < y1 {
+                        let add = (y + 1 + hw) - (y0 - hw);
+                        let sub = (y - hw) - (y0 - hw);
+                        for i in 0..span {
+                            va[i] += ha[add * span + i] - ha[sub * span + i];
+                            vb[i] += hb[add * span + i] - hb[sub * span + i];
+                            vc[i] += hc[add * span + i] - hc[sub * span + i];
+                        }
+                    }
                 }
             }
+            cx0 = cx1 + 1;
         }
     });
     best.into_iter().flatten().collect()
