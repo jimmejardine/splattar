@@ -194,3 +194,29 @@ Registration failure ladder actually hit (each now guarded in code):
 
 The Sim(3) estimator itself is solid: Umeyama + RANSAC recovers scale 2.7 /
 arbitrary rotation through 40% outliers at 1e-6 accuracy in unit tests.
+
+### M7 refinement ablation on the real walkthrough (2026-07-21)
+
+All runs: 600 frames of 1.mp4, 239×425, pose+focal refinement + appearance
+compensation as noted; held-out PSNR is pose-aligned (BARF protocol).
+
+| Run | Config | Held-out |
+|---|---|---|
+| frozen VO poses (baseline) | 3k iters / 150k | 18.80 dB |
+| + pose/focal refinement | 3k / 150k | 20.33 dB |
+| + appearance compensation | 3k / 150k | **21.16 dB** (best so far) |
+| long: 7k / 250k, geo+noise on, unanchored | | 15.51 dB |
+| + appearance gauge anchor, decayed pose LR | 7k / 250k | 16.64 dB |
+| + pose-refinement window (stop at iters/2) | 7k / 250k | 17.75 dB |
+
+Diagnosis chain now encoded in code: (1) per-view affines share a global
+color gauge — anchored so the mean correction stays identity; (2) constant
+pose-refinement LR walks the camera gauge all run — now decayed on the
+position schedule AND stopped at mid-training (train loss stayed excellent
+while held-out collapsed: overfitting a moving gauge); (3) prime suspect for
+the remaining long-run gap **and** the original Mip-NeRF360 room collapse:
+MCMC exploration noise scales with the position LR, which scales with scene
+**extent** — ~50× too strong on a walkthrough whose extent is ~30× its room
+depth, and it activates exactly at geo_start. geo_bench exonerated the
+geometry-loss kernels themselves (~0% per-iteration cost at 300k/780×520).
+Verification run with noise 20→1 in flight.

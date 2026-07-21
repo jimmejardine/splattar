@@ -576,7 +576,10 @@ fn train_and_bake(
         reg_scale: 0.005,
         sh_promote_every: 1000,
         mcmc_every: 300,
-        mcmc_noise: 20.0,
+        // Noise sigma = mcmc_noise × pos LR, and pos LR scales with scene
+        // EXTENT — on a walkthrough (extent ≈ 30× room depth) 20.0 jitters
+        // surfels by ~0.1 world units per iter and wrecks held-out quality.
+        mcmc_noise: 1.0,
         entries_per_surfel: 48,
         // VO poses + a guessed focal are noisy — let the verified camera
         // gradients polish them (validated: recovers +2.2 dB on synthetic
