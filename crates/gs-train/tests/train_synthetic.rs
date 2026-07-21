@@ -318,3 +318,87 @@ fn pose_refinement_recovers_perturbed_poses() {
     );
     assert!(with > 25.0, "refined PSNR too low: {with:.2} dB");
 }
+
+/// M7 gate: per-view affine appearance compensation absorbs auto-exposure.
+/// Every training target gets its own random gain/bias (like a phone sweeping
+/// exposure through a walkthrough); eval targets stay clean. Without
+/// compensation the model averages exposures; with it, PSNR should recover
+/// most of the gap to the clean bar.
+#[test]
+#[ignore = "slow end-to-end training (~90 s GPU); run with --ignored"]
+fn appearance_compensation_recovers_exposure_swings() {
+    let Some(ctx) = context() else { return };
+
+    let gt = random_surfels(0xfeedbeef, N_GT, 1.2, true);
+    let gt_raster = Rasterizer::new(&ctx, N_GT as u32, SIZE, SIZE, (N_GT * 64) as u32);
+    gt_raster.upload_scene(
+        &ctx,
+        &SceneInput {
+            positions: &gt.positions,
+            scales: &gt.scales,
+            quats: &gt.quats,
+            opacities: &gt.opacities,
+            sh: &gt.sh,
+            sh_coeffs: 1,
+        },
+    );
+    let render_gt = |camera: &RasterCamera| -> Vec<[f32; 4]> {
+        let mut encoder = ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        gt_raster.forward(&ctx, &mut encoder, camera, N_GT as u32);
+        ctx.queue.submit([encoder.finish()]);
+        bytemuck::cast_slice(&gs_wgpu::buffers::readback(
+            &ctx.device,
+            &ctx.queue,
+            &gt_raster.out_color,
+        ))
+        .to_vec()
+    };
+
+    let mut rng = 0x9a77e51u64;
+    let mut train_views = Vec::new();
+    let mut eval_views = Vec::new();
+    for i in 0..35 {
+        let angle = i as f32 / 35.0 * std::f32::consts::TAU;
+        let camera = orbit_camera(angle, 1.0 + (i % 3) as f32 * 0.5, 4.0);
+        let mut target = render_gt(&camera);
+        if i % 7 == 3 {
+            eval_views.push(TrainView { target, camera });
+        } else {
+            // Auto-exposure-style corruption: shared-ish gain, small bias.
+            let gain = 1.0 + uni(&mut rng, -0.25, 0.35);
+            let bias = uni(&mut rng, -0.06, 0.06);
+            for p in &mut target {
+                for ch in 0..3 {
+                    p[ch] = (p[ch] * gain + bias).clamp(0.0, 1.0);
+                }
+            }
+            train_views.push(TrainView { target, camera });
+        }
+    }
+
+    let run = |appearance_start: u32| -> f64 {
+        let init = random_surfels(0x12345, N_TRAIN, 1.2, false);
+        let config = TrainConfig {
+            iters: 6000,
+            log_every: 6000,
+            appearance_start,
+            ..Default::default()
+        };
+        let mut trainer =
+            Trainer::new(&ctx, SIZE, SIZE, train_views.clone(), init, config);
+        trainer.train(&ctx);
+        // Eval targets are clean, so plain PSNR is the honest metric here.
+        trainer.eval_psnr(&ctx, &eval_views)
+    };
+
+    let without = run(u32::MAX);
+    let with = run(300);
+    eprintln!("exposure swings: PSNR {without:.2} dB raw vs {with:.2} dB compensated");
+    assert!(
+        with > without + 1.5,
+        "appearance compensation gained too little: {without:.2} -> {with:.2} dB"
+    );
+    assert!(with > 25.0, "compensated PSNR too low: {with:.2} dB");
+}

@@ -579,6 +579,8 @@ fn train_and_bake(
         pose_refine_lr: 2e-3,
         pose_refine_start: 500,
         focal_refine: true,
+        // Phone auto-exposure sweeps continuously — compensate per view.
+        appearance_start: 300,
         ..Default::default()
     };
     let mut eval_views = prepared.eval_views;

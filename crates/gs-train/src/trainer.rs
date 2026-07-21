@@ -60,6 +60,12 @@ pub struct TrainConfig {
     pub pose_refine_start: u32,
     /// Also refine the (shared) focal length in log-space.
     pub focal_refine: bool,
+    /// Iteration at which per-view affine appearance compensation starts
+    /// (u32::MAX = off). Phone auto-exposure/AWB sweeps continuously; each
+    /// view gets a per-channel gain+bias fitted against its render and the
+    /// *target* is inverse-corrected in the loss — the scene stays canonical
+    /// (never baked into SH, per CLAUDE.md).
+    pub appearance_start: u32,
 }
 
 impl Default for TrainConfig {
@@ -88,6 +94,7 @@ impl Default for TrainConfig {
             pose_refine_lr: 0.0,
             pose_refine_start: 500,
             focal_refine: false,
+            appearance_start: u32::MAX,
         }
     }
 }
@@ -130,6 +137,9 @@ pub struct Trainer {
     /// extent (a long walkthrough's extent is ~30× the room depth).
     probe_positions: Vec<Vec3>,
     pose_depth: Vec<f32>,
+    /// Per-view appearance [gain rgb, bias rgb], EMA-updated from LS fits.
+    appear: Vec<[f32; 6]>,
+    target_scratch: Vec<[f32; 4]>,
 }
 
 #[repr(C)]
@@ -295,6 +305,8 @@ impl Trainer {
             focal_scale: 1.0,
             probe_positions,
             pose_depth: vec![0.0; n_views],
+            appear: vec![[1.0, 1.0, 1.0, 0.0, 0.0, 0.0]; n_views],
+            target_scratch: Vec::new(),
         }
     }
 
@@ -351,11 +363,33 @@ impl Trainer {
         };
 
         let view_idx = self.next_view();
-        ctx.queue.write_buffer(
-            &self.loss.target,
-            0,
-            bytemuck::cast_slice(&self.views[view_idx].target),
-        );
+        let appearance_on = iter >= self.config.appearance_start;
+        if appearance_on {
+            // Inverse-correct the target with this view's affine so the
+            // canonical scene is compared against exposure-normalized pixels.
+            let ap = self.appear[view_idx];
+            let src = &self.views[view_idx].target;
+            self.target_scratch.clear();
+            self.target_scratch.extend(src.iter().map(|p| {
+                [
+                    ((p[0] - ap[3]) / ap[0]).clamp(0.0, 4.0),
+                    ((p[1] - ap[4]) / ap[1]).clamp(0.0, 4.0),
+                    ((p[2] - ap[5]) / ap[2]).clamp(0.0, 4.0),
+                    p[3],
+                ]
+            }));
+            ctx.queue.write_buffer(
+                &self.loss.target,
+                0,
+                bytemuck::cast_slice(&self.target_scratch),
+            );
+        } else {
+            ctx.queue.write_buffer(
+                &self.loss.target,
+                0,
+                bytemuck::cast_slice(&self.views[view_idx].target),
+            );
+        }
         let mut camera = self.views[view_idx].camera.clone();
         camera.focal *= self.focal_scale;
         // Progressive SH unlock.
@@ -377,6 +411,30 @@ impl Trainer {
         self.loss.encode(&mut encoder);
         self.normal_loss.encode(&mut encoder);
         ctx.queue.submit([encoder.finish()]);
+
+        // Appearance: refresh this view's affine from the fresh render vs the
+        // ORIGINAL target (one-step lag: the loss above used the previous
+        // fit — self-consistent once the EMA settles).
+        if appearance_on {
+            let render: Vec<[f32; 4]> = bytemuck::cast_slice(&gs_wgpu::buffers::readback(
+                &ctx.device,
+                &ctx.queue,
+                &self.raster.out_color,
+            ))
+            .to_vec();
+            if let Some(fit) = fit_affine(&render, &self.views[view_idx].target) {
+                let ap = &mut self.appear[view_idx];
+                for k in 0..6 {
+                    ap[k] = 0.8 * ap[k] + 0.2 * fit[k];
+                }
+                for g in &mut ap[..3] {
+                    *g = g.clamp(0.5, 2.0);
+                }
+                for b in &mut ap[3..] {
+                    *b = b.clamp(-0.5, 0.5);
+                }
+            }
+        }
 
         let mut encoder = ctx
             .device
@@ -520,7 +578,33 @@ impl Trainer {
                 apply_camera_step(&mut view.camera, &step);
             }
         }
-        self.eval_psnr(ctx, &refined)
+        if self.config.appearance_start != u32::MAX {
+            self.eval_psnr_affine(ctx, &refined)
+        } else {
+            self.eval_psnr(ctx, &refined)
+        }
+    }
+
+    /// PSNR with a per-view affine (gain+bias) fitted between render and
+    /// target before scoring — the eval counterpart of training-time
+    /// appearance compensation (auto-exposure is not scene error).
+    pub fn eval_psnr_affine(&self, ctx: &GpuContext, views: &[TrainView]) -> f64 {
+        let mut total = 0.0;
+        for view in views {
+            let out = self.render_view(ctx, &view.camera);
+            let ap = fit_affine(&out, &view.target)
+                .unwrap_or([1.0, 1.0, 1.0, 0.0, 0.0, 0.0]);
+            let mut mse = 0.0f64;
+            for (o, t) in out.iter().zip(&view.target) {
+                for ch in 0..3 {
+                    let e = (ap[ch] * o[ch] + ap[3 + ch] - t[ch]) as f64;
+                    mse += e * e;
+                }
+            }
+            mse /= (out.len() * 3) as f64;
+            total += -10.0 * mse.max(1e-12).log10();
+        }
+        total / views.len().max(1) as f64
     }
 
     /// MCMC relocation: dead surfels (activated opacity below threshold) move
@@ -746,6 +830,36 @@ fn adam6(
         step[k] = lr * (m[k] / bc1) / ((v[k] / bc2).sqrt() + 1e-10);
     }
     step
+}
+
+/// Per-channel least-squares affine target ≈ gain·render + bias, on a pixel
+/// subsample. Returns [gain rgb, bias rgb]; None if the render is degenerate.
+fn fit_affine(render: &[[f32; 4]], target: &[[f32; 4]]) -> Option<[f32; 6]> {
+    let mut out = [1.0f32, 1.0, 1.0, 0.0, 0.0, 0.0];
+    for ch in 0..3 {
+        let (mut sr, mut st, mut srr, mut srt, mut n) = (0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64);
+        for i in (0..render.len()).step_by(4) {
+            let r = render[i][ch] as f64;
+            let t = target[i][ch] as f64;
+            sr += r;
+            st += t;
+            srr += r * r;
+            srt += r * t;
+            n += 1.0;
+        }
+        let var = srr - sr * sr / n;
+        if var < 1e-9 || !var.is_finite() {
+            return None;
+        }
+        let g = (srt - sr * st / n) / var;
+        let b = (st - g * sr) / n;
+        if !(g.is_finite() && b.is_finite()) {
+            return None;
+        }
+        out[ch] = g as f32;
+        out[3 + ch] = b as f32;
+    }
+    Some(out)
 }
 
 fn apply_camera_step(camera: &mut gs_kernels::RasterCamera, step: &[f32; 6]) {
