@@ -13,6 +13,7 @@ gs-core = { workspace = true }
 glam = { workspace = true }
 nalgebra = { workspace = true }
 log = { workspace = true }
+rayon = { workspace = true }
 
 [dev-dependencies]
 rand = { workspace = true }

@@ -283,44 +283,57 @@ fn run_vo(
     let mut reader = gs_video::Mp4H264Reader::open(video).context("open video")?;
     let t0 = std::time::Instant::now();
 
-    let mut vo: Option<(VoFrontEnd, Intrinsics, (u32, u32))> = None;
-    let mut n = 0u32;
-    while let Some(frame) = reader.next_frame().context("decode")? {
-        let (fe, ..) = vo.get_or_insert_with(|| {
-            let f = focal.unwrap_or(0.85 * frame.width.max(frame.height) as f64);
-            log::info!(
-                "video {}x{}, focal guess {f:.0}px",
-                frame.width,
-                frame.height
-            );
-            let intr = Intrinsics {
-                focal: f,
-                cx: frame.width as f64 / 2.0,
-                cy: frame.height as f64 / 2.0,
-            };
-            (
-                VoFrontEnd::new(VoConfig {
-                    intrinsics: intr,
-                    ..Default::default()
-                }),
-                intr,
-                (frame.width, frame.height),
-            )
-        });
-        let gray = gs_pose::GrayImage::from_luma8(
-            &frame.y,
-            frame.width as usize,
-            frame.height as usize,
-        );
-        fe.push_frame(gray, frame.pts);
-        n += 1;
-        if n.is_multiple_of(200) {
-            log::info!("tracked {n} frames, {} keyframes", fe.keyframes.len());
+    // Decode and tracking overlap: NVDEC decode (mostly blocking GPU fence
+    // waits) stays on this thread — the Vulkan session isn't Send — while
+    // KLT tracking runs on a worker fed through a small bounded channel, so
+    // causal-pass wall clock is max(decode, track) instead of their sum.
+    let (tx, rx) = std::sync::mpsc::sync_channel::<(Vec<u8>, u32, u32, f64)>(3);
+    let worker = std::thread::spawn(move || {
+        let mut vo: Option<(VoFrontEnd, Intrinsics, (u32, u32))> = None;
+        let mut n = 0u32;
+        while let Ok((y, width, height, pts)) = rx.recv() {
+            let (fe, ..) = vo.get_or_insert_with(|| {
+                let f = focal.unwrap_or(0.85 * width.max(height) as f64);
+                log::info!("video {width}x{height}, focal guess {f:.0}px");
+                let intr = Intrinsics {
+                    focal: f,
+                    cx: width as f64 / 2.0,
+                    cy: height as f64 / 2.0,
+                };
+                (
+                    VoFrontEnd::new(VoConfig {
+                        intrinsics: intr,
+                        ..Default::default()
+                    }),
+                    intr,
+                    (width, height),
+                )
+            });
+            let gray =
+                gs_pose::GrayImage::from_luma8(&y, width as usize, height as usize);
+            fe.push_frame(gray, pts);
+            n += 1;
+            if n.is_multiple_of(200) {
+                log::info!("tracked {n} frames, {} keyframes", fe.keyframes.len());
+            }
         }
-        if max_frames > 0 && n >= max_frames {
+        (vo, n)
+    });
+    let mut sent = 0u32;
+    while let Some(frame) = reader.next_frame().context("decode")? {
+        if tx
+            .send((frame.y, frame.width, frame.height, frame.pts))
+            .is_err()
+        {
+            break; // worker died; its panic resurfaces at join
+        }
+        sent += 1;
+        if max_frames > 0 && sent >= max_frames {
             break;
         }
     }
+    drop(tx);
+    let (vo, n) = worker.join().expect("tracking worker panicked");
     let (mut fe, intrinsics, video_size) = vo.context("no frames decoded")?;
     let decode_track_s = t0.elapsed().as_secs_f64();
     log::info!(

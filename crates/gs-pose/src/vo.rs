@@ -16,6 +16,7 @@
 
 use glam::{DMat3, DMat4, DVec3};
 use nalgebra::Vector3;
+use rayon::prelude::*;
 
 use crate::ba::{BaConfig, BaProblem, Obs, optimize};
 use crate::detect::{DetectConfig, detect};
@@ -196,25 +197,47 @@ impl VoFrontEnd {
         if let Some(prev) = &self.prev {
             // Track with constant-velocity prediction (median of last flow).
             let (mfx, mfy) = self.prev_median_flow;
-            let mut flows: Vec<(f32, f32)> = Vec::new();
+            let (cx, cy) = (self.cfg.intrinsics.cx as f32, self.cfg.intrinsics.cy as f32);
+            let klt = &self.cfg.klt;
+            // Per-feature pyramidal LK is the causal-pass hot loop and is
+            // embarrassingly parallel (the pyramids are read-only, each track
+            // owns its state). Per-track results are reduced in track order
+            // below, so the flow median and the zoom sums are identical to
+            // the serial loop regardless of thread count.
+            /// (flow, radial numerator, radial denominator) per surviving track.
+            type Tracked = Option<((f32, f32), f64, f64)>;
+            let tracked: Vec<Tracked> = self
+                .tracks
+                .par_iter_mut()
+                .map(|tr| {
+                    let p = tr.cur?;
+                    let guess = (p.0 + mfx, p.1 + mfy);
+                    match track_point_fb(prev, &pyr, p, guess, klt) {
+                        Some(q) => {
+                            tr.cur = Some(q);
+                            // Radial components about the principal point.
+                            let r0 = ((p.0 - cx) as f64, (p.1 - cy) as f64);
+                            let r1 = ((q.0 - cx) as f64, (q.1 - cy) as f64);
+                            Some((
+                                (q.0 - p.0, q.1 - p.1),
+                                r1.0 * r0.0 + r1.1 * r0.1,
+                                r0.0 * r0.0 + r0.1 * r0.1,
+                            ))
+                        }
+                        None => {
+                            tr.cur = None;
+                            None
+                        }
+                    }
+                })
+                .collect();
+            let mut flows: Vec<(f32, f32)> = Vec::with_capacity(tracked.len());
             let mut radial_num = 0.0f64;
             let mut radial_den = 0.0f64;
-            let (cx, cy) = (self.cfg.intrinsics.cx as f32, self.cfg.intrinsics.cy as f32);
-            for tr in &mut self.tracks {
-                let Some(p) = tr.cur else { continue };
-                let guess = (p.0 + mfx, p.1 + mfy);
-                match track_point_fb(prev, &pyr, p, guess, &self.cfg.klt) {
-                    Some(q) => {
-                        flows.push((q.0 - p.0, q.1 - p.1));
-                        // Radial components about the principal point.
-                        let r0 = ((p.0 - cx) as f64, (p.1 - cy) as f64);
-                        let r1 = ((q.0 - cx) as f64, (q.1 - cy) as f64);
-                        radial_num += r1.0 * r0.0 + r1.1 * r0.1;
-                        radial_den += r0.0 * r0.0 + r0.1 * r0.1;
-                        tr.cur = Some(q);
-                    }
-                    None => tr.cur = None,
-                }
+            for (flow, rn, rd) in tracked.into_iter().flatten() {
+                flows.push(flow);
+                radial_num += rn;
+                radial_den += rd;
             }
             if radial_den > 1.0 {
                 zoom = (radial_num / radial_den).max(1e-6).ln();
@@ -346,9 +369,12 @@ impl VoFrontEnd {
         // Sample candidate starts — scanning every keyframe is O(n²) in
         // track lookups and adds nothing once the pool is a few dozen.
         let step = ((hi - lo) / 48).max(1);
-        let mut candidates: Vec<(f64, usize, usize)> = (lo..hi)
-            .step_by(step)
-            .filter_map(|ka| {
+        // Each candidate start is scored independently (read-only track
+        // scans, the O(n²) cost noted above) — parallel, order preserved.
+        let starts: Vec<usize> = (lo..hi).step_by(step).collect();
+        let mut candidates: Vec<(f64, usize, usize)> = starts
+            .par_iter()
+            .filter_map(|&ka| {
                 let mut chosen: Option<(usize, usize, f64)> = None;
                 for kb in ka + 1..n_kf {
                     let (m, _) = self.kf_matches(ka, kb);
@@ -442,17 +468,30 @@ impl VoFrontEnd {
         let mut order: Vec<usize> = (0..n_kf).filter(|&k| poses[k].is_none()).collect();
         order.sort_by_key(|&k| k.abs_diff(anchor));
 
-        for k in order {
-            // PnP from tracks with landmarks observed at keyframe k.
-            let mut pts3 = Vec::new();
-            let mut obs2 = Vec::new();
-            for tr in &self.tracks {
-                let Some(l) = tr.landmark else { continue };
-                if let Some(&(_, p)) = tr.obs.iter().find(|o| o.0 == k) {
-                    pts3.push(landmarks[l]);
-                    obs2.push(self.cfg.intrinsics.norm(p));
-                }
+        let total_pending = order.len();
+        let mut solved_count = 2usize; // the bootstrap pair
+        for (processed, k) in order.into_iter().enumerate() {
+            if processed > 0 && processed % 100 == 0 {
+                log::info!(
+                    "anchor-out mapping: {processed}/{total_pending} keyframes ({solved_count} solved, {} landmarks)",
+                    landmarks.len()
+                );
             }
+            // PnP from tracks with landmarks observed at keyframe k. The scan
+            // over all tracks is per-track independent; order-preserving
+            // parallel collect keeps PnP inputs identical to the serial scan.
+            let gathered: Vec<(Vector3<f64>, (f64, f64))> = self
+                .tracks
+                .par_iter()
+                .filter_map(|tr| {
+                    let l = tr.landmark?;
+                    tr.obs
+                        .iter()
+                        .find(|o| o.0 == k)
+                        .map(|&(_, p)| (landmarks[l], self.cfg.intrinsics.norm(p)))
+                })
+                .collect();
+            let (pts3, obs2): (Vec<_>, Vec<_>) = gathered.into_iter().unzip();
             // Prior: nearest solved pose.
             let prior = nearest_pose(&poses, k)?;
             let Some(res) = solve_pnp(&pts3, &obs2, &prior, &PnpConfig::default()) else {
@@ -460,31 +499,39 @@ impl VoFrontEnd {
                 continue;
             };
             poses[k] = Some(res.pose);
+            solved_count += 1;
 
-            // Triangulate tracks that now have ≥2 solved observations.
-            for tr in &mut self.tracks {
-                if tr.landmark.is_some() {
-                    continue;
-                }
-                let solved: Vec<(Se3, (f64, f64))> = tr
-                    .obs
-                    .iter()
-                    .filter_map(|(kf, p)| {
-                        poses[*kf].map(|pose| (pose, self.cfg.intrinsics.norm(*p)))
-                    })
-                    .collect();
-                if solved.len() < 2 {
-                    continue;
-                }
-                if let Some(p) = triangulate_n(&solved) {
+            // Triangulate tracks that now have ≥2 solved observations —
+            // candidates found in parallel, committed serially in track order
+            // so landmark numbering stays deterministic.
+            let new_points: Vec<(usize, Vector3<f64>)> = self
+                .tracks
+                .par_iter()
+                .enumerate()
+                .filter_map(|(ti, tr)| {
+                    if tr.landmark.is_some() {
+                        return None;
+                    }
+                    let solved: Vec<(Se3, (f64, f64))> = tr
+                        .obs
+                        .iter()
+                        .filter_map(|(kf, p)| {
+                            poses[*kf].map(|pose| (pose, self.cfg.intrinsics.norm(*p)))
+                        })
+                        .collect();
+                    if solved.len() < 2 {
+                        return None;
+                    }
+                    let p = triangulate_n(&solved)?;
                     // Cheirality + parallax over the solved views.
                     let ok_z = solved.iter().all(|(pose, _)| pose.act(&p)[2] > 1e-3);
                     let ang = parallax_angle(&solved[0].0, &solved[solved.len() - 1].0, &p);
-                    if ok_z && ang > self.cfg.boot_min_parallax * 0.5 {
-                        tr.landmark = Some(landmarks.len());
-                        landmarks.push(p);
-                    }
-                }
+                    (ok_z && ang > self.cfg.boot_min_parallax * 0.5).then_some((ti, p))
+                })
+                .collect();
+            for (ti, p) in new_points {
+                self.tracks[ti].landmark = Some(landmarks.len());
+                landmarks.push(p);
             }
 
             // Sliding-window BA around k (every other keyframe — the window
@@ -495,7 +542,13 @@ impl VoFrontEnd {
         }
 
         // Final polish: full BA with the anchor pair fixed (cheap at VO scale).
+        log::info!(
+            "anchor-out mapping done: {solved_count}/{n_kf} solved, {} landmarks; global BA...",
+            landmarks.len()
+        );
+        let t_ba = std::time::Instant::now();
         self.global_ba(&mut poses, &mut landmarks, anchor);
+        log::info!("global BA done in {:.1}s", t_ba.elapsed().as_secs_f64());
 
         let keyframe_poses: Vec<Option<KeyframePose>> = poses
             .iter()
