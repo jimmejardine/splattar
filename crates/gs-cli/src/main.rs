@@ -757,13 +757,23 @@ fn run_add(
         d.sort_by(f64::total_cmp);
         let thresh = 0.05 * d[d.len() / 2];
         if let Some((sim3, inliers)) = register_point_sets(&a, &b, 800, thresh, 0x5133) {
+            // Inlier spread gate: a genuine overlap spans structure, it isn't
+            // a tight cluster barely wider than the RANSAC threshold.
+            let inl_b: Vec<DVec3> = inliers.iter().map(|&i| b[i]).collect();
+            let cen = inl_b.iter().copied().sum::<DVec3>() / inl_b.len() as f64;
+            let spread = (inl_b.iter().map(|p| (*p - cen).length_squared()).sum::<f64>()
+                / inl_b.len() as f64)
+                .sqrt();
             log::info!(
-                "Sim(3): {} of {} matches agree (scale {:.3})",
+                "Sim(3): {} of {} matches agree (scale {:.3}, inlier spread {:.2} vs thresh {:.2})",
                 inliers.len(),
                 pairs.len(),
-                sim3.scale
+                sim3.scale,
+                spread,
+                thresh
             );
-            if inliers.len() >= 25 {
+            if inliers.len() >= 25 && (0.05..=20.0).contains(&sim3.scale) && spread > 4.0 * thresh
+            {
                 registration = Some(sim3);
             }
         }

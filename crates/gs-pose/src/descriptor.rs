@@ -55,7 +55,11 @@ pub fn hamming(a: &Descriptor, b: &Descriptor) -> u32 {
         .sum()
 }
 
-/// Brute-force match with Lowe-style ratio test on Hamming distances.
+/// Brute-force match with Lowe-style ratio test on Hamming distances, plus a
+/// cross-check: each b-side descriptor keeps only its single best a-side
+/// partner. Without the cross-check, repeated indoor texture lets hundreds of
+/// a-descriptors pile onto the same few b-landmarks, and a degenerate
+/// (scale→0) Sim(3) can "explain" the resulting concentrated cluster.
 /// Returns (index in a, index in b) pairs.
 pub fn match_descriptors(
     a: &[Descriptor],
@@ -63,7 +67,7 @@ pub fn match_descriptors(
     max_dist: u32,
     ratio: f32,
 ) -> Vec<(usize, usize)> {
-    let mut out = Vec::new();
+    let mut fwd: Vec<(usize, usize, u32)> = Vec::new();
     for (i, da) in a.iter().enumerate() {
         let mut best = (u32::MAX, usize::MAX);
         let mut second = u32::MAX;
@@ -77,9 +81,25 @@ pub fn match_descriptors(
             }
         }
         if best.0 <= max_dist && (best.0 as f32) < ratio * second as f32 {
-            out.push((i, best.1));
+            fwd.push((i, best.1, best.0));
         }
     }
+    // Cross-check: keep only the best a per b.
+    let mut best_for_b: std::collections::HashMap<usize, (usize, u32)> =
+        std::collections::HashMap::new();
+    for &(i, j, d) in &fwd {
+        match best_for_b.get(&j) {
+            Some(&(_, dj)) if dj <= d => {}
+            _ => {
+                best_for_b.insert(j, (i, d));
+            }
+        }
+    }
+    let mut out: Vec<(usize, usize)> = best_for_b
+        .into_iter()
+        .map(|(j, (i, _))| (i, j))
+        .collect();
+    out.sort_unstable();
     out
 }
 

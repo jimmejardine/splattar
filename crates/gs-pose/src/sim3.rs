@@ -106,6 +106,11 @@ pub fn ransac_sim3(
         let sa: Vec<Vector3<f64>> = idx.iter().map(|&i| a[i]).collect();
         let sb: Vec<Vector3<f64>> = idx.iter().map(|&i| b[i]).collect();
         let Some(m) = umeyama(&sa, &sb) else { continue };
+        // Degenerate-scale models (near-coincident samples) can "explain"
+        // any concentrated cluster by collapsing it — never score them.
+        if !(0.01..=100.0).contains(&m.scale) {
+            continue;
+        }
         let count = a
             .iter()
             .zip(b)
