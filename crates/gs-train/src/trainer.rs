@@ -70,6 +70,11 @@ pub struct TrainConfig {
     /// *target* is inverse-corrected in the loss — the scene stays canonical
     /// (never baked into SH, per CLAUDE.md).
     pub appearance_start: u32,
+    /// Below this iteration, forward and backward go in separate queue
+    /// submissions (headroom under the Windows GPU watchdog — TDR ~2 s per
+    /// submission — for heavy unconverged early iterations); from it on, one
+    /// submission per iteration. u32::MAX = always split (escape hatch).
+    pub merge_submits_after: u32,
 }
 
 impl Default for TrainConfig {
@@ -100,6 +105,7 @@ impl Default for TrainConfig {
             pose_refine_end: u32::MAX,
             focal_refine: false,
             appearance_start: u32::MAX,
+            merge_submits_after: 1000,
         }
     }
 }
@@ -144,13 +150,29 @@ pub struct Trainer {
     pose_depth: Vec<f32>,
     /// Per-view appearance [gain rgb, bias rgb], EMA-updated from LS fits.
     appear: Vec<[f32; 6]>,
-    target_scratch: Vec<[f32; 4]>,
+    /// GPU-resident targets + GPU affine-fit reduction (async readback).
+    appearance: crate::appearance::Appearance,
+    /// Async ring for the 64-byte grad_cam readback: pose updates apply 1-2
+    /// iterations late instead of stalling the queue every iteration.
+    pose_ring: gs_wgpu::ReadbackRing<PendingPose>,
     /// Per-kernel GPU timing, sampled on log iterations (None when the
     /// adapter lacks TIMESTAMP_QUERY).
     timer: Option<gs_wgpu::GpuTimer>,
     /// Host wall-clock per step phase, accumulated between log lines. The
     /// host timers are what reveal CPU↔GPU stalls — GPU timestamps can't.
     phases: PhaseTimes,
+}
+
+/// Snapshot taken when a pose-gradient readback is issued — the host Adam
+/// step must chain the gradient at the camera state that produced it.
+struct PendingPose {
+    view_idx: usize,
+    /// Camera rotation at render time (grad_cam's dl/dR chains through it).
+    quat: glam::Quat,
+    /// Focal at render time, for the log-space focal gradient.
+    focal: f32,
+    /// LR decay factor at issue time.
+    decay: f32,
 }
 
 /// Millisecond accumulators for the phases of [`Trainer::step`].
@@ -208,6 +230,14 @@ impl Trainer {
             (n * config.entries_per_surfel).max(1024),
         );
         let loss = SsimLoss::new(ctx, width, height, config.lambda, &raster.out_color, &raster.dl_dcolor);
+        let appearance = crate::appearance::Appearance::new(
+            ctx,
+            width,
+            height,
+            &views,
+            &loss.target,
+            &raster.out_color,
+        );
 
         // Scene extent for position LR scaling.
         let (mut lo, mut hi) = (init.positions[0], init.positions[0]);
@@ -344,7 +374,8 @@ impl Trainer {
             probe_positions,
             pose_depth: vec![0.0; n_views],
             appear: vec![[1.0, 1.0, 1.0, 0.0, 0.0, 0.0]; n_views],
-            target_scratch: Vec::new(),
+            appearance,
+            pose_ring: gs_wgpu::ReadbackRing::new(&ctx.device, "pose-grad", 16 * 4, 4),
             timer: ctx
                 .device
                 .features()
@@ -411,34 +442,30 @@ impl Trainer {
             0.0
         };
 
-        let view_idx = self.next_view();
-        let appearance_on = iter >= self.config.appearance_start;
-        if appearance_on {
-            // Inverse-correct the target with this view's affine so the
-            // canonical scene is compared against exposure-normalized pixels.
-            let ap = self.appear[view_idx];
-            let src = &self.views[view_idx].target;
-            self.target_scratch.clear();
-            self.target_scratch.extend(src.iter().map(|p| {
-                [
-                    ((p[0] - ap[3]) / ap[0]).clamp(0.0, 4.0),
-                    ((p[1] - ap[4]) / ap[1]).clamp(0.0, 4.0),
-                    ((p[2] - ap[5]) / ap[2]).clamp(0.0, 4.0),
-                    p[3],
-                ]
-            }));
-            ctx.queue.write_buffer(
-                &self.loss.target,
-                0,
-                bytemuck::cast_slice(&self.target_scratch),
-            );
-        } else {
-            ctx.queue.write_buffer(
-                &self.loss.target,
-                0,
-                bytemuck::cast_slice(&self.views[view_idx].target),
-            );
+        // Deliver async results that completed since last iteration:
+        // appearance fits and pose updates, both applied 1-2 iterations late
+        // by design (appearance models slow auto-exposure and already ran one
+        // step lagged; pose LR decays and BARF-style refinement tolerates it).
+        let fits = self.appearance.poll_fits(&ctx.device);
+        for (v, fit) in fits {
+            self.apply_affine_fit(v, fit);
         }
+        let pending = self.pose_ring.poll_ready(&ctx.device);
+        for (p, bytes) in pending {
+            self.apply_pose_grads(&p, &bytes);
+        }
+
+        let view_idx = self.next_view();
+        // A pose update for the view we are about to render must not land
+        // after its camera is snapshotted — force-drain the rare collision
+        // (a view recurs every ~n_views iterations; ring latency is 1-2).
+        if self.pose_ring.any_pending(|p| p.view_idx == view_idx) {
+            let pending = self.pose_ring.drain_blocking(&ctx.device);
+            for (p, bytes) in pending {
+                self.apply_pose_grads(&p, &bytes);
+            }
+        }
+        let appearance_on = iter >= self.config.appearance_start;
         let mut camera = self.views[view_idx].camera.clone();
         camera.focal *= self.focal_scale;
         // Progressive SH unlock.
@@ -458,61 +485,46 @@ impl Trainer {
         let mut encoder = ctx
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        // GPU-side target: inverse-correct this view's atlas image with its
+        // current affine (identity before appearance starts) into the loss
+        // target — no host transform, no per-iteration image upload.
+        self.appearance.encode_transform(
+            ctx,
+            &mut encoder,
+            view_idx,
+            &self.appear[view_idx],
+            timer.as_mut(),
+        );
         self.raster
             .forward_timed(ctx, &mut encoder, &camera, self.num_surfels, timer.as_mut());
         self.loss.encode_timed(&mut encoder, timer.as_mut());
         self.normal_loss.encode_timed(&mut encoder, timer.as_mut());
-        if let Some(t) = timer.as_ref() {
-            t.resolve(&mut encoder);
-        }
-        ctx.queue.submit([encoder.finish()]);
-        let t_fwd = std::time::Instant::now();
-
-        // Appearance: refresh this view's affine from the fresh render vs the
-        // ORIGINAL target (one-step lag: the loss above used the previous
-        // fit — self-consistent once the EMA settles).
+        // Appearance: refit this view's affine from the fresh render vs the
+        // ORIGINAL target — GPU-reduced to 48 bytes, read back async through
+        // the ring (applied 1-2 iterations later by poll_fits above; the old
+        // blocking fit already ran one step lagged by design).
         if appearance_on {
-            let render: Vec<[f32; 4]> = bytemuck::cast_slice(&gs_wgpu::buffers::readback(
-                &ctx.device,
-                &ctx.queue,
-                &self.raster.out_color,
-            ))
-            .to_vec();
-            if let Some(fit) = fit_affine(&render, &self.views[view_idx].target) {
-                let ap = &mut self.appear[view_idx];
-                for k in 0..6 {
-                    ap[k] = 0.8 * ap[k] + 0.2 * fit[k];
-                }
-                for g in &mut ap[..3] {
-                    *g = g.clamp(0.5, 2.0);
-                }
-                for b in &mut ap[3..] {
-                    *b = b.clamp(-0.5, 0.5);
-                }
-                // Anchor the color gauge: the affines have a global degree of
-                // freedom (all views can drift together, chasing the render).
-                // Project it out so the mean correction stays identity.
-                let n = self.appear.len() as f32;
-                let mut mean = [0.0f32; 6];
-                for a in &self.appear {
-                    for k in 0..6 {
-                        mean[k] += a[k] / n;
-                    }
-                }
-                for a in &mut self.appear {
-                    for k in 0..3 {
-                        a[k] /= mean[k].max(0.25);
-                        a[3 + k] -= mean[3 + k];
-                    }
-                }
-            }
+            self.appearance
+                .encode_fit(&mut encoder, view_idx, timer.as_mut());
         }
+        // Nothing reads between forward and backward anymore — once past the
+        // heavy early iterations (TDR headroom), keep everything in one
+        // submission.
+        let split = iter < self.config.merge_submits_after;
+        if split {
+            if let Some(t) = timer.as_ref() {
+                t.resolve(&mut encoder);
+            }
+            ctx.queue.submit([encoder.finish()]);
+            self.appearance.map_pending();
+            encoder = ctx
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        }
+        let t_fwd = std::time::Instant::now();
 
         let t_appear = std::time::Instant::now();
 
-        let mut encoder = ctx
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
         self.raster
             .backward_timed(&mut encoder, self.num_surfels, timer.as_mut());
         self.optim.encode_step_timed(ctx, &mut encoder, timer.as_mut());
@@ -535,23 +547,36 @@ impl Trainer {
             pass.set_bind_group(0, &self.noise_bg, &[]);
             pass.dispatch_workgroups(self.num_surfels.div_ceil(256), 1, 1);
         }
-        if let Some(t) = timer.as_ref() {
-            t.resolve(&mut encoder);
-        }
-        ctx.queue.submit([encoder.finish()]);
-        let t_bwd = std::time::Instant::now();
-
-        // Pose refinement: chain the (parity-verified) camera gradients on
-        // the host and Adam-step this view's rotation/center + shared focal.
-        // LR decays with the same schedule as positions so late training
-        // stops jittering converged cameras.
+        // Pose refinement: queue this view's camera gradient for an async
+        // readback instead of stalling on it. The host Adam step (rotation/
+        // center + shared focal, LR decayed like positions) runs when the
+        // readback lands, against the camera snapshot taken here.
         if self.config.pose_refine_lr > 0.0
             && iter >= self.config.pose_refine_start
             && iter < self.config.pose_refine_end
         {
-            let decay = self.config.pos_lr_final_factor.powf(t);
-            self.refine_pose(ctx, view_idx, &camera, decay);
+            let tag = PendingPose {
+                view_idx,
+                quat: camera.quat,
+                focal: camera.focal,
+                decay: self.config.pos_lr_final_factor.powf(t),
+            };
+            if !self
+                .pose_ring
+                .encode_copy(&mut encoder, &self.raster.grad_cam, 0, 16 * 4, tag)
+            {
+                log::debug!("pose ring full — dropping pose sample for view {view_idx}");
+            }
         }
+        if let Some(t) = timer.as_ref() {
+            t.resolve(&mut encoder);
+        }
+        ctx.queue.submit([encoder.finish()]);
+        if !split {
+            self.appearance.map_pending();
+        }
+        self.pose_ring.map_pending();
+        let t_bwd = std::time::Instant::now();
         let t_pose = std::time::Instant::now();
 
         // Periodic dead-surfel relocation.
@@ -577,41 +602,66 @@ impl Trainer {
         view_idx
     }
 
-    /// Host-side camera update from `grad_cam`:
+    /// Fold a completed least-squares fit into a view's appearance affine:
+    /// EMA update, clamps, and the global gauge anchor (the affines have a
+    /// shared degree of freedom — all views could drift together chasing the
+    /// render — so the mean correction is projected back to identity).
+    fn apply_affine_fit(&mut self, view_idx: usize, fit: [f32; 6]) {
+        let ap = &mut self.appear[view_idx];
+        for k in 0..6 {
+            ap[k] = 0.8 * ap[k] + 0.2 * fit[k];
+        }
+        for g in &mut ap[..3] {
+            *g = g.clamp(0.5, 2.0);
+        }
+        for b in &mut ap[3..] {
+            *b = b.clamp(-0.5, 0.5);
+        }
+        let n = self.appear.len() as f32;
+        let mut mean = [0.0f32; 6];
+        for a in &self.appear {
+            for k in 0..6 {
+                mean[k] += a[k] / n;
+            }
+        }
+        for a in &mut self.appear {
+            for k in 0..3 {
+                a[k] /= mean[k].max(0.25);
+                a[3 + k] -= mean[3 + k];
+            }
+        }
+    }
+
+    /// Host-side camera update from a completed `grad_cam` readback:
     /// layout [dl/dR (col-major 3×3), dl/dcenter (3), dl/dfocal, …].
     /// Rotation uses the right-perturbation R' = R·exp([δ]×): the Riemannian
-    /// gradient is the antisymmetric part of B = Rᵀ·(dl/dR).
-    fn refine_pose(
-        &mut self,
-        ctx: &GpuContext,
-        view_idx: usize,
-        camera: &RasterCamera,
-        decay: f32,
-    ) {
-        let g = read_cam_grads(ctx, &self.raster.grad_cam);
-        let Some(grad) = camera_step_grad(&g, camera.quat) else {
+    /// gradient is the antisymmetric part of B = Rᵀ·(dl/dR). Chains through
+    /// the camera snapshot taken when the readback was issued.
+    fn apply_pose_grads(&mut self, p: &PendingPose, bytes: &[u8]) {
+        let g: &[f32] = bytemuck::cast_slice(bytes);
+        let Some(grad) = camera_step_grad(g, p.quat) else {
             return;
         };
         // Center LR scales with this view's median scene depth: a center
         // move of d·δθ shifts the image about as much as a rotation of δθ.
-        let depth = self.view_depth(view_idx);
-        let t = self.pose_t[view_idx] + 1;
-        self.pose_t[view_idx] = t;
-        let lr = self.config.pose_refine_lr * decay;
+        let depth = self.view_depth(p.view_idx);
+        let t = self.pose_t[p.view_idx] + 1;
+        self.pose_t[p.view_idx] = t;
+        let lr = self.config.pose_refine_lr * p.decay;
         let step = adam6(
-            &mut self.pose_m[view_idx],
-            &mut self.pose_v[view_idx],
+            &mut self.pose_m[p.view_idx],
+            &mut self.pose_v[p.view_idx],
             t,
             &grad,
             lr,
             lr * depth,
         );
-        let view = &mut self.views[view_idx];
+        let view = &mut self.views[p.view_idx];
         apply_camera_step(&mut view.camera, &step);
 
         // Shared focal in log-space (dL/d log f = f · dL/df).
         if self.config.focal_refine {
-            let gf = g[12] * camera.focal;
+            let gf = g[12] * p.focal;
             let (ref mut m, ref mut v, ref mut tf) = self.focal_state;
             *tf += 1;
             *m = 0.9 * *m + 0.1 * gf;
@@ -809,6 +859,19 @@ impl Trainer {
         log::debug!("mcmc: relocated {} dead surfels", dead.len());
     }
 
+    /// Apply every in-flight async result (pose updates, appearance fits).
+    /// Call after the last step before eval/export so nothing queued is lost.
+    fn flush_async(&mut self, ctx: &GpuContext) {
+        let pending = self.pose_ring.drain_blocking(&ctx.device);
+        for (p, bytes) in pending {
+            self.apply_pose_grads(&p, &bytes);
+        }
+        let fits: Vec<_> = self.appearance.drain_fits(&ctx.device);
+        for (v, fit) in fits {
+            self.apply_affine_fit(v, fit);
+        }
+    }
+
     pub fn train(&mut self, ctx: &GpuContext) {
         let start = std::time::Instant::now();
         for iter in 0..self.config.iters {
@@ -843,6 +906,7 @@ impl Trainer {
                 }
             }
         }
+        self.flush_async(ctx);
     }
 
     /// Render a view and return its rgb image (readback).

@@ -2,6 +2,7 @@
 //! and the training loop for posed-sequence datasets (the M3 validation
 //! harness; incremental anchor-out submap building arrives in M7).
 
+pub mod appearance;
 pub mod init;
 pub mod normal_loss;
 pub mod optim;
