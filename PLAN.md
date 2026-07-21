@@ -1,6 +1,6 @@
 # Splattar — Architecture & Roadmap
 
-> **Status (2026-07-21): M0–M6 core complete** (measured gates in [RESULTS.md](RESULTS.md)). M5 decode went **hardware** — Vulkan Video (NVDEC) via ash (every pure-Rust H.264 crate failed the bake-off: CAVLC-only, I-only, or AGPL). M6 VO passes ATE < 1% / RPE < 0.5° on synthetic GT and solves 404/404 keyframes on real Android footage (`gs-cli pose`); the AKAZE/Sim(3) relocalization primitive is deferred to M8 prep. Next up: **M7 — video-native training end-to-end**. Real-dataset parity gates (published-2DGS ±1 dB) are being measured on Mip-NeRF360 `room` now that M4's MCMC landed.
+> **Status (2026-07-21): M0–M6 complete; M7/M8 core landed, quality gates open** (details in [RESULTS.md](RESULTS.md)). M5 decode is **hardware** (Vulkan Video/NVDEC via ash — every pure-Rust H.264 crate failed the bake-off). M6 VO: ATE 0.91% / RPE < 0.5° synthetic, 404/404 keyframes on real footage. M7: `gs-cli run video.mp4` produces a walkable splat end-to-end (project dir + submap); held-out PSNR 20.3 dB vs the 24 dB gate — next lever is the per-submap affine appearance model (unmodeled auto-exposure). M8: project persistence, `add`, Sim(3) machinery, and first-class islands all work; cross-video *merging* of the overlapping flat pair awaits AKAZE-class relocalization descriptors (naive BRIEF gets no geometric consensus across viewpoint change). Open perf task: geometry losses are >10× per-iteration cost at real resolutions (disabled in `run` meanwhile). Mip-NeRF360 `room` parity run pending that fix.
 
 ## Goal
 
