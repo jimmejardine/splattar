@@ -185,8 +185,17 @@ fn main() -> anyhow::Result<()> {
         } => {
             let cloud = if file.is_dir() {
                 // Project directory: compose submaps (registered ones in the
-                // shared world, islands offset side by side).
-                compose_project(&file)?.0
+                // shared world, islands offset side by side). A directory
+                // that merely CONTAINS a default `gs-project` (e.g. the
+                // video folder) works too.
+                let root = if !file.join("submap-0").is_dir()
+                    && file.join("gs-project").join("submap-0").is_dir()
+                {
+                    file.join("gs-project")
+                } else {
+                    file.clone()
+                };
+                compose_project(&root)?.0
             } else {
                 let contents = gs_io::load_ply(&file)
                     .with_context(|| format!("loading {}", file.display()))?;
