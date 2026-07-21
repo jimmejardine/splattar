@@ -393,3 +393,32 @@ cuts are whip pans — the instrumented negative documented above ("segment
 bridging"). The strict `components < 3` assert is kept deliberately as
 the acceptance gate for the full-res pairwise-matching work; make
 bridging succeed rather than loosening the test.
+
+### Causal-pass + solve speedup: 65 min → ~3 min on the back-room clip (2026-07-21)
+
+Three changes, verified deterministic (identical keyframe counts across
+runs): (1) the keyframe flow threshold is now a fraction of the image
+diagonal (`kf_flow_frac`, default 0.015 ≈ the proven 15 px @ 478×850) —
+the old absolute-pixel threshold promoted ~90% of frames on high-res
+footage; (2) KLT tracks at a capped long side (960 px, integer luma
+decimation), the whole front-end living in tracking coords with a single
+`track_scale` lift at the training boundary; (3) the remaining serial
+per-frame internals were rayon-parallelized with index-ordered merges
+(promotion-time descriptor extraction — the dominant one — corner
+detection per cell-row band, pyramid rows). Promotion reasons are now
+logged (flow/survival/low-tracks).
+
+Back-room HEVC clip, 4,315 frames @ 720×1280: causal 11.5 → 47.0 fps,
+keyframes 3,605 → 2,900 (91% flow-driven — the footage genuinely moves
+fast), anchor-out solve 745 → 121 s, full coverage throughout. Decode is
+NOT the bottleneck (NVDEC ~500 fps, overlapped); the causal pass is now
+bounded by the serial frame-to-frame KLT chain itself.
+
+`SPLATTAR_KF_FLOW_FRAC` env knob added for density experiments. At 0.03:
+1,923 keyframes, same 4 segments, full coverage, comparable landmarks
+(43k vs 48k), solve 71.6 s. Candidate default bump pending an end-to-end
+PSNR comparison. GPU KLT (WGSL LK — the GPU is idle during VO in today's
+serial flow, NVDEC is a separate engine) is the recorded next lever if
+the causal pass needs another 4×+; a faster linear-algebra library is
+not — the big solve already runs on faer, and the rest is small
+fixed-size ops where keyframe count, not the library, is the multiplier.

@@ -376,15 +376,18 @@ fn run_vo(
                     cx: tw as f64 / 2.0,
                     cy: th as f64 / 2.0,
                 };
-                (
-                    VoFrontEnd::new(VoConfig {
-                        intrinsics: intr,
-                        ..Default::default()
-                    }),
-                    intr,
-                    (tw, th),
-                    scale,
-                )
+                let mut cfg = VoConfig {
+                    intrinsics: intr,
+                    ..Default::default()
+                };
+                // Tuning override for keyframe density experiments.
+                if let Ok(v) = std::env::var("SPLATTAR_KF_FLOW_FRAC")
+                    && let Ok(frac) = v.parse::<f32>()
+                {
+                    log::info!("kf_flow_frac override: {frac}");
+                    cfg.kf_flow_frac = frac;
+                }
+                (VoFrontEnd::new(cfg), intr, (tw, th), scale)
             });
             let s = *scale as usize;
             let gray = if s > 1 {
