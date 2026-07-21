@@ -38,13 +38,21 @@ fn cam_add(idx: u32, v: f32) {
     }
 }
 
+// Uniform-slot camera accumulation: every surfel thread adds into the SAME
+// 13 global slots, so the host swaps this body for a subgroup pre-reduction
+// when the device has subgroups (see Rasterizer::new) — one CAS per subgroup
+// instead of one per thread on a single hot address.
+fn red_cam_add(idx: u32, v: f32) {
+    cam_add(idx, v);
+}
+
 // dL/dR_cam accumulation for a = R_camᵀ y chains: dR_{j,k} += y_j · da_k.
 // grad_cam layout: [R00 R10 R20 R01 R11 R21 R02 R12 R22, dC.xyz, dfocal, pad].
 fn cam_rot_chain(y: vec3<f32>, da: vec3<f32>) {
     for (var k = 0u; k < 3u; k++) {
-        cam_add(k * 3u + 0u, y.x * da[k]);
-        cam_add(k * 3u + 1u, y.y * da[k]);
-        cam_add(k * 3u + 2u, y.z * da[k]);
+        red_cam_add(k * 3u + 0u, y.x * da[k]);
+        red_cam_add(k * 3u + 1u, y.y * da[k]);
+        red_cam_add(k * 3u + 2u, y.z * da[k]);
     }
 }
 
@@ -270,7 +278,7 @@ fn surfel_prep_bwd(@builtin(global_invocation_id) gid: vec3<u32>) {
     grad_scales[i] = vec2<f32>(dscale_u, dscale_v);
     grad_quat[i] = dq;
     grad_opacity[i] = dopacity;
-    cam_add(9u, dcenter.x);
-    cam_add(10u, dcenter.y);
-    cam_add(11u, dcenter.z);
+    red_cam_add(9u, dcenter.x);
+    red_cam_add(10u, dcenter.y);
+    red_cam_add(11u, dcenter.z);
 }

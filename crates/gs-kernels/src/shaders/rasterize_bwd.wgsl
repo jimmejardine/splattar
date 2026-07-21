@@ -77,10 +77,26 @@ fn cam_add(idx: u32, v: f32) {
     }
 }
 
+// Uniform-slot camera accumulation — same host-swapped subgroup reduction as
+// red_add (every thread targets the same grad_cam slot).
+fn red_cam_add(idx: u32, v: f32) {
+    cam_add(idx, v);
+}
+
+// Workgroup-uniform slot accumulation: every invocation that reaches a call
+// targets the SAME slot (the chunk-entry index j and component are uniform
+// across the tile), so the host swaps this body for a subgroup pre-reduction
+// (subgroupAdd + one CAS per subgroup) when the device has subgroups — see
+// Rasterizer::new. Each divergent active group sums its own lanes and elects
+// one leader, so totals stay correct in non-uniform control flow.
+fn red_add(slot: u32, v: f32) {
+    shared_add(slot, v);
+}
+
 fn add_vec3(entry: u32, base: u32, v: vec3<f32>) {
-    shared_add(entry * GS + base, v.x);
-    shared_add(entry * GS + base + 1u, v.y);
-    shared_add(entry * GS + base + 2u, v.z);
+    red_add(entry * GS + base, v.x);
+    red_add(entry * GS + base + 1u, v.y);
+    red_add(entry * GS + base + 2u, v.z);
 }
 
 fn entry_normal(sc: SurfelCam) -> vec3<f32> {
@@ -220,7 +236,7 @@ fn rasterize_bwd(
             if raw_alpha > ALPHA_CLAMP {
                 continue;
             }
-            shared_add(j * GS + 12u, dl_dalpha * hit.ghat); // dopacity
+            red_add(j * GS + 12u, dl_dalpha * hit.ghat); // dopacity
             let dl_dghat = dl_dalpha * sc.color_op.w;
 
             if hit.ray_branch {
@@ -292,5 +308,5 @@ fn rasterize_bwd(
         workgroupBarrier();
     }
 
-    cam_add(12u, dfocal);
+    red_cam_add(12u, dfocal);
 }

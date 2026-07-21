@@ -132,7 +132,37 @@ impl Rasterizer {
         let out_ncontrib = buffers::storage_empty(device, "raster-out-ncontrib", px * 4);
 
         let common = include_str!("shaders/raster_common.wgsl");
+        // Subgroup specialization: the backward kernels accumulate into
+        // workgroup-uniform slots (per-splat gradient slots, the 13 grad_cam
+        // slots), so with device subgroups each add is pre-reduced warp-wide
+        // and only one lane CASes — the swap happens on the marked `red_add`
+        // / `red_cam_add` bodies. Both variants must pass the gs-cpu-ref
+        // gradient checks; SPLATTAR_NO_SUBGROUPS=1 forces the scalar path.
+        let subgroups = ctx.device.features().contains(wgpu::Features::SUBGROUP);
         let make = |label: &str, body: &str, entry: &str| {
+            // include_str! content depends on checkout line endings —
+            // normalize before marker substitution.
+            // Naga (wgpu 30) accepts subgroup built-ins without an `enable
+            // subgroups;` directive (it rejects the directive itself).
+            let mut body = body.replace("\r\n", "\n");
+            if subgroups {
+                // subgroupExclusiveAdd(1u) == 0 elects the first active lane
+                // (naga 30 has no subgroupElect).
+                body = body
+                    .replace(
+                        "fn red_add(slot: u32, v: f32) {\n    shared_add(slot, v);\n}",
+                        "fn red_add(slot: u32, v: f32) {\n    let s = subgroupAdd(v);\n    if subgroupExclusiveAdd(1u) == 0u {\n        shared_add(slot, s);\n    }\n}",
+                    )
+                    .replace(
+                        "fn red_cam_add(idx: u32, v: f32) {\n    cam_add(idx, v);\n}",
+                        "fn red_cam_add(idx: u32, v: f32) {\n    let s = subgroupAdd(v);\n    if subgroupExclusiveAdd(1u) == 0u {\n        cam_add(idx, s);\n    }\n}",
+                    );
+                assert!(
+                    !(body.contains("red_add(") || body.contains("red_cam_add("))
+                        || body.contains("subgroupAdd"),
+                    "reduction marker drifted — subgroup swap silently failed for {label}"
+                );
+            }
             let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some(label),
                 source: wgpu::ShaderSource::Wgsl(format!("{common}\n{body}").into()),

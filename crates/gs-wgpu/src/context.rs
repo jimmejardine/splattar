@@ -60,10 +60,20 @@ impl GpuContext {
 
         // Optional features: request whatever the adapter offers. Timestamps
         // feed the per-kernel training/bench timers (GpuTimer no-ops without
-        // them); code paths must handle either feature being absent.
+        // them); subgroups let the backward rasterizer pre-reduce gradient
+        // adds warp-wide before hitting the shared-memory CAS loop (kernels
+        // select their variant from device.features()). Code paths must
+        // handle either feature being absent. SPLATTAR_NO_SUBGROUPS=1 forces
+        // the scalar-CAS fallback — the emergency disable, and how the
+        // fallback path is exercised in gradient checks on subgroup-capable
+        // hardware.
         let mut required_features = wgpu::Features::empty();
         if adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY) {
             required_features |= wgpu::Features::TIMESTAMP_QUERY;
+        }
+        let no_subgroups = std::env::var_os("SPLATTAR_NO_SUBGROUPS").is_some_and(|v| v != "0");
+        if adapter.features().contains(wgpu::Features::SUBGROUP) && !no_subgroups {
+            required_features |= wgpu::Features::SUBGROUP;
         }
 
         let (device, queue) = adapter
