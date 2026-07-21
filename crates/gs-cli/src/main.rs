@@ -138,8 +138,16 @@ enum Command {
         #[arg(long, default_value_t = 1000)]
         sh_promote: u32,
     },
-    /// Export the project as baked .ply/.spz (+ scene manifest). Arrives in M7.
-    Export { project: PathBuf },
+    /// Bake the composed project to a single compat .ply + scene-manifest
+    /// JSON sidecar (lossy snapshot — never re-ingested; `add` grows the
+    /// project, then re-export).
+    Export {
+        project: PathBuf,
+        /// Output .ply path (default: <project>/export.ply; manifest sits
+        /// next to it as <stem>.manifest.json).
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -160,7 +168,7 @@ fn main() -> anyhow::Result<()> {
             let cloud = if file.is_dir() {
                 // Project directory: compose submaps (registered ones in the
                 // shared world, islands offset side by side).
-                compose_project(&file)?
+                compose_project(&file)?.0
             } else {
                 let contents = gs_io::load_ply(&file)
                     .with_context(|| format!("loading {}", file.display()))?;
@@ -249,11 +257,7 @@ fn main() -> anyhow::Result<()> {
                 sh_promote,
             },
         ),
-        Command::Export { .. } => bail!(
-            "`export` (baked merged .ply + manifest) is not implemented yet; \
-             `view <project-dir>` composes submaps live, and each submap has \
-             its own splat.ply"
-        ),
+        Command::Export { project, out } => run_export(&project, out),
     }
 }
 
@@ -562,11 +566,12 @@ fn train_and_bake(
     let config = TrainConfig {
         iters,
         log_every: 500,
-        // Geometry losses stay off until the geo-perf task lands: they
-        // currently cost >10x per iteration at real resolutions.
-        geo_start: iters + 1,
-        lambda_dist: 0.0,
-        lambda_normal: 0.0,
+        // Geo losses measured at ~zero marginal cost (examples/geo_bench);
+        // the earlier room-run collapse tracks scene evolution, not these
+        // kernels — watch it/s in logs, not this config.
+        geo_start: 1500,
+        lambda_dist: 0.01,
+        lambda_normal: 0.05,
         reg_opacity: 0.01,
         reg_scale: 0.005,
         sh_promote_every: 1000,
@@ -850,16 +855,86 @@ fn dedup_landmarks(
     (out_p, out_d)
 }
 
-/// Compose a project's submaps into one SplatCloud for viewing: registered
-/// submaps go through their Sim(3) into the shared world; islands are placed
-/// side by side along +x (presentation-only offset, never stored — per the
-/// two-tier data-model rule).
-fn compose_project(root: &std::path::Path) -> anyhow::Result<gs_core::SplatCloud> {
+/// Bake the composed project into one compat .ply + a manifest sidecar.
+fn run_export(project_root: &std::path::Path, out: Option<PathBuf>) -> anyhow::Result<()> {
+    let (cloud, placements) = compose_project(project_root)?;
+    let n = cloud.positions.len();
+    let coeffs = if n > 0 { cloud.sh.len() / (n * 3) } else { 0 };
+
+    // Flatten to the writer's layout (vec4 positions, 2 activated scales,
+    // xyzw quats, 48-coeff-major SH padded/truncated to degree 3).
+    let mut positions = Vec::with_capacity(n * 4);
+    let mut scales = Vec::with_capacity(n * 2);
+    let mut quats = Vec::with_capacity(n * 4);
+    let mut sh = vec![0f32; n * 48];
+    for i in 0..n {
+        let p = cloud.positions[i];
+        positions.extend_from_slice(&[p.x, p.y, p.z, 1.0]);
+        let s = cloud.scales[i];
+        scales.extend_from_slice(&[s.x, s.y]);
+        let q = cloud.rotations[i];
+        quats.extend_from_slice(&[q.x, q.y, q.z, q.w]);
+        let per = coeffs.min(16) * 3;
+        sh[i * 48..i * 48 + per]
+            .copy_from_slice(&cloud.sh[i * coeffs * 3..i * coeffs * 3 + per]);
+    }
+
+    let out = out.unwrap_or_else(|| project_root.join("export.ply"));
+    gs_io::write_3dgs_ply(&out, n, &positions, &scales, &quats, &cloud.opacity, &sh)?;
+
+    // Scene-manifest sidecar (hand-rolled JSON — no serde in the workspace).
+    let mut manifest = String::from("{\n  \"submaps\": [\n");
+    for (k, pl) in placements.iter().enumerate() {
+        manifest.push_str(&format!(
+            "    {{\"video\": {:?}, \"registered\": {}, \"surfel_start\": {}, \
+             \"surfel_count\": {}, \"island_offset_x\": {:.4}, \
+             \"bbox_min\": [{:.4}, {:.4}, {:.4}], \"bbox_max\": [{:.4}, {:.4}, {:.4}]}}{}\n",
+            pl.video,
+            pl.registered,
+            pl.surfels.start,
+            pl.surfels.len(),
+            pl.island_offset_x,
+            pl.bbox.0[0], pl.bbox.0[1], pl.bbox.0[2],
+            pl.bbox.1[0], pl.bbox.1[1], pl.bbox.1[2],
+            if k + 1 < placements.len() { "," } else { "" }
+        ));
+    }
+    manifest.push_str("  ],\n  \"note\": \"baked snapshot — never re-ingest; grow the project with `gs-cli add` and re-export\"\n}\n");
+    let manifest_path = out.with_extension("manifest.json");
+    std::fs::write(&manifest_path, manifest)?;
+    println!(
+        "exported {n} surfels from {} submaps: {} (+ {})",
+        placements.len(),
+        out.display(),
+        manifest_path.display()
+    );
+    Ok(())
+}
+
+/// Per-submap placement info produced during composition (for the manifest).
+struct SubmapPlacement {
+    video: String,
+    registered: bool,
+    surfels: std::ops::Range<usize>,
+    /// Presentation x-offset applied to islands (0 for registered submaps).
+    island_offset_x: f32,
+    /// World-space AABB after placement.
+    bbox: ([f32; 3], [f32; 3]),
+}
+
+/// Compose a project's submaps into one SplatCloud: registered submaps go
+/// through their Sim(3) into the shared world; islands are placed side by
+/// side along +x (presentation-only offset, never stored — per the two-tier
+/// data-model rule).
+fn compose_project(
+    root: &std::path::Path,
+) -> anyhow::Result<(gs_core::SplatCloud, Vec<SubmapPlacement>)> {
     use glam::{DQuat, DVec3, Quat, Vec3};
 
     let proj = project::Project::load(root)?;
     let mut merged: Option<gs_core::SplatCloud> = None;
     let mut island_cursor: Option<f32> = None; // starts at world max x + gap
+    let mut placements: Vec<SubmapPlacement> = Vec::new();
 
     for (i, meta) in proj.submaps.iter().enumerate() {
         let ply = project::Project::submap_dir(root, i).join("splat.ply");
@@ -870,6 +945,7 @@ fn compose_project(root: &std::path::Path) -> anyhow::Result<gs_core::SplatCloud
         };
 
         // Transform into the world (or island placement).
+        let mut island_offset_x = 0.0f32;
         match &meta.world_from_submap {
             Some(w) => {
                 let s = w.scale as f32;
@@ -920,9 +996,26 @@ fn compose_project(root: &std::path::Path) -> anyhow::Result<gs_core::SplatCloud
                     p.x += dx;
                 }
                 island_cursor = Some(world_max + gap + (max_x - min_x));
+                island_offset_x = dx;
                 log::info!("submap-{i} is an unregistered island — placed at +x offset {dx:.1}");
             }
         }
+
+        let start = merged.as_ref().map_or(0, |m| m.positions.len());
+        let mut bbox = ([f32::MAX; 3], [f32::MIN; 3]);
+        for p in &cloud.positions {
+            for a in 0..3 {
+                bbox.0[a] = bbox.0[a].min(p[a]);
+                bbox.1[a] = bbox.1[a].max(p[a]);
+            }
+        }
+        placements.push(SubmapPlacement {
+            video: meta.video.clone(),
+            registered: meta.world_from_submap.is_some(),
+            surfels: start..start + cloud.positions.len(),
+            island_offset_x,
+            bbox,
+        });
 
         merged = Some(match merged {
             None => cloud,
@@ -940,7 +1033,7 @@ fn compose_project(root: &std::path::Path) -> anyhow::Result<gs_core::SplatCloud
             }
         });
     }
-    merged.context("empty project")
+    Ok((merged.context("empty project")?, placements))
 }
 
 /// Integer box downsample for RGBA f32 images.
