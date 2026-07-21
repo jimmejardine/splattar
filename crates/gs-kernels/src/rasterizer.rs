@@ -4,9 +4,11 @@
 //! once at the MCMC budget (no mid-training reallocation — see CLAUDE.md).
 
 use glam::{Mat3, Quat, Vec3};
-use gs_wgpu::{GpuContext, buffers};
+use gs_wgpu::{GpuContext, GpuTimer, buffers};
 
 use crate::binning::TileBinner;
+
+pub(crate) use gs_wgpu::profile::scope as ts;
 
 pub const TILE: u32 = 16;
 /// GPU SH storage is always padded to degree 3 (48 floats per surfel).
@@ -286,6 +288,16 @@ impl Rasterizer {
     /// Record the backward pass. Caller has uploaded dL/d(color) into
     /// [`dl_dcolor`] and already recorded a matching [`forward`] this frame.
     pub fn backward(&self, encoder: &mut wgpu::CommandEncoder, num_surfels: u32) {
+        self.backward_timed(encoder, num_surfels, None);
+    }
+
+    /// [`backward`] with each pass wrapped in a GpuTimer scope.
+    pub fn backward_timed(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        num_surfels: u32,
+        mut timer: Option<&mut GpuTimer>,
+    ) {
         encoder.clear_buffer(&self.grad_geom, 0, None);
         encoder.clear_buffer(&self.grad_cam, 0, None);
         encoder.clear_buffer(&self.grad_pos, 0, None);
@@ -296,7 +308,7 @@ impl Rasterizer {
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("rasterize-bwd"),
-                timestamp_writes: None,
+                timestamp_writes: ts(&mut timer, "rasterize-bwd"),
             });
             pass.set_pipeline(&self.bwd_pipeline);
             pass.set_bind_group(0, &self.bwd_bg, &[]);
@@ -305,7 +317,7 @@ impl Rasterizer {
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("surfel-prep-bwd"),
-                timestamp_writes: None,
+                timestamp_writes: ts(&mut timer, "surfel-prep-bwd"),
             });
             pass.set_pipeline(&self.geom_bwd_pipeline);
             pass.set_bind_group(0, &self.geom_bwd_bg, &[]);
@@ -351,6 +363,19 @@ impl Rasterizer {
         camera: &RasterCamera,
         num_surfels: u32,
     ) {
+        self.forward_timed(ctx, encoder, camera, num_surfels, None);
+    }
+
+    /// [`forward`] with each pass (including binning + both sorts) wrapped in
+    /// a GpuTimer scope.
+    pub fn forward_timed(
+        &self,
+        ctx: &GpuContext,
+        encoder: &mut wgpu::CommandEncoder,
+        camera: &RasterCamera,
+        num_surfels: u32,
+        mut timer: Option<&mut GpuTimer>,
+    ) {
         assert!(num_surfels <= self.capacity);
         let r = Mat3::from_quat(camera.quat.normalize());
         let uniform = CameraUniform {
@@ -373,17 +398,18 @@ impl Rasterizer {
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("surfel-prep"),
-                timestamp_writes: None,
+                timestamp_writes: ts(&mut timer, "surfel-prep"),
             });
             pass.set_pipeline(&self.prep_pipeline);
             pass.set_bind_group(0, &self.prep_bg, &[]);
             pass.dispatch_workgroups(num_surfels.div_ceil(256), 1, 1);
         }
-        self.binner.encode(ctx, encoder, num_surfels, self.tiles_x);
+        self.binner
+            .encode_timed(ctx, encoder, num_surfels, self.tiles_x, timer.as_deref_mut());
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("rasterize-fwd"),
-                timestamp_writes: None,
+                timestamp_writes: ts(&mut timer, "rasterize-fwd"),
             });
             pass.set_pipeline(&self.fwd_pipeline);
             pass.set_bind_group(0, &self.fwd_bg, &[]);

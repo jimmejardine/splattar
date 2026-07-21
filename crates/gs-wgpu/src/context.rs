@@ -58,10 +58,11 @@ impl GpuContext {
             ..wgpu::Limits::default()
         };
 
+        // Optional features: request whatever the adapter offers. Timestamps
+        // feed the per-kernel training/bench timers (GpuTimer no-ops without
+        // them); code paths must handle either feature being absent.
         let mut required_features = wgpu::Features::empty();
-        if cfg!(feature = "profile")
-            && adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY)
-        {
+        if adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY) {
             required_features |= wgpu::Features::TIMESTAMP_QUERY;
         }
 

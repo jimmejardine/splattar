@@ -230,7 +230,6 @@ impl RadixSorter {
     }
 
     /// Like [`encode`], with the two passes wrapped in GpuTimer scopes.
-    #[cfg(feature = "profile")]
     pub fn encode_profiled(
         &self,
         encoder: &mut wgpu::CommandEncoder,
@@ -246,7 +245,6 @@ impl RadixSorter {
     /// Diagnostic encoding: every stage of every digit pass in its own
     /// timestamped compute pass. Slower than `encode` (pass overhead) — for
     /// attributing cost only, never for production timing.
-    #[cfg(feature = "profile")]
     pub fn encode_stage_profiled(
         &self,
         encoder: &mut wgpu::CommandEncoder,

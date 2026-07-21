@@ -229,6 +229,15 @@ impl SsimLoss {
     /// Record the full loss pipeline: assumes the forward image is current and
     /// the target uploaded. Writes dL/d(color) into the rasterizer's buffer.
     pub fn encode(&self, encoder: &mut wgpu::CommandEncoder) {
+        self.encode_timed(encoder, None);
+    }
+
+    /// [`encode`] wrapped in a GpuTimer scope.
+    pub fn encode_timed(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        mut timer: Option<&mut gs_wgpu::GpuTimer>,
+    ) {
         let npix = self.width * self.height;
         let groups_1d = npix.div_ceil(256);
         let gx = self.width.div_ceil(16);
@@ -236,7 +245,7 @@ impl SsimLoss {
 
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("ssim-loss"),
-            timestamp_writes: None,
+            timestamp_writes: gs_wgpu::profile::scope(&mut timer, "ssim-loss"),
         });
         pass.set_pipeline(&self.products_pipeline);
         pass.set_bind_group(0, &self.products_bg, &[]);

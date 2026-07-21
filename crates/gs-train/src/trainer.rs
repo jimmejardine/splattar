@@ -145,6 +145,39 @@ pub struct Trainer {
     /// Per-view appearance [gain rgb, bias rgb], EMA-updated from LS fits.
     appear: Vec<[f32; 6]>,
     target_scratch: Vec<[f32; 4]>,
+    /// Per-kernel GPU timing, sampled on log iterations (None when the
+    /// adapter lacks TIMESTAMP_QUERY).
+    timer: Option<gs_wgpu::GpuTimer>,
+    /// Host wall-clock per step phase, accumulated between log lines. The
+    /// host timers are what reveal CPU↔GPU stalls — GPU timestamps can't.
+    phases: PhaseTimes,
+}
+
+/// Millisecond accumulators for the phases of [`Trainer::step`].
+#[derive(Default)]
+struct PhaseTimes {
+    target: f64,
+    fwd: f64,
+    appear: f64,
+    bwd: f64,
+    pose: f64,
+    mcmc: f64,
+    n: u32,
+}
+
+impl PhaseTimes {
+    fn log_line(&self) -> String {
+        let n = self.n.max(1) as f64;
+        format!(
+            "host ms/iter: target {:.2} | fwd-submit {:.2} | appear {:.2} | bwd-submit {:.2} | pose {:.2} | mcmc {:.2}",
+            self.target / n,
+            self.fwd / n,
+            self.appear / n,
+            self.bwd / n,
+            self.pose / n,
+            self.mcmc / n,
+        )
+    }
 }
 
 #[repr(C)]
@@ -312,6 +345,12 @@ impl Trainer {
             pose_depth: vec![0.0; n_views],
             appear: vec![[1.0, 1.0, 1.0, 0.0, 0.0, 0.0]; n_views],
             target_scratch: Vec::new(),
+            timer: ctx
+                .device
+                .features()
+                .contains(wgpu::Features::TIMESTAMP_QUERY)
+                .then(|| gs_wgpu::GpuTimer::new(ctx, 64)),
+            phases: PhaseTimes::default(),
         }
     }
 
@@ -351,6 +390,11 @@ impl Trainer {
 
     /// One training iteration on a random view. Returns the view used.
     pub fn step(&mut self, ctx: &GpuContext, iter: u32) -> usize {
+        // GPU per-kernel timing is sampled on log iterations only (scopes
+        // accumulate until read, and the read blocks).
+        let profile = self.config.log_every > 0 && iter.is_multiple_of(self.config.log_every);
+        let mut timer = if profile { self.timer.take() } else { None };
+        let t0 = std::time::Instant::now();
         // Exponential position LR decay.
         let t = iter as f32 / self.config.iters.max(1) as f32;
         let lr = self.config.lr_pos * self.extent * self.config.pos_lr_final_factor.powf(t);
@@ -407,15 +451,22 @@ impl Trainer {
             camera.focal,
         );
 
+        let t_target = std::time::Instant::now();
+
         // Split into two submissions so a heavy early-training iteration stays
         // under the Windows GPU watchdog (TDR ~2 s per submission).
         let mut encoder = ctx
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-        self.raster.forward(ctx, &mut encoder, &camera, self.num_surfels);
-        self.loss.encode(&mut encoder);
-        self.normal_loss.encode(&mut encoder);
+        self.raster
+            .forward_timed(ctx, &mut encoder, &camera, self.num_surfels, timer.as_mut());
+        self.loss.encode_timed(&mut encoder, timer.as_mut());
+        self.normal_loss.encode_timed(&mut encoder, timer.as_mut());
+        if let Some(t) = timer.as_ref() {
+            t.resolve(&mut encoder);
+        }
         ctx.queue.submit([encoder.finish()]);
+        let t_fwd = std::time::Instant::now();
 
         // Appearance: refresh this view's affine from the fresh render vs the
         // ORIGINAL target (one-step lag: the loss above used the previous
@@ -457,11 +508,14 @@ impl Trainer {
             }
         }
 
+        let t_appear = std::time::Instant::now();
+
         let mut encoder = ctx
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-        self.raster.backward(&mut encoder, self.num_surfels);
-        self.optim.encode_step(ctx, &mut encoder);
+        self.raster
+            .backward_timed(&mut encoder, self.num_surfels, timer.as_mut());
+        self.optim.encode_step_timed(ctx, &mut encoder, timer.as_mut());
 
         // MCMC exploration noise on raw positions, scaled by the position LR.
         if self.config.mcmc_noise > 0.0 && geo_on {
@@ -481,7 +535,11 @@ impl Trainer {
             pass.set_bind_group(0, &self.noise_bg, &[]);
             pass.dispatch_workgroups(self.num_surfels.div_ceil(256), 1, 1);
         }
+        if let Some(t) = timer.as_ref() {
+            t.resolve(&mut encoder);
+        }
         ctx.queue.submit([encoder.finish()]);
+        let t_bwd = std::time::Instant::now();
 
         // Pose refinement: chain the (parity-verified) camera gradients on
         // the host and Adam-step this view's rotation/center + shared focal.
@@ -494,6 +552,7 @@ impl Trainer {
             let decay = self.config.pos_lr_final_factor.powf(t);
             self.refine_pose(ctx, view_idx, &camera, decay);
         }
+        let t_pose = std::time::Instant::now();
 
         // Periodic dead-surfel relocation.
         if self.config.mcmc_every > 0
@@ -502,6 +561,18 @@ impl Trainer {
             && iter + 500 < self.config.iters
         {
             self.mcmc_relocate(ctx);
+        }
+
+        let ms = |a: std::time::Instant, b: std::time::Instant| (b - a).as_secs_f64() * 1e3;
+        self.phases.target += ms(t0, t_target);
+        self.phases.fwd += ms(t_target, t_fwd);
+        self.phases.appear += ms(t_fwd, t_appear);
+        self.phases.bwd += ms(t_appear, t_bwd);
+        self.phases.pose += ms(t_bwd, t_pose);
+        self.phases.mcmc += ms(t_pose, std::time::Instant::now());
+        self.phases.n += 1;
+        if timer.is_some() {
+            self.timer = timer;
         }
         view_idx
     }
@@ -750,6 +821,26 @@ impl Trainer {
                     "iter {iter:>6}: L1 {l1:.5}  D-SSIM {dssim:.5}  ({:.1} it/s)",
                     (iter as f64 + 1.0) / start.elapsed().as_secs_f64()
                 );
+                log::info!("  {}", self.phases.log_line());
+                self.phases = PhaseTimes::default();
+                if let Some(timer) = self.timer.as_mut() {
+                    // Sampled on this iteration only; merge duplicate labels
+                    // (the two radix sorts share theirs).
+                    let mut merged: Vec<(String, f64)> = Vec::new();
+                    for (label, dt) in timer.read(ctx) {
+                        match merged.iter_mut().find(|(l, _)| *l == label) {
+                            Some((_, acc)) => *acc += dt,
+                            None => merged.push((label, dt)),
+                        }
+                    }
+                    if !merged.is_empty() {
+                        let line: Vec<String> = merged
+                            .iter()
+                            .map(|(l, ms)| format!("{l} {ms:.2}"))
+                            .collect();
+                        log::info!("  gpu ms (sampled): {}", line.join(" | "));
+                    }
+                }
             }
         }
     }

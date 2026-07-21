@@ -163,6 +163,20 @@ impl TileBinner {
         num_items: u32,
         tiles_x: u32,
     ) {
+        self.encode_timed(ctx, encoder, num_items, tiles_x, None);
+    }
+
+    /// [`encode`] with each pass (including both radix sorts) wrapped in a
+    /// GpuTimer scope.
+    pub fn encode_timed(
+        &self,
+        ctx: &GpuContext,
+        encoder: &mut wgpu::CommandEncoder,
+        num_items: u32,
+        tiles_x: u32,
+        mut timer: Option<&mut gs_wgpu::GpuTimer>,
+    ) {
+        use crate::rasterizer::ts;
         assert!(num_items <= self.max_items);
         assert!(tiles_x > 0 && self.num_tiles.is_multiple_of(tiles_x));
         ctx.queue
@@ -174,7 +188,7 @@ impl TileBinner {
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("binning-count"),
-                timestamp_writes: None,
+                timestamp_writes: ts(&mut timer, "binning-count"),
             });
             pass.set_pipeline(&self.count_pipeline);
             pass.set_bind_group(0, &self.count_bg, &[]);
@@ -186,28 +200,36 @@ impl TileBinner {
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("binning-expand"),
-                timestamp_writes: None,
+                timestamp_writes: ts(&mut timer, "binning-expand"),
             });
             pass.set_pipeline(&self.expand_pipeline);
             pass.set_bind_group(0, &self.expand_bg, &[]);
             pass.dispatch_workgroups(item_groups, 1, 1);
         }
-        self.sorter.encode(encoder); // stable sort by depth key
+        // Stable sort by depth key.
+        match timer.as_deref_mut() {
+            Some(t) => self.sorter.encode_profiled(encoder, t),
+            None => self.sorter.encode(encoder),
+        }
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("binning-gather"),
-                timestamp_writes: None,
+                timestamp_writes: ts(&mut timer, "binning-gather"),
             });
             pass.set_pipeline(&self.gather_pipeline);
             pass.set_bind_group(0, &self.gather_bg, &[]);
             pass.dispatch_workgroups(entry_groups, 1, 1);
         }
-        self.sorter.encode(encoder); // stable sort by tile id — groups tiles
+        // Stable sort by tile id — groups tiles.
+        match timer.as_deref_mut() {
+            Some(t) => self.sorter.encode_profiled(encoder, t),
+            None => self.sorter.encode(encoder),
+        }
         encoder.clear_buffer(&self.ranges, 0, None);
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("binning-ranges"),
-                timestamp_writes: None,
+                timestamp_writes: ts(&mut timer, "binning-ranges"),
             });
             pass.set_pipeline(&self.ranges_pipeline);
             pass.set_bind_group(0, &self.ranges_bg, &[]);

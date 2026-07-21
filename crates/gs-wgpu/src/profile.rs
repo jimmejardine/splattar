@@ -4,6 +4,15 @@
 
 use crate::GpuContext;
 
+/// Reborrow an optional timer into a compute-pass timestamp descriptor —
+/// `timestamp_writes: scope(&mut timer, "label")` in pass descriptors.
+pub fn scope<'a>(
+    timer: &'a mut Option<&mut GpuTimer>,
+    label: &str,
+) -> Option<wgpu::ComputePassTimestampWrites<'a>> {
+    timer.as_mut().and_then(|t| t.compute_scope(label))
+}
+
 pub struct GpuTimer {
     query_set: Option<wgpu::QuerySet>,
     resolve: wgpu::Buffer,

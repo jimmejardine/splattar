@@ -185,11 +185,21 @@ impl Optimizer {
 
     /// One Adam step for every class, then refresh activated buffers.
     pub fn encode_step(&mut self, ctx: &GpuContext, encoder: &mut wgpu::CommandEncoder) {
+        self.encode_step_timed(ctx, encoder, None);
+    }
+
+    /// [`encode_step`] wrapped in a GpuTimer scope.
+    pub fn encode_step_timed(
+        &mut self,
+        ctx: &GpuContext,
+        encoder: &mut wgpu::CommandEncoder,
+        mut timer: Option<&mut gs_wgpu::GpuTimer>,
+    ) {
         self.t += 1;
         self.write_uniforms(ctx, self.t);
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("adam"),
-            timestamp_writes: None,
+            timestamp_writes: gs_wgpu::profile::scope(&mut timer, "adam"),
         });
         pass.set_pipeline(&self.step_pipeline);
         for c in &self.classes {
