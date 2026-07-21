@@ -257,3 +257,26 @@ case: registration needs viewpoint-robust (AKAZE-class) descriptors, used
 with the covisibility-voted matcher over whole segments (real overlap
 exists at NON-boundary times — the walkthrough revisits rooms). The 2D
 solver and instrumentation carry over unchanged once descriptors improve.
+
+### M8: descriptor upgrade landed — retrieval better, consensus still open (2026-07-21)
+
+Shipped the viewpoint-robust descriptor ("AKAZE-class"): steered BRIEF with
+intensity-centroid orientation at 3 pyramid levels per observation, matched
+on minimum Hamming over level offsets (≈4× scale search). Unit gates:
+survives 25° in-plane rotation (9+/12) and 1.7× scale (8+/12); persistence
+v5 stores full per-landmark observation lists + per-submap pose tables, and
+a new offline `gs-cli register` lab re-attempts registration with tunable
+gates in seconds (no VO re-run).
+
+Cross-video measurement (1.mp4 ↔ 2.mp4): raw matches 348 → 443 (+27%), and
+the covisibility vote table is now semantically coherent — video 2's opening
+keyframes (0–144) consistently match video 1's closing stretch (416–512),
+i.e. the walkthroughs were localized by appearance alone. What still fails
+is geometric consensus: per-keyframe correspondence precision remains too
+low for Umeyama or DLT-PnP (best 2D groups of 12–17 obs never yield ≥6
+consistent reprojections). Conclusion: landmark-DB retrieval is the wrong
+final stage. Next architecture step: persist small keyframe thumbnails and
+run pairwise image matching + epipolar verification on the candidate
+covisible pairs the vote table already identifies. Whip-pan segment cuts
+(1.mp4 internal) remain information-limited at the boundary regardless of
+descriptors — cross-segment merging rides the same revisit-based path.

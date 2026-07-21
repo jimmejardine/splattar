@@ -16,13 +16,19 @@ use anyhow::{Context, bail};
 
 pub const LANDMARK_MAGIC_V1: &[u8; 8] = b"SPLLM01\n";
 pub const LANDMARK_MAGIC_V2: &[u8; 8] = b"SPLLM02\n";
-pub const LANDMARK_MAGIC: &[u8; 8] = b"SPLLM03\n";
+pub const LANDMARK_MAGIC_V3: &[u8; 8] = b"SPLLM03\n";
+pub const LANDMARK_MAGIC_V4: &[u8; 8] = b"SPLLM04\n";
+pub const LANDMARK_MAGIC: &[u8; 8] = b"SPLLM05\n";
 pub const DESC_BYTES: usize = 32;
+/// Pyramid levels per multi-scale descriptor (mirrors gs_pose::descriptor).
+pub const DESC_LEVELS: usize = 3;
 
 pub struct Landmark {
     pub pos: [f32; 3],
     pub color: [u8; 3],
-    pub desc: [u8; DESC_BYTES],
+    /// Oriented multi-scale descriptor (one steered BRIEF per pyramid
+    /// level). Pre-v4 files carry a single level, replicated on load.
+    pub desc: [[u8; DESC_BYTES]; DESC_LEVELS],
     /// Reference keyframe index (VO-global within the source video); enables
     /// temporal-bridge and covisibility-grouped registration. `u32::MAX` for
     /// landmarks loaded from v1 files.
@@ -30,6 +36,9 @@ pub struct Landmark {
     /// Pixel position of the reference observation in keyframe `kf` (2D
     /// anchor for PnP-style bridging). NaN when loaded from pre-v3 files.
     pub obs: [f32; 2],
+    /// ALL keyframe observations (kf index, pixel) — single-camera PnP
+    /// registration needs co-observed sets. Ref-obs only on pre-v5 files.
+    pub obs_all: Vec<(u32, [f32; 2])>,
 }
 
 /// Sim(3) mapping submap coordinates into project-world coordinates.
@@ -185,10 +194,19 @@ pub fn write_landmarks(path: &Path, landmarks: &[Landmark]) -> anyhow::Result<()
             f.write_all(&c.to_le_bytes())?;
         }
         f.write_all(&l.color)?;
-        f.write_all(&l.desc)?;
+        for lvl in &l.desc {
+            f.write_all(lvl)?;
+        }
         f.write_all(&l.kf.to_le_bytes())?;
         f.write_all(&l.obs[0].to_le_bytes())?;
         f.write_all(&l.obs[1].to_le_bytes())?;
+        let n_obs = l.obs_all.len().min(u16::MAX as usize) as u16;
+        f.write_all(&n_obs.to_le_bytes())?;
+        for (kf, p) in l.obs_all.iter().take(n_obs as usize) {
+            f.write_all(&kf.to_le_bytes())?;
+            f.write_all(&p[0].to_le_bytes())?;
+            f.write_all(&p[1].to_le_bytes())?;
+        }
     }
     Ok(())
 }
@@ -200,7 +218,9 @@ pub fn read_landmarks(path: &Path) -> anyhow::Result<Vec<Landmark>> {
     let mut magic = [0u8; 8];
     f.read_exact(&mut magic)?;
     let version = match &magic {
-        m if m == LANDMARK_MAGIC => 3,
+        m if m == LANDMARK_MAGIC => 5,
+        m if m == LANDMARK_MAGIC_V4 => 4,
+        m if m == LANDMARK_MAGIC_V3 => 3,
         m if m == LANDMARK_MAGIC_V2 => 2,
         m if m == LANDMARK_MAGIC_V1 => 1,
         _ => bail!("bad landmark file magic in {}", path.display()),
@@ -218,8 +238,18 @@ pub fn read_landmarks(path: &Path) -> anyhow::Result<Vec<Landmark>> {
         }
         let mut color = [0u8; 3];
         f.read_exact(&mut color)?;
-        let mut desc = [0u8; DESC_BYTES];
-        f.read_exact(&mut desc)?;
+        let mut desc = [[0u8; DESC_BYTES]; DESC_LEVELS];
+        if version >= 4 {
+            for lvl in &mut desc {
+                f.read_exact(lvl)?;
+            }
+        } else {
+            // Single-level legacy descriptor: replicate across levels so the
+            // scale-searching distance degrades to plain Hamming.
+            let mut one = [0u8; DESC_BYTES];
+            f.read_exact(&mut one)?;
+            desc = [one; DESC_LEVELS];
+        }
         let kf = if version >= 2 {
             let mut b = [0u8; 4];
             f.read_exact(&mut b)?;
@@ -237,12 +267,35 @@ pub fn read_landmarks(path: &Path) -> anyhow::Result<Vec<Landmark>> {
         } else {
             [f32::NAN; 2]
         };
+        let obs_all = if version >= 5 {
+            let mut n2 = [0u8; 2];
+            f.read_exact(&mut n2)?;
+            let cnt = u16::from_le_bytes(n2) as usize;
+            let mut list = Vec::with_capacity(cnt);
+            for _ in 0..cnt {
+                let mut b = [0u8; 12];
+                f.read_exact(&mut b)?;
+                list.push((
+                    u32::from_le_bytes(b[0..4].try_into().unwrap()),
+                    [
+                        f32::from_le_bytes(b[4..8].try_into().unwrap()),
+                        f32::from_le_bytes(b[8..12].try_into().unwrap()),
+                    ],
+                ));
+            }
+            list
+        } else if kf != u32::MAX && obs[0].is_finite() {
+            vec![(kf, obs)]
+        } else {
+            Vec::new()
+        };
         out.push(Landmark {
             pos,
             color,
             desc,
             kf,
             obs,
+            obs_all,
         });
     }
     Ok(out)
@@ -288,16 +341,20 @@ mod tests {
             .map(|k| Landmark {
                 pos: [k as f32, -(k as f32), 0.5 * k as f32],
                 color: [k as u8, 2 * k as u8, 255 - k as u8],
-                desc: [k as u8; DESC_BYTES],
+                desc: [[k as u8; DESC_BYTES]; DESC_LEVELS],
                 kf: 100 + k as u32,
                 obs: [10.0 * k as f32, 5.0 + k as f32],
+                obs_all: vec![
+                    (100 + k as u32, [10.0 * k as f32, 5.0 + k as f32]),
+                    (101 + k as u32, [11.0 * k as f32, 6.0 + k as f32]),
+                ],
             })
             .collect();
         write_landmarks(&p, &lms).unwrap();
         let back = read_landmarks(&p).unwrap();
         assert_eq!(back.len(), 10);
         assert_eq!(back[3].pos, [3.0, -3.0, 1.5]);
-        assert_eq!(back[7].desc, [7u8; DESC_BYTES]);
+        assert_eq!(back[7].desc, [[7u8; DESC_BYTES]; DESC_LEVELS]);
         assert_eq!(back[7].kf, 107);
     }
 }

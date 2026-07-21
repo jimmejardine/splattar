@@ -142,6 +142,24 @@ enum Command {
         #[arg(long, default_value_t = 1000)]
         sh_promote: u32,
     },
+    /// Offline registration lab: re-attempt Sim(3) registration of one
+    /// persisted submap against the rest of the project, with tunable
+    /// matching parameters and diagnostics. Writes nothing unless --write.
+    Register {
+        project: PathBuf,
+        /// Submap index to (re-)register.
+        #[arg(long)]
+        submap: usize,
+        #[arg(long, default_value_t = 55)]
+        max_dist: u32,
+        #[arg(long, default_value_t = 0.85)]
+        ratio: f32,
+        #[arg(long, default_value_t = 5)]
+        min_votes: usize,
+        /// Persist a successful registration into the submap's meta.
+        #[arg(long)]
+        write: bool,
+    },
     /// Bake the composed project to a single compat .ply + scene-manifest
     /// JSON sidecar (lossy snapshot — never re-ingested; `add` grows the
     /// project, then re-export).
@@ -262,6 +280,14 @@ fn main() -> anyhow::Result<()> {
                 sh_promote,
             },
         ),
+        Command::Register {
+            project,
+            submap,
+            max_dist,
+            ratio,
+            min_votes,
+            write,
+        } => run_register(&project, submap, max_dist, ratio, min_votes, write),
         Command::Export { project, out } => run_export(&project, out),
     }
 }
@@ -550,6 +576,10 @@ fn prepare_training(
             desc: seg.landmark_desc[li],
             kf: kf as u32,
             obs: [px, py],
+            obs_all: seg.landmark_obs_all[li]
+                .iter()
+                .map(|(k, p)| (*k as u32, [p.0, p.1]))
+                .collect(),
         });
     }
     anyhow::ensure!(points.len() >= 150, "too few init points: {}", points.len());
@@ -698,6 +728,43 @@ fn write_trajectory_csv(
     Ok(())
 }
 
+/// Per-submap solved keyframe poses (kf index + center + c2w quat), the
+/// offline registration lab's camera source.
+fn write_seg_poses(path: &std::path::Path, seg: &gs_pose::VoResult) -> anyhow::Result<()> {
+    let mut csv = String::from("kf,cx,cy,cz,qw,qx,qy,qz\n");
+    for (k, kp) in seg.keyframe_poses.iter().enumerate() {
+        let Some(kp) = kp else { continue };
+        let c = kp.pose.center();
+        let q = kp.pose.r.inverse(); // camera-to-world rotation
+        csv.push_str(&format!(
+            "{k},{:.6},{:.6},{:.6},{:.8},{:.8},{:.8},{:.8}\n",
+            c[0], c[1], c[2], q.w, q.i, q.j, q.k
+        ));
+    }
+    std::fs::write(path, csv)?;
+    Ok(())
+}
+
+/// Load a poses.csv back as world→camera transforms per keyframe.
+fn load_seg_poses(
+    path: &std::path::Path,
+) -> anyhow::Result<std::collections::HashMap<u32, (glam::DQuat, glam::DVec3)>> {
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("reading {}", path.display()))?;
+    let mut out = std::collections::HashMap::new();
+    for line in text.lines().skip(1) {
+        let f: Vec<f64> = line.split(',').filter_map(|v| v.parse().ok()).collect();
+        if f.len() != 8 {
+            continue;
+        }
+        let center = glam::DVec3::new(f[1], f[2], f[3]);
+        let q_c2w = glam::DQuat::from_xyzw(f[5], f[6], f[7], f[4]);
+        let r_wc = q_c2w.conjugate();
+        out.insert(f[0] as u32, (r_wc, -(r_wc * center)));
+    }
+    Ok(out)
+}
+
 /// M7 pipeline: video -> VO -> train -> project dir with submap-0 + baked ply.
 #[allow(clippy::too_many_arguments)]
 fn run_pipeline(
@@ -737,6 +804,7 @@ fn run_pipeline(
     )?;
     project::write_landmarks(&dir.join("landmarks.bin"), &prepared.landmarks)?;
     write_trajectory_csv(&dir.join("trajectory.csv"), &vo)?;
+    write_seg_poses(&dir.join("poses.csv"), primary)?;
 
     let ply = dir.join("splat.ply");
     let (psnr, num) = train_and_bake(prepared, iters, budget, pose_window, &ply)?;
@@ -898,6 +966,7 @@ fn add_segment_submap(
     )?;
     project::write_landmarks(&dir.join("landmarks.bin"), &prepared.landmarks)?;
     write_trajectory_csv(&dir.join("trajectory.csv"), vo)?;
+    write_seg_poses(&dir.join("poses.csv"), seg)?;
 
     let ply = dir.join("splat.ply");
     let (psnr, num) = train_and_bake(prepared, iters, budget, 1.0, &ply)?;
@@ -916,7 +985,7 @@ fn add_segment_submap(
 /// reference keyframe + owning submap (usize::MAX for the new side).
 struct DbLandmark {
     pos: glam::DVec3,
-    desc: gs_pose::descriptor::Descriptor,
+    desc: gs_pose::descriptor::MultiDescriptor,
     kf: u32,
     /// Reference observation pixel (NaN when unknown, e.g. pre-v3 files).
     /// Persisted for the world side of future 2D-based registration; the
@@ -926,24 +995,34 @@ struct DbLandmark {
     submap: usize,
 }
 
-/// Voxel dedup (0.5% of median centroid distance), keeping full records.
-fn dedup_db_landmarks(lms: Vec<DbLandmark>) -> Vec<DbLandmark> {
-    if lms.is_empty() {
-        return lms;
+/// Voxel-dedup keep-mask (0.5% of median centroid distance): true for the
+/// first landmark in each voxel. Mask form so parallel arrays stay aligned.
+fn dedup_mask(pts: &[glam::DVec3]) -> Vec<bool> {
+    if pts.is_empty() {
+        return Vec::new();
     }
-    let centroid = lms.iter().map(|l| l.pos).sum::<glam::DVec3>() / lms.len() as f64;
-    let mut d: Vec<f64> = lms.iter().map(|l| (l.pos - centroid).length()).collect();
+    let centroid = pts.iter().copied().sum::<glam::DVec3>() / pts.len() as f64;
+    let mut d: Vec<f64> = pts.iter().map(|p| (*p - centroid).length()).collect();
     d.sort_by(f64::total_cmp);
     let voxel = (0.005 * d[d.len() / 2]).max(1e-6);
     let mut seen = std::collections::HashSet::new();
-    lms.into_iter()
-        .filter(|l| {
+    pts.iter()
+        .map(|p| {
             seen.insert((
-                (l.pos.x / voxel).floor() as i64,
-                (l.pos.y / voxel).floor() as i64,
-                (l.pos.z / voxel).floor() as i64,
+                (p.x / voxel).floor() as i64,
+                (p.y / voxel).floor() as i64,
+                (p.z / voxel).floor() as i64,
             ))
         })
+        .collect()
+}
+
+/// Voxel dedup keeping full records.
+fn dedup_db_landmarks(lms: Vec<DbLandmark>) -> Vec<DbLandmark> {
+    let mask = dedup_mask(&lms.iter().map(|l| l.pos).collect::<Vec<_>>());
+    lms.into_iter()
+        .zip(mask)
+        .filter_map(|(l, keep)| keep.then_some(l))
         .collect()
 }
 
@@ -1209,6 +1288,225 @@ fn seg_kf_range(seg: &gs_pose::VoResult) -> Option<(u32, u32)> {
     Some((*solved.first()?, *solved.last()?))
 }
 
+
+/// Offline registration lab over persisted submaps: full diagnostics
+/// (distance percentiles, vote histogram), tunable gates, optional write.
+fn run_register(
+    project_root: &std::path::Path,
+    submap: usize,
+    max_dist: u32,
+    ratio: f32,
+    min_votes: usize,
+    write: bool,
+) -> anyhow::Result<()> {
+    use glam::DVec3;
+    use gs_pose::descriptor::{hamming_multi, match_descriptors};
+    use gs_pose::sim3::Sim3G;
+
+    let proj = project::Project::load(project_root)?;
+    anyhow::ensure!(submap < proj.submaps.len(), "no submap-{submap}");
+
+    let load = |i: usize| -> anyhow::Result<Vec<project::Landmark>> {
+        project::read_landmarks(
+            &project::Project::submap_dir(project_root, i).join("landmarks.bin"),
+        )
+    };
+    // World: all registered submaps except the target.
+    let mut world: Vec<DbLandmark> = Vec::new();
+    for (i, meta) in proj.submaps.iter().enumerate() {
+        if i == submap {
+            continue;
+        }
+        let Some(w) = &meta.world_from_submap else { continue };
+        let s = Sim3G {
+            scale: w.scale,
+            rot: glam::DQuat::from_xyzw(w.quat[1], w.quat[2], w.quat[3], w.quat[0]),
+            trans: DVec3::from_array(w.trans),
+        };
+        let entries: Vec<DbLandmark> = load(i)?
+            .into_iter()
+            .map(|l| DbLandmark {
+                pos: s.apply(DVec3::new(l.pos[0] as f64, l.pos[1] as f64, l.pos[2] as f64)),
+                desc: l.desc,
+                kf: l.kf,
+                obs: (l.obs[0], l.obs[1]),
+                submap: i,
+            })
+            .collect();
+        world.extend(dedup_db_landmarks(entries));
+    }
+    let new_raw = load(submap)?;
+    let new_pts_all: Vec<DVec3> = new_raw
+        .iter()
+        .map(|l| DVec3::new(l.pos[0] as f64, l.pos[1] as f64, l.pos[2] as f64))
+        .collect();
+    let mask = dedup_mask(&new_pts_all);
+    let new: Vec<&project::Landmark> = new_raw
+        .iter()
+        .zip(&mask)
+        .filter_map(|(l, &keep)| keep.then_some(l))
+        .collect();
+    let new_pts: Vec<DVec3> = new
+        .iter()
+        .map(|l| DVec3::new(l.pos[0] as f64, l.pos[1] as f64, l.pos[2] as f64))
+        .collect();
+    println!("world {} landmarks, submap-{submap} {} landmarks", world.len(), new.len());
+
+    // Distance diagnostics on the raw matches.
+    let wd: Vec<_> = world.iter().map(|l| l.desc).collect();
+    let nd: Vec<_> = new.iter().map(|l| l.desc).collect();
+    let pairs = match_descriptors(&nd, &wd, max_dist, ratio);
+    let mut dists: Vec<u32> = pairs
+        .iter()
+        .map(|&(x, y)| hamming_multi(&nd[x], &wd[y]))
+        .collect();
+    dists.sort_unstable();
+    let pct = |p: usize| dists.get(dists.len() * p / 100).copied().unwrap_or(0);
+    println!(
+        "matches: {} (dist p10 {} / p50 {} / p90 {})",
+        pairs.len(),
+        pct(10),
+        pct(50),
+        pct(90)
+    );
+
+    // Vote histogram (top buckets).
+    const BUCKET: u32 = 8;
+    let mut votes: std::collections::HashMap<(u32, usize, u32), usize> =
+        std::collections::HashMap::new();
+    for &(x, y) in &pairs {
+        if new[x].kf != u32::MAX && world[y].kf != u32::MAX {
+            *votes
+                .entry((new[x].kf / BUCKET, world[y].submap, world[y].kf / BUCKET))
+                .or_default() += 1;
+        }
+    }
+    let mut top: Vec<_> = votes.iter().collect();
+    top.sort_by_key(|(_, v)| std::cmp::Reverse(**v));
+    for ((nk, ws, wk), v) in top.iter().take(8) {
+        println!(
+            "  votes {v}: submap kf~{}..{} <-> {ws} kf~{}..{}",
+            nk * BUCKET,
+            (nk + 1) * BUCKET,
+            wk * BUCKET,
+            (wk + 1) * BUCKET
+        );
+    }
+    let good: std::collections::HashSet<(u32, usize, u32)> = votes
+        .into_iter()
+        .filter(|(_, v)| *v >= min_votes)
+        .map(|(k, _)| k)
+        .collect();
+    let filtered: Vec<(usize, usize)> = pairs
+        .into_iter()
+        .filter(|&(x, y)| {
+            good.contains(&(new[x].kf / BUCKET, world[y].submap, world[y].kf / BUCKET))
+        })
+        .collect();
+    println!("covis-filtered: {} matches in {} buckets", filtered.len(), good.len());
+
+    let mut registration = None;
+    if filtered.len() >= 15 {
+        let a: Vec<DVec3> = filtered.iter().map(|&(x, _)| new_pts[x]).collect();
+        let b: Vec<DVec3> = filtered.iter().map(|&(_, y)| world[y].pos).collect();
+        registration = attempt_sim3(&a, &b, 0.05, 15, "register-lab 3D");
+    }
+
+    // 2D stage: DLT-PnP a covisible keyframe of the target submap against
+    // the world 3D of the filtered matches (dodges this submap's own noisy
+    // landmark depths; gauge scale from median depth ratios).
+    if registration.is_none() && filtered.len() >= 8 {
+        let meta = &proj.submaps[submap];
+        let (cx, cy) = (meta.width as f64 / 2.0, meta.height as f64 / 2.0);
+        let poses = load_seg_poses(
+            &project::Project::submap_dir(project_root, submap).join("poses.csv"),
+        )?;
+        // Rank keyframes by how many filtered matches they observe.
+        let mut per_kf: std::collections::HashMap<u32, Vec<(usize, usize, [f32; 2])>> =
+            std::collections::HashMap::new();
+        for &(x, y) in &filtered {
+            for (k, p) in &new[x].obs_all {
+                per_kf.entry(*k).or_default().push((x, y, *p));
+            }
+        }
+        let mut ranked: Vec<_> = per_kf.into_iter().collect();
+        ranked.sort_by_key(|(_, v)| std::cmp::Reverse(v.len()));
+        for (k, group) in ranked.into_iter().take(8) {
+            // One camera sees ONE world region: keep only this keyframe's
+            // dominant world neighborhood (mode over 16-kf world buckets).
+            let mut region_votes: std::collections::HashMap<(usize, u32), usize> =
+                std::collections::HashMap::new();
+            for &(_, y, _) in &group {
+                *region_votes
+                    .entry((world[y].submap, world[y].kf / 16))
+                    .or_default() += 1;
+            }
+            let Some((&dom, _)) = region_votes.iter().max_by_key(|(_, v)| **v) else {
+                continue;
+            };
+            let group: Vec<_> = group
+                .into_iter()
+                .filter(|&(_, y, _)| {
+                    world[y].submap == dom.0 && (world[y].kf / 16).abs_diff(dom.1) <= 1
+                })
+                .collect();
+            if group.len() < 6 {
+                continue;
+            }
+            let Some((r_wc, t_wc)) = poses.get(&k) else { continue };
+            let obs: Vec<gs_pose::sim3::BridgeObs> = group
+                .iter()
+                .map(|&(x, y, p)| gs_pose::sim3::BridgeObs {
+                    obs: (
+                        (p[0] as f64 - cx) / meta.focal,
+                        (p[1] as f64 - cy) / meta.focal,
+                    ),
+                    world: world[y].pos,
+                    seg: new_pts[x],
+                })
+                .collect();
+            let result = gs_pose::sim3::sim3_from_bridge(
+                *r_wc,
+                *t_wc,
+                &obs,
+                8.0 / meta.focal,
+                0x2b71d6e,
+            );
+            match result {
+                Some((s, inl)) => {
+                    println!(
+                        "2D stage kf {k}: {inl}/{} reprojection inliers (scale {:.3})",
+                        obs.len(),
+                        s.scale
+                    );
+                    if inl >= 10 && (0.05..=20.0).contains(&s.scale) {
+                        registration = Some(s);
+                        break;
+                    }
+                }
+                None => println!("2D stage kf {k}: rejected ({} obs)", group.len()),
+            }
+        }
+    }
+    match &registration {
+        Some(s) => println!("REGISTERED: scale {:.3}", s.scale),
+        None => println!("no registration"),
+    }
+    if write {
+        if let Some(s) = registration {
+            let dir = project::Project::submap_dir(project_root, submap);
+            let mut meta = project::read_meta(&dir.join("meta.txt"))?;
+            meta.world_from_submap = Some(project::WorldFromSubmap {
+                scale: s.scale,
+                quat: [s.rot.w, s.rot.x, s.rot.y, s.rot.z],
+                trans: s.trans.to_array(),
+            });
+            project::write_meta(&dir.join("meta.txt"), &meta)?;
+            println!("written to submap-{submap}/meta.txt");
+        }
+    }
+    Ok(())
+}
 
 /// Bake the composed project into one compat .ply + a manifest sidecar.
 fn run_export(project_root: &std::path::Path, out: Option<PathBuf>) -> anyhow::Result<()> {

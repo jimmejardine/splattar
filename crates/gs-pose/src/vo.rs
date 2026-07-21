@@ -109,8 +109,8 @@ struct Track {
     at_last_kf: Option<(f32, f32)>,
     /// Observations at keyframes: (kf index, position).
     obs: Vec<(usize, (f32, f32))>,
-    /// Binary patch descriptor per observation (for cross-video matching).
-    obs_desc: Vec<crate::descriptor::Descriptor>,
+    /// Oriented multi-scale descriptor per observation (cross-video matching).
+    obs_desc: Vec<crate::descriptor::MultiDescriptor>,
     /// Landmark index once triangulated.
     landmark: Option<usize>,
 }
@@ -157,7 +157,7 @@ pub struct VoResult {
     /// in ONE keyframe (single-camera PnP), which the median obs alone can't.
     pub landmark_obs_all: Vec<Vec<(usize, (f32, f32))>>,
     /// Binary descriptor at the reference observation (cross-video matching).
-    pub landmark_desc: Vec<crate::descriptor::Descriptor>,
+    pub landmark_desc: Vec<crate::descriptor::MultiDescriptor>,
     pub spline: Option<PoseSpline>,
     /// Index of the anchor keyframe (gauge origin).
     pub anchor: usize,
@@ -270,16 +270,11 @@ impl VoFrontEnd {
                 pts,
                 sharpness,
             });
-            let smooth = &pyr.levels[1.min(pyr.levels.len() - 1)];
-            let lvl_scale = if pyr.levels.len() > 1 { 0.5 } else { 1.0 };
             for tr in &mut self.tracks {
                 if let Some(p) = tr.cur {
                     tr.obs.push((kf_idx, p));
-                    tr.obs_desc.push(crate::descriptor::describe(
-                        smooth,
-                        p.0 * lvl_scale,
-                        p.1 * lvl_scale,
-                    ));
+                    tr.obs_desc
+                        .push(crate::descriptor::describe_multi(&pyr, p.0, p.1));
                 }
                 // Dead tracks must drop out of the survival statistics, or
                 // the ratio decays monotonically and every frame becomes a
@@ -299,11 +294,7 @@ impl VoFrontEnd {
                     cur: Some((c.x, c.y)),
                     at_last_kf: Some((c.x, c.y)),
                     obs: vec![(kf_idx, (c.x, c.y))],
-                    obs_desc: vec![crate::descriptor::describe(
-                        smooth,
-                        c.x * lvl_scale,
-                        c.y * lvl_scale,
-                    )],
+                    obs_desc: vec![crate::descriptor::describe_multi(&pyr, c.x, c.y)],
                     landmark: None,
                 });
             }
@@ -659,7 +650,8 @@ impl VoFrontEnd {
         let mut landmark_obs_all: Vec<Vec<(usize, (f32, f32))>> =
             vec![Vec::new(); landmarks.len()];
         let mut landmark_desc =
-            vec![[0u8; crate::descriptor::DESC_BYTES]; landmarks.len()];
+            vec![[[0u8; crate::descriptor::DESC_BYTES]; crate::descriptor::DESC_LEVELS];
+                landmarks.len()];
         for tr in &self.tracks {
             let Some(l) = tr.landmark else { continue };
             if !tr.obs.is_empty() {
