@@ -1,5 +1,0 @@
-[2026-07-21T00:35:13Z INFO  gs_cli] project DB: 8984 registered landmarks
-[2026-07-21T00:35:13Z INFO  gs_video::mp4_reader] h264 track 1: 478x850, 5183 samples, timescale 90000
-[2026-07-21T00:35:13Z INFO  gs_video::nvdec] nvdec: session ready — 480x864 coded, 2 DPB slots, coincide mode
-[2026-07-21T00:35:13Z INFO  gs_cli] video 478x850, focal guess 722px
-[2026-07-21T00:35:34Z INFO  gs_cli] tracked 200 frames, 173 keyframes
