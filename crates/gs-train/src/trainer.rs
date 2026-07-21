@@ -433,6 +433,22 @@ impl Trainer {
                 for b in &mut ap[3..] {
                     *b = b.clamp(-0.5, 0.5);
                 }
+                // Anchor the color gauge: the affines have a global degree of
+                // freedom (all views can drift together, chasing the render).
+                // Project it out so the mean correction stays identity.
+                let n = self.appear.len() as f32;
+                let mut mean = [0.0f32; 6];
+                for a in &self.appear {
+                    for k in 0..6 {
+                        mean[k] += a[k] / n;
+                    }
+                }
+                for a in &mut self.appear {
+                    for k in 0..3 {
+                        a[k] /= mean[k].max(0.25);
+                        a[3 + k] -= mean[3 + k];
+                    }
+                }
             }
         }
 
@@ -464,8 +480,11 @@ impl Trainer {
 
         // Pose refinement: chain the (parity-verified) camera gradients on
         // the host and Adam-step this view's rotation/center + shared focal.
+        // LR decays with the same schedule as positions so late training
+        // stops jittering converged cameras.
         if self.config.pose_refine_lr > 0.0 && iter >= self.config.pose_refine_start {
-            self.refine_pose(ctx, view_idx, &camera);
+            let decay = self.config.pos_lr_final_factor.powf(t);
+            self.refine_pose(ctx, view_idx, &camera, decay);
         }
 
         // Periodic dead-surfel relocation.
@@ -483,7 +502,13 @@ impl Trainer {
     /// layout [dl/dR (col-major 3×3), dl/dcenter (3), dl/dfocal, …].
     /// Rotation uses the right-perturbation R' = R·exp([δ]×): the Riemannian
     /// gradient is the antisymmetric part of B = Rᵀ·(dl/dR).
-    fn refine_pose(&mut self, ctx: &GpuContext, view_idx: usize, camera: &RasterCamera) {
+    fn refine_pose(
+        &mut self,
+        ctx: &GpuContext,
+        view_idx: usize,
+        camera: &RasterCamera,
+        decay: f32,
+    ) {
         let g = read_cam_grads(ctx, &self.raster.grad_cam);
         let Some(grad) = camera_step_grad(&g, camera.quat) else {
             return;
@@ -493,13 +518,14 @@ impl Trainer {
         let depth = self.view_depth(view_idx);
         let t = self.pose_t[view_idx] + 1;
         self.pose_t[view_idx] = t;
+        let lr = self.config.pose_refine_lr * decay;
         let step = adam6(
             &mut self.pose_m[view_idx],
             &mut self.pose_v[view_idx],
             t,
             &grad,
-            self.config.pose_refine_lr,
-            self.config.pose_refine_lr * depth,
+            lr,
+            lr * depth,
         );
         let view = &mut self.views[view_idx];
         apply_camera_step(&mut view.camera, &step);
@@ -513,7 +539,7 @@ impl Trainer {
             *v = 0.999 * *v + 0.001 * gf * gf;
             let mhat = *m / (1.0 - 0.9f32.powi(*tf as i32));
             let vhat = *v / (1.0 - 0.999f32.powi(*tf as i32));
-            let lr_f = self.config.pose_refine_lr * 0.5;
+            let lr_f = lr * 0.5;
             self.focal_scale *= (-lr_f * mhat / (vhat.sqrt() + 1e-10)).exp();
         }
     }
