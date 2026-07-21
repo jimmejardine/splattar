@@ -32,6 +32,12 @@ fn gt_pose(t: f64) -> Se3 {
 
 /// Ray-trace one frame: near plane z=4 (finite), far plane z=9 (infinite).
 fn render(pose: &Se3) -> GrayImage {
+    render_with(pose, 0.0)
+}
+
+/// `phase` shifts the plane textures — a phase jump mid-sequence is a hard
+/// content cut that kills every KLT track without touching the geometry.
+fn render_with(pose: &Se3, phase: f64) -> GrayImage {
     let mut img = GrayImage::new(W, H);
     let inv = pose.inverse();
     let cam_center = pose.center();
@@ -50,15 +56,22 @@ fn render(pose: &Se3) -> GrayImage {
                 if t_near > 0.0 {
                     let p = cam_center + d_world * t_near;
                     if p[0].abs() < 2.2 && p[1].abs() < 1.6 {
+                        // Coordinate offset too — tex() has phase-free terms,
+                        // and a genuine cut must decorrelate all of them.
                         img.data[py * W + px] =
-                            tex(p[0], p[1], 0.0).clamp(0.0, 1.0) as f32;
+                            tex(p[0] + 3.0 * phase, p[1] - 2.0 * phase, phase)
+                                .clamp(0.0, 1.0) as f32;
                         continue;
                     }
                 }
                 let t_far = (9.0 - cam_center[2]) / d_world[2];
                 if t_far > 0.0 {
                     let p = cam_center + d_world * t_far;
-                    val = tex(p[0] * 0.6, p[1] * 0.6, 1.7);
+                    val = tex(
+                        p[0] * 0.6 + 3.0 * phase,
+                        p[1] * 0.6 - 2.0 * phase,
+                        1.7 + phase,
+                    );
                 }
             }
             img.data[py * W + px] = val.clamp(0.0, 1.0) as f32;
@@ -168,6 +181,130 @@ fn vo_recovers_translating_trajectory() {
     let mid_t = (solved[1].0 + solved[2].0) * 0.5;
     let s = spline.sample(mid_t);
     assert!(s.t.iter().all(|v| v.is_finite()));
+}
+
+/// A hard content cut mid-clip (texture phase jump — every track dies, the
+/// camera keeps moving) must split the solve into per-side segments, each
+/// accurate against GT in its own gauge.
+#[test]
+fn vo_segments_across_a_hard_cut() {
+    let n_half = 60;
+    let dt = 1.0 / 30.0;
+    let cut_pts = n_half as f64 * dt;
+    let cfg = VoConfig {
+        intrinsics: Intrinsics {
+            focal: FOCAL,
+            cx: W as f64 / 2.0,
+            cy: H as f64 / 2.0,
+        },
+        kf_flow_px: 6.0,
+        ..Default::default()
+    };
+    let mut vo = VoFrontEnd::new(cfg);
+    for k in 0..2 * n_half {
+        let t = k as f64 * dt;
+        // The cut itself is three featureless frames (a whip pan / blur in
+        // real footage): every track dies, nothing new spawns. A pure
+        // texture swap is NOT enough — quasi-periodic synthetic textures
+        // produce self-consistent false KLT matches that pass the
+        // forward-backward check (wallpaper ambiguity).
+        let img = if (n_half..n_half + 3).contains(&k) {
+            let mut flat = GrayImage::new(W, H);
+            flat.data.fill(0.35);
+            flat
+        } else {
+            let phase = if k < n_half { 0.0 } else { 4.2 };
+            render_with(&gt_pose(t), phase)
+        };
+        vo.push_frame(img, t);
+    }
+    assert!(
+        {
+            let mut probe = VoFrontEnd::new(VoConfig {
+                intrinsics: Intrinsics {
+                    focal: FOCAL,
+                    cx: W as f64 / 2.0,
+                    cy: H as f64 / 2.0,
+                },
+                kf_flow_px: 6.0,
+                ..Default::default()
+            });
+            for k in 0..n_half + 3 {
+                let t = k as f64 * dt;
+                let img = if k >= n_half {
+                    let mut flat = GrayImage::new(W, H);
+                    flat.data.fill(0.35);
+                    flat
+                } else {
+                    render_with(&gt_pose(t), 0.0)
+                };
+                probe.push_frame(img, t);
+            }
+            probe.live_tracks() == 0
+        },
+        "flat frames must kill every track"
+    );
+
+    let segments = vo.solve_segments();
+    for (si, seg) in segments.iter().enumerate() {
+        let pts: Vec<f64> = seg
+            .keyframe_poses
+            .iter()
+            .flatten()
+            .map(|kp| kp.pts)
+            .collect();
+        eprintln!(
+            "segment {si}: {} solved, pts {:.2}..{:.2} (cut at {cut_pts:.2})",
+            pts.len(),
+            pts.first().copied().unwrap_or(-1.0),
+            pts.last().copied().unwrap_or(-1.0)
+        );
+    }
+    assert!(
+        segments.len() >= 2,
+        "expected >= 2 segments across the cut, got {}",
+        segments.len()
+    );
+    let total_solved: usize = segments
+        .iter()
+        .map(|s| s.keyframe_poses.iter().flatten().count())
+        .sum();
+    let n_kf = segments[0].keyframe_poses.len();
+    eprintln!(
+        "segments: {} covering {total_solved}/{n_kf} keyframes",
+        segments.len()
+    );
+    assert!(
+        total_solved as f64 >= 0.8 * n_kf as f64,
+        "segments cover too little: {total_solved}/{n_kf}"
+    );
+
+    for (si, seg) in segments.iter().enumerate() {
+        let solved: Vec<(f64, Se3)> = seg
+            .keyframe_poses
+            .iter()
+            .flatten()
+            .map(|kp| (kp.pts, kp.pose))
+            .collect();
+        assert!(solved.len() >= 6, "segment {si} too small: {}", solved.len());
+        // No segment may span the cut — its two sides share no tracks.
+        let all_before = solved.iter().all(|(t, _)| *t < cut_pts - 1e-9);
+        let all_after = solved.iter().all(|(t, _)| *t >= cut_pts - 1e-9);
+        assert!(all_before || all_after, "segment {si} spans the content cut");
+        // Per-segment ATE gate (each segment is its own gauge).
+        let est: Vec<Vector3<f64>> = solved.iter().map(|(_, p)| p.center()).collect();
+        let gt: Vec<Vector3<f64>> = solved.iter().map(|(t, _)| gt_pose(*t).center()).collect();
+        let traj: f64 = gt.windows(2).map(|w| (w[1] - w[0]).norm()).sum();
+        let ate_rms = ate(&est, &gt);
+        eprintln!(
+            "  segment {si}: {} kf, trajectory {traj:.3}, ATE {ate_rms:.5}",
+            solved.len()
+        );
+        assert!(
+            ate_rms < 0.02 * traj.max(0.1),
+            "segment {si} ATE {ate_rms:.5} vs trajectory {traj:.3}"
+        );
+    }
 }
 
 #[test]

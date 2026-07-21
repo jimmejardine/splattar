@@ -268,10 +268,17 @@ fn main() -> anyhow::Result<()> {
 
 /// Shared VO stage: decode → causal pass → anchor-out solve.
 struct VoOutput {
-    result: gs_pose::VoResult,
+    /// Solved segments in temporal order — each in its own monocular gauge
+    /// (track-continuity breaks split the clip; Sim(3) registration or
+    /// island placement joins the submaps built from them).
+    segments: Vec<gs_pose::VoResult>,
     keyframes: Vec<gs_pose::vo::Keyframe>,
     intrinsics: gs_pose::vo::Intrinsics,
     video_size: (u32, u32),
+}
+
+fn solved_count(seg: &gs_pose::VoResult) -> usize {
+    seg.keyframe_poses.iter().flatten().count()
 }
 
 fn run_vo(
@@ -343,17 +350,29 @@ fn run_vo(
     );
 
     let t1 = std::time::Instant::now();
-    let result = fe.solve().context("VO solve failed (not enough parallax?)")?;
+    let segments = fe.solve_segments();
+    anyhow::ensure!(
+        !segments.is_empty(),
+        "VO solve failed (not enough parallax?)"
+    );
+    let total_solved: usize = segments.iter().map(solved_count).sum();
     log::info!(
-        "anchor-out solve: {}/{} keyframes solved (anchor at kf {}), {} landmarks, {:.2}s",
-        result.keyframe_poses.iter().flatten().count(),
-        result.keyframe_poses.len(),
-        result.anchor,
-        result.landmarks.len(),
+        "anchor-out solve: {} segment(s), {}/{} keyframes solved, {:.2}s",
+        segments.len(),
+        total_solved,
+        fe.keyframes.len(),
         t1.elapsed().as_secs_f64()
     );
+    for (i, seg) in segments.iter().enumerate() {
+        log::info!(
+            "  segment {i}: {} keyframes solved (anchor kf {}), {} landmarks",
+            solved_count(seg),
+            seg.anchor,
+            seg.landmarks.len()
+        );
+    }
     Ok(VoOutput {
-        result,
+        segments,
         keyframes: std::mem::take(&mut fe.keyframes),
         intrinsics,
         video_size,
@@ -367,25 +386,32 @@ fn run_pose(
     out: Option<PathBuf>,
 ) -> anyhow::Result<()> {
     let vo = run_vo(video, focal, max_frames)?;
-    let solved: Vec<_> = vo.result.keyframe_poses.iter().flatten().collect();
 
     let out = out.unwrap_or_else(|| {
         let mut p = video.to_path_buf();
         p.set_extension("trajectory.csv");
         p
     });
-    let mut csv = String::from("pts,cx,cy,cz,qw,qx,qy,qz\n");
-    for kp in &solved {
-        let c = kp.pose.center();
-        let q = kp.pose.r.inverse(); // camera-to-world rotation
-        csv.push_str(&format!(
-            "{:.6},{:.6},{:.6},{:.6},{:.8},{:.8},{:.8},{:.8}\n",
-            kp.pts, c[0], c[1], c[2], q.w, q.i, q.j, q.k
-        ));
-    }
-    std::fs::write(&out, csv)?;
+    std::fs::write(&out, trajectory_csv(&vo))?;
     log::info!("trajectory written to {}", out.display());
     Ok(())
+}
+
+/// Multi-segment trajectory CSV. The `seg` column matters: each segment is
+/// its own monocular gauge, so positions are only comparable within one.
+fn trajectory_csv(vo: &VoOutput) -> String {
+    let mut csv = String::from("seg,pts,cx,cy,cz,qw,qx,qy,qz\n");
+    for (si, seg) in vo.segments.iter().enumerate() {
+        for kp in seg.keyframe_poses.iter().flatten() {
+            let c = kp.pose.center();
+            let q = kp.pose.r.inverse(); // camera-to-world rotation
+            csv.push_str(&format!(
+                "{si},{:.6},{:.6},{:.6},{:.6},{:.8},{:.8},{:.8},{:.8}\n",
+                kp.pts, c[0], c[1], c[2], q.w, q.i, q.j, q.k
+            ));
+        }
+    }
+    csv
 }
 
 /// Everything the trainer needs from a video, plus the persistence payload.
@@ -399,10 +425,12 @@ struct Prepared {
     th: u32,
 }
 
-/// View selection + second decode pass + landmark assembly.
+/// View selection + second decode pass + landmark assembly, for one VO
+/// segment (poses and landmarks live in that segment's gauge).
 fn prepare_training(
     video: &std::path::Path,
     vo: &VoOutput,
+    seg: &gs_pose::VoResult,
     downscale: u32,
     max_views: u32,
 ) -> anyhow::Result<Prepared> {
@@ -418,7 +446,7 @@ fn prepare_training(
     {
         let mut window_start = f64::NEG_INFINITY;
         let mut best_in_window: Option<usize> = None;
-        for (k, kp) in vo.result.keyframe_poses.iter().enumerate() {
+        for (k, kp) in seg.keyframe_poses.iter().enumerate() {
             if kp.is_none() {
                 continue;
             }
@@ -479,13 +507,12 @@ fn prepare_training(
     // reference observation when it lands on a collected view.
     let centroid = {
         let mut c = glam::DVec3::ZERO;
-        for l in &vo.result.landmarks {
+        for l in &seg.landmarks {
             c += *l;
         }
-        c / vo.result.landmarks.len().max(1) as f64
+        c / seg.landmarks.len().max(1) as f64
     };
-    let mut dists: Vec<f64> = vo
-        .result
+    let mut dists: Vec<f64> = seg
         .landmarks
         .iter()
         .map(|l| (*l - centroid).length())
@@ -496,11 +523,11 @@ fn prepare_training(
         chosen.iter().enumerate().map(|(s, &k)| (k, s)).collect();
     let mut points: Vec<gs_io::SfmPoint> = Vec::new();
     let mut landmarks: Vec<project::Landmark> = Vec::new();
-    for (li, l) in vo.result.landmarks.iter().enumerate() {
+    for (li, l) in seg.landmarks.iter().enumerate() {
         if (*l - centroid).length() > 8.0 * med_dist {
             continue; // low-parallax runaway triangulation
         }
-        let (kf, (px, py)) = vo.result.landmark_obs[li];
+        let (kf, (px, py)) = seg.landmark_obs[li];
         let color = slot_of_kf
             .get(&kf)
             .and_then(|&slot| images[slot].as_ref())
@@ -520,14 +547,14 @@ fn prepare_training(
         landmarks.push(project::Landmark {
             pos,
             color,
-            desc: vo.result.landmark_desc[li],
+            desc: seg.landmark_desc[li],
         });
     }
     anyhow::ensure!(points.len() >= 500, "too few init points: {}", points.len());
     log::info!(
         "init: {} landmarks kept of {} (median-distance filter)",
         points.len(),
-        vo.result.landmarks.len()
+        seg.landmarks.len()
     );
 
     // Cameras in the renderer convention; every 8th view held out.
@@ -535,7 +562,7 @@ fn prepare_training(
     let mut train_views = Vec::new();
     let mut eval_views = Vec::new();
     for (slot, &k) in chosen.iter().enumerate() {
-        let kp = vo.result.keyframe_poses[k].as_ref().unwrap();
+        let kp = seg.keyframe_poses[k].as_ref().unwrap();
         let c2w = kp.c2w();
         let m = glam::Mat4::from_cols_array(&c2w.to_cols_array().map(|v| v as f32));
         let (_, rot, trans) = m.to_scale_rotation_translation();
@@ -665,16 +692,7 @@ fn write_trajectory_csv(
     path: &std::path::Path,
     vo: &VoOutput,
 ) -> anyhow::Result<()> {
-    let mut csv = String::from("pts,cx,cy,cz,qw,qx,qy,qz\n");
-    for kp in vo.result.keyframe_poses.iter().flatten() {
-        let c = kp.pose.center();
-        let q = kp.pose.r.inverse();
-        csv.push_str(&format!(
-            "{:.6},{:.6},{:.6},{:.6},{:.8},{:.8},{:.8},{:.8}\n",
-            kp.pts, c[0], c[1], c[2], q.w, q.i, q.j, q.k
-        ));
-    }
-    std::fs::write(path, csv)?;
+    std::fs::write(path, trajectory_csv(vo))?;
     Ok(())
 }
 
@@ -692,7 +710,13 @@ fn run_pipeline(
     out: Option<PathBuf>,
 ) -> anyhow::Result<()> {
     let vo = run_vo(video, focal, max_frames)?;
-    let prepared = prepare_training(video, &vo, downscale, max_views)?;
+    // Largest segment becomes submap-0 (its gauge = project world); the
+    // clip beyond track-continuity breaks goes through the same
+    // register-or-island path another video would.
+    let mut order: Vec<usize> = (0..vo.segments.len()).collect();
+    order.sort_by_key(|&i| std::cmp::Reverse(solved_count(&vo.segments[i])));
+    let primary = &vo.segments[order[0]];
+    let prepared = prepare_training(video, &vo, primary, downscale, max_views)?;
 
     // Project layout: submap-0 in its own gauge (= project world).
     let project_root = video.with_extension("project");
@@ -716,22 +740,76 @@ fn run_pipeline(
     if let Some(extra) = out {
         std::fs::copy(&ply, &extra)?;
     }
+    for &si in &order[1..] {
+        if let Err(e) = add_segment_submap(
+            &project_root,
+            video,
+            &vo,
+            &vo.segments[si],
+            iters,
+            budget,
+            downscale,
+            max_views,
+        ) {
+            log::warn!("segment {si}: skipped ({e:#})");
+        }
+    }
     println!(
-        "done: {} ({num} surfels, held-out PSNR {psnr:.2} dB) — walk it with `gs-cli view {}`",
+        "done: {} ({} submap(s), submap-0: {num} surfels, held-out PSNR {psnr:.2} dB) — walk it with `gs-cli view {}`",
         project_root.display(),
-        ply.display()
+        order.len(),
+        project_root.display()
     );
     Ok(())
 }
 
-/// M8: extend a project with another video — register via descriptor-matched
-/// 3D-3D landmark correspondences (RANSAC Sim(3)), or persist as an island.
+/// M8: extend a project with another video — each VO segment is registered
+/// via descriptor-matched 3D-3D landmark correspondences (RANSAC Sim(3)),
+/// or persisted as an island.
 #[allow(clippy::too_many_arguments)]
 fn run_add(
     video: &std::path::Path,
     project_root: &std::path::Path,
     focal: Option<f64>,
     max_frames: u32,
+    iters: u32,
+    budget: u32,
+    downscale: u32,
+    max_views: u32,
+) -> anyhow::Result<()> {
+    let vo = run_vo(video, focal, max_frames)?;
+    // Largest segment first: it has the best registration odds and, once
+    // landed, its landmarks help the smaller ones register.
+    let mut order: Vec<usize> = (0..vo.segments.len()).collect();
+    order.sort_by_key(|&i| std::cmp::Reverse(solved_count(&vo.segments[i])));
+    for &si in &order {
+        if let Err(e) = add_segment_submap(
+            project_root,
+            video,
+            &vo,
+            &vo.segments[si],
+            iters,
+            budget,
+            downscale,
+            max_views,
+        ) {
+            log::warn!("segment {si}: skipped ({e:#})");
+        }
+    }
+    println!("view the composed project with `gs-cli view {}`", project_root.display());
+    Ok(())
+}
+
+/// Register one VO segment against the project's pooled landmark DB and
+/// persist it as a new trained submap (or an island when no overlap is
+/// found). Reloads the project each call so segments landed earlier extend
+/// the DB for later ones.
+#[allow(clippy::too_many_arguments)]
+fn add_segment_submap(
+    project_root: &std::path::Path,
+    video: &std::path::Path,
+    vo: &VoOutput,
+    seg: &gs_pose::VoResult,
     iters: u32,
     budget: u32,
     downscale: u32,
@@ -771,8 +849,7 @@ fn run_add(
     let (world_pts, world_desc) = dedup_landmarks(world_pts, world_desc);
     log::info!("project DB: {} registered landmarks after dedup", world_pts.len());
 
-    let vo = run_vo(video, focal, max_frames)?;
-    let prepared = prepare_training(video, &vo, downscale, max_views)?;
+    let prepared = prepare_training(video, vo, seg, downscale, max_views)?;
 
     // Descriptor matching new-submap -> world, then Sim(3) RANSAC on 3D pairs.
     let new_pts_all: Vec<DVec3> = prepared
@@ -835,7 +912,7 @@ fn run_add(
         },
     )?;
     project::write_landmarks(&dir.join("landmarks.bin"), &prepared.landmarks)?;
-    write_trajectory_csv(&dir.join("trajectory.csv"), &vo)?;
+    write_trajectory_csv(&dir.join("trajectory.csv"), vo)?;
 
     let ply = dir.join("splat.ply");
     let (psnr, num) = train_and_bake(prepared, iters, budget, 1.0, &ply)?;
@@ -847,7 +924,6 @@ fn run_add(
             "no overlap found: kept as an ISLAND (film a bridge clip to connect it)"
         }
     );
-    println!("view the composed project with `gs-cli view {}`", project_root.display());
     Ok(())
 }
 

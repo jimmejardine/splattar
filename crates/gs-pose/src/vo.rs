@@ -311,6 +311,11 @@ impl VoFrontEnd {
         self.tracks.iter().filter(|t| t.cur.is_some()).count()
     }
 
+    /// Live-track count (diagnostics/tests).
+    pub fn live_tracks(&self) -> usize {
+        self.live_count()
+    }
+
     /// (median flow since last KF, survival ratio vs last KF).
     fn kf_statistics(&self) -> (f32, f32) {
         let mut disp: Vec<f32> = Vec::new();
@@ -352,20 +357,88 @@ impl VoFrontEnd {
         (matches, track_ids)
     }
 
-    /// Anchor-out solve over the collected segment.
+    /// Anchor-out solve over the whole clip, returning the segment with the
+    /// most solved keyframes. Kept for callers (and validation gates) that
+    /// want a single gauge; well-connected footage yields exactly one
+    /// segment, so this matches the pre-segmentation behavior there.
     pub fn solve(&mut self) -> Option<VoResult> {
+        self.solve_segments()
+            .into_iter()
+            .max_by_key(|r| r.keyframe_poses.iter().flatten().count())
+    }
+
+    /// Segment-recursive anchor-out solve: solve the best-conditioned
+    /// segment of a keyframe range, then recurse into the unsolved flanks —
+    /// each segment gets its own monocular gauge (scale is per-submap until
+    /// Sim(3) alignment, per CLAUDE.md). Track continuity breaks (fast pans,
+    /// doorways) end a segment exactly where PnP stops connecting, so
+    /// boundaries land on low-quality footage by construction. Returned in
+    /// temporal order.
+    pub fn solve_segments(&mut self) -> Vec<VoResult> {
+        /// Ranges shorter than this can't bootstrap + margin meaningfully.
+        /// (Deliberately permissive — downstream training applies its own
+        /// minimum view/landmark counts before a sliver becomes a submap.)
+        const MIN_SEGMENT_KF: usize = 8;
+        /// Runaway backstop, far above any real walkthrough.
+        const MAX_SEGMENTS: usize = 12;
         let n_kf = self.keyframes.len();
-        if n_kf < 2 {
+        let mut out: Vec<VoResult> = Vec::new();
+        let mut pending: Vec<(usize, usize)> = vec![(0, n_kf)];
+        while let Some((lo, hi)) = pending.pop() {
+            if hi.saturating_sub(lo) < MIN_SEGMENT_KF || out.len() >= MAX_SEGMENTS {
+                continue;
+            }
+            let Some(res) = self.solve_range(lo, hi) else {
+                log::info!("segment [{lo},{hi}): no viable bootstrap — dropped");
+                continue;
+            };
+            let solved: Vec<usize> = res
+                .keyframe_poses
+                .iter()
+                .enumerate()
+                .filter_map(|(k, p)| p.is_some().then_some(k))
+                .collect();
+            let (first, last) = (solved[0], *solved.last().unwrap());
+            log::info!(
+                "segment solved: keyframes [{first}..{last}] ({} of {} in range [{lo},{hi}))",
+                solved.len(),
+                hi - lo
+            );
+            pending.push((lo, first));
+            pending.push((last + 1, hi));
+            out.push(res);
+        }
+        out.sort_by_key(|r| {
+            r.keyframe_poses
+                .iter()
+                .position(|p| p.is_some())
+                .unwrap_or(usize::MAX)
+        });
+        out
+    }
+
+    /// Anchor-out solve restricted to keyframes [lo, hi).
+    fn solve_range(&mut self, range_lo: usize, range_hi: usize) -> Option<VoResult> {
+        let n_kf = self.keyframes.len();
+        let range_n = range_hi.saturating_sub(range_lo);
+        if range_n < 2 {
             return None;
+        }
+        // Landmark assignments are per-segment (each segment is its own
+        // gauge) — clear anything a previous segment's solve left behind.
+        for tr in &mut self.tracks {
+            tr.landmark = None;
         }
         let thresh = self.cfg.ransac_px / self.cfg.intrinsics.focal;
 
         // Candidate anchor pairs: from each start keyframe, extend forward
         // until the shared tracks carry enough flow for a well-conditioned
         // two-view solve (adjacent keyframes rarely have the baseline).
-        let margin = ((n_kf as f64 * self.cfg.anchor_margin) as usize).min(n_kf / 4);
-        let lo = margin;
-        let hi = (n_kf - 1 - margin).max(lo + 1).min(n_kf - 1);
+        // Margins keep the anchor away from the range ends — boundaries sit
+        // at low-quality footage by construction.
+        let margin = ((range_n as f64 * self.cfg.anchor_margin) as usize).min(range_n / 4);
+        let lo = range_lo + margin;
+        let hi = (range_hi - 1 - margin).max(lo + 1).min(range_hi - 1);
         // Sample candidate starts — scanning every keyframe is O(n²) in
         // track lookups and adds nothing once the pool is a few dozen.
         let step = ((hi - lo) / 48).max(1);
@@ -376,7 +449,7 @@ impl VoFrontEnd {
             .par_iter()
             .filter_map(|&ka| {
                 let mut chosen: Option<(usize, usize, f64)> = None;
-                for kb in ka + 1..n_kf {
+                for kb in ka + 1..range_hi {
                     let (m, _) = self.kf_matches(ka, kb);
                     if m.len() < self.cfg.boot_min_inliers {
                         break;
@@ -463,9 +536,11 @@ impl VoFrontEnd {
             return None;
         }
 
-        // Anchor-out expansion: everything outside the (solved) anchor pair,
-        // nearest-to-anchor first, alternating temporal directions.
-        let mut order: Vec<usize> = (0..n_kf).filter(|&k| poses[k].is_none()).collect();
+        // Anchor-out expansion: everything in range outside the (solved)
+        // anchor pair, nearest-to-anchor first, alternating temporal
+        // directions.
+        let mut order: Vec<usize> =
+            (range_lo..range_hi).filter(|&k| poses[k].is_none()).collect();
         order.sort_by_key(|&k| k.abs_diff(anchor));
 
         let total_pending = order.len();
@@ -492,6 +567,14 @@ impl VoFrontEnd {
                 })
                 .collect();
             let (pts3, obs2): (Vec<_>, Vec<_>) = gathered.into_iter().unzip();
+            // PnP needs real support: a pose glued on from a handful of
+            // (possibly spurious) surviving tracks poisons the gauge across
+            // genuine continuity breaks — leave it unsolved instead (the
+            // segment recursion picks the far side up in its own gauge).
+            const MIN_PNP_LANDMARKS: usize = 12;
+            if pts3.len() < MIN_PNP_LANDMARKS {
+                continue;
+            }
             // Prior: nearest solved pose.
             let prior = nearest_pose(&poses, k)?;
             let Some(res) = solve_pnp(&pts3, &obs2, &prior, &PnpConfig::default()) else {
@@ -543,7 +626,7 @@ impl VoFrontEnd {
 
         // Final polish: full BA with the anchor pair fixed (cheap at VO scale).
         log::info!(
-            "anchor-out mapping done: {solved_count}/{n_kf} solved, {} landmarks; global BA...",
+            "anchor-out mapping done: {solved_count}/{range_n} solved in [{range_lo},{range_hi}), {} landmarks; global BA...",
             landmarks.len()
         );
         let t_ba = std::time::Instant::now();
