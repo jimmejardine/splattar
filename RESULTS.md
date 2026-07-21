@@ -280,3 +280,23 @@ run pairwise image matching + epipolar verification on the candidate
 covisible pairs the vote table already identifies. Whip-pan segment cuts
 (1.mp4 internal) remain information-limited at the boundary regardless of
 descriptors — cross-segment merging rides the same revisit-based path.
+
+### M8: pairwise image stage — bottleneck moved to solver sample size (2026-07-21)
+
+The pairwise architecture is in: submaps persist half-res keyframe
+thumbnails + pose tables; the registration ladder ends with fresh
+corner detection and descriptor matching between the actual images of
+vote-nominated keyframe pairs, essential-matrix verification, landmark
+snapping, and Sim(3) via Umeyama or the 2D depth-ratio bridge. Synthetic
+gate: 30+ verified matches on a true pair, unrelated pair rejected (two
+pitfalls documented in code: tight ratio gates skew matches onto dominant
+planes and degenerate the eight-point solve; small thumbnails need dense
+detection).
+
+On the real flat pair the right keyframes engage (52–68 raw matches per
+nominated pair) but no pair verifies: cross-take match precision is ~20%,
+and EIGHT-point sampling needs 8 clean draws (0.2⁸ × 8k iters ≈ 0.02
+expected successes). The arithmetic fix is a FIVE-point essential solver
+(0.2⁵ × 8k ≈ 2.6) — M6's originally-planned five-point bootstrap, now
+with a measured, quantitative justification. Everything downstream of the
+solver is already built and waiting.
