@@ -35,6 +35,27 @@ struct DpbSlot {
     age: u64,
 }
 
+/// How many decode submissions may be in flight before the CPU waits. The
+/// GPU executes them in order (references stay correct); the CPU overlaps
+/// fence waits, readback copies, and bitstream prep across frames.
+const INFLIGHT: usize = 4;
+
+/// Per-in-flight-frame resources: its own command buffer, fence, bitstream
+/// upload buffer, and persistently-mapped readback buffer.
+struct FrameCtx {
+    cmd: vk::CommandBuffer,
+    fence: vk::Fence,
+    bitstream: vk::Buffer,
+    bitstream_mem: vk::DeviceMemory,
+    bitstream_ptr: *mut u8,
+    readback: vk::Buffer,
+    readback_mem: vk::DeviceMemory,
+    readback_ptr: *const u8,
+    /// POC of the frame this ctx is decoding (valid while busy).
+    poc: i32,
+    busy: bool,
+}
+
 pub struct H265Decoder {
     _entry: ash::Entry,
     instance: ash::Instance,
@@ -46,20 +67,18 @@ pub struct H265Decoder {
     session_params: vk::VideoSessionParametersKHR,
     session_memory: Vec<vk::DeviceMemory>,
     bitstream_align: u64,
+    bitstream_cap: usize,
     slots: Vec<DpbSlot>,
     coded_w: u32,
     coded_h: u32,
     crop: [u32; 4],
     bit_depth: u8,
-    bitstream: vk::Buffer,
-    bitstream_mem: vk::DeviceMemory,
-    bitstream_ptr: *mut u8,
-    bitstream_cap: usize,
-    readback: vk::Buffer,
-    readback_mem: vk::DeviceMemory,
+    ctxs: Vec<FrameCtx>,
+    /// Busy ctx indices in submission order (front = oldest).
+    inflight: std::collections::VecDeque<usize>,
     cmd_pool: vk::CommandPool,
-    cmd: vk::CommandBuffer,
-    fence: vk::Fence,
+    /// Accumulated wall time blocked in fence waits (diagnostic).
+    pub wait_s: f64,
     reset_done: bool,
     age_counter: u64,
     prev_poc_lsb: i32,
@@ -564,79 +583,113 @@ impl H265Decoder {
             });
         }
 
-        // Bitstream + readback buffers.
+        // Per-in-flight-frame bitstream + readback buffers and commands.
         let bytes_per_sample = if bit_depth == 10 { 2 } else { 1 } as usize;
         let bitstream_cap = 8 << 20;
-        let (bitstream, bitstream_mem, bitstream_ptr) = {
-            let mut plist = vk::VideoProfileListInfoKHR::default().profiles(&profiles);
-            let buffer = device.create_buffer(
-                &vk::BufferCreateInfo::default()
-                    .size(bitstream_cap as u64)
-                    .usage(vk::BufferUsageFlags::VIDEO_DECODE_SRC_KHR)
-                    .sharing_mode(vk::SharingMode::EXCLUSIVE)
-                    .push_next(&mut plist),
-                None,
-            )?;
-            let req = device.get_buffer_memory_requirements(buffer);
-            let type_idx = find_memory_type(
-                &mem_props,
-                req.memory_type_bits,
-                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-            )
-            .ok_or_else(|| NvDecError::Missing("host-visible bitstream memory".into()))?;
-            let mem = device.allocate_memory(
-                &vk::MemoryAllocateInfo::default()
-                    .allocation_size(req.size)
-                    .memory_type_index(type_idx),
-                None,
-            )?;
-            device.bind_buffer_memory(buffer, mem, 0)?;
-            let ptr =
-                device.map_memory(mem, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())? as *mut u8;
-            (buffer, mem, ptr)
-        };
         let readback_size = (coded_w as usize * coded_h as usize * 3 / 2) * bytes_per_sample;
-        let (readback, readback_mem) = {
-            let buffer = device.create_buffer(
-                &vk::BufferCreateInfo::default()
-                    .size(readback_size as u64)
-                    .usage(vk::BufferUsageFlags::TRANSFER_DST)
-                    .sharing_mode(vk::SharingMode::EXCLUSIVE),
-                None,
-            )?;
-            let req = device.get_buffer_memory_requirements(buffer);
-            let type_idx = find_memory_type(
-                &mem_props,
-                req.memory_type_bits,
-                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-            )
-            .ok_or_else(|| NvDecError::Missing("host-visible readback memory".into()))?;
-            let mem = device.allocate_memory(
-                &vk::MemoryAllocateInfo::default()
-                    .allocation_size(req.size)
-                    .memory_type_index(type_idx),
-                None,
-            )?;
-            device.bind_buffer_memory(buffer, mem, 0)?;
-            (buffer, mem)
-        };
-
         let cmd_pool = device.create_command_pool(
             &vk::CommandPoolCreateInfo::default()
                 .queue_family_index(queue_family)
                 .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER),
             None,
         )?;
-        let cmd = device.allocate_command_buffers(
+        // Depth override for determinism bisection (1 = fully serialized).
+        let inflight = std::env::var("SPLATTAR_DECODE_INFLIGHT")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .map_or(INFLIGHT, |v| v.clamp(1, 8));
+        let cmds = device.allocate_command_buffers(
             &vk::CommandBufferAllocateInfo::default()
                 .command_pool(cmd_pool)
                 .level(vk::CommandBufferLevel::PRIMARY)
-                .command_buffer_count(1),
-        )?[0];
-        let fence = device.create_fence(&vk::FenceCreateInfo::default(), None)?;
+                .command_buffer_count(inflight as u32),
+        )?;
+        let mut ctxs = Vec::with_capacity(inflight);
+        for cmd in cmds {
+            let (bitstream, bitstream_mem, bitstream_ptr) = {
+                let mut plist = vk::VideoProfileListInfoKHR::default().profiles(&profiles);
+                let buffer = device.create_buffer(
+                    &vk::BufferCreateInfo::default()
+                        .size(bitstream_cap as u64)
+                        .usage(vk::BufferUsageFlags::VIDEO_DECODE_SRC_KHR)
+                        .sharing_mode(vk::SharingMode::EXCLUSIVE)
+                        .push_next(&mut plist),
+                    None,
+                )?;
+                let req = device.get_buffer_memory_requirements(buffer);
+                let type_idx = find_memory_type(
+                    &mem_props,
+                    req.memory_type_bits,
+                    vk::MemoryPropertyFlags::HOST_VISIBLE
+                        | vk::MemoryPropertyFlags::HOST_COHERENT,
+                )
+                .ok_or_else(|| NvDecError::Missing("host-visible bitstream memory".into()))?;
+                let mem = device.allocate_memory(
+                    &vk::MemoryAllocateInfo::default()
+                        .allocation_size(req.size)
+                        .memory_type_index(type_idx),
+                    None,
+                )?;
+                device.bind_buffer_memory(buffer, mem, 0)?;
+                let ptr = device.map_memory(mem, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())?
+                    as *mut u8;
+                (buffer, mem, ptr)
+            };
+            let (readback, readback_mem, readback_ptr) = {
+                let buffer = device.create_buffer(
+                    &vk::BufferCreateInfo::default()
+                        .size(readback_size as u64)
+                        .usage(vk::BufferUsageFlags::TRANSFER_DST)
+                        .sharing_mode(vk::SharingMode::EXCLUSIVE),
+                    None,
+                )?;
+                let req = device.get_buffer_memory_requirements(buffer);
+                // HOST_CACHED first: the CPU READS this buffer every frame,
+                // and plain write-combined memory reads back at ~100 MB/s —
+                // measured as the dominant decode-thread cost.
+                let type_idx = find_memory_type(
+                    &mem_props,
+                    req.memory_type_bits,
+                    vk::MemoryPropertyFlags::HOST_VISIBLE
+                        | vk::MemoryPropertyFlags::HOST_COHERENT
+                        | vk::MemoryPropertyFlags::HOST_CACHED,
+                )
+                .or_else(|| {
+                    find_memory_type(
+                        &mem_props,
+                        req.memory_type_bits,
+                        vk::MemoryPropertyFlags::HOST_VISIBLE
+                            | vk::MemoryPropertyFlags::HOST_COHERENT,
+                    )
+                })
+                .ok_or_else(|| NvDecError::Missing("host-visible readback memory".into()))?;
+                let mem = device.allocate_memory(
+                    &vk::MemoryAllocateInfo::default()
+                        .allocation_size(req.size)
+                        .memory_type_index(type_idx),
+                    None,
+                )?;
+                device.bind_buffer_memory(buffer, mem, 0)?;
+                let ptr = device.map_memory(mem, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())?
+                    as *const u8;
+                (buffer, mem, ptr)
+            };
+            ctxs.push(FrameCtx {
+                cmd,
+                fence: device.create_fence(&vk::FenceCreateInfo::default(), None)?,
+                bitstream,
+                bitstream_mem,
+                bitstream_ptr,
+                readback,
+                readback_mem,
+                readback_ptr,
+                poc: 0,
+                busy: false,
+            });
+        }
 
         log::info!(
-            "nvdec-h265: session ready — {}x{} coded, {}-bit, {} DPB slots, coincide mode",
+            "nvdec-h265: session ready — {}x{} coded, {}-bit, {} DPB slots, {inflight} in flight, coincide mode",
             coded_w,
             coded_h,
             bit_depth,
@@ -654,20 +707,16 @@ impl H265Decoder {
             session_params,
             session_memory,
             bitstream_align,
+            bitstream_cap,
             slots,
             coded_w,
             coded_h,
             crop: sps.crop,
             bit_depth,
-            bitstream,
-            bitstream_mem,
-            bitstream_ptr,
-            bitstream_cap,
-            readback,
-            readback_mem,
+            ctxs,
+            inflight: std::collections::VecDeque::new(),
             cmd_pool,
-            cmd,
-            fence,
+            wait_s: 0.0,
             reset_done: false,
             age_counter: 0,
             prev_poc_lsb: 0,
@@ -702,21 +751,81 @@ impl H265Decoder {
         msb + lsb
     }
 
-    /// Decode one access unit's VCL NALs (raw, no start codes). Returns the
-    /// coded-size frame plus its PicOrderCntVal (for reorder bookkeeping).
-    pub fn decode(
+    /// Submit one access unit's VCL NALs (raw, no start codes) for decode.
+    /// Up to [`INFLIGHT`] submissions overlap on the GPU; when the ring is
+    /// full this returns the OLDEST completed frame (with its
+    /// PicOrderCntVal), otherwise None. Outputs arrive in submission order —
+    /// drain the tail with [`Self::drain`].
+    pub fn submit(
         &mut self,
         slices: &[&[u8]],
         header: &H265SliceHeader,
-    ) -> Result<(H265Frame, i32), NvDecError> {
-        unsafe { self.decode_impl(slices, header) }
+    ) -> Result<Option<(H265Frame, i32)>, NvDecError> {
+        unsafe { self.submit_impl(slices, header) }
     }
 
-    unsafe fn decode_impl(
+    /// Wait for and return the oldest in-flight frame (None when empty).
+    pub fn drain(&mut self) -> Result<Option<(H265Frame, i32)>, NvDecError> {
+        match self.inflight.pop_front() {
+            Some(idx) => unsafe { self.collect(idx).map(Some) },
+            None => Ok(None),
+        }
+    }
+
+    /// Wait the ctx's fence and lift its readback into an owned frame.
+    unsafe fn collect(&mut self, idx: usize) -> Result<(H265Frame, i32), NvDecError> {
+        let fence = self.ctxs[idx].fence;
+        let t = std::time::Instant::now();
+        self.device.wait_for_fences(&[fence], true, 10_000_000_000)?;
+        self.wait_s += t.elapsed().as_secs_f64();
+        self.device.reset_fences(&[fence])?;
+        let ctx = &mut self.ctxs[idx];
+        let bps = if self.bit_depth == 10 { 2usize } else { 1 };
+        let y_size = self.coded_w as usize * self.coded_h as usize * bps;
+        let uv_size = y_size / 2;
+        let mut y = vec![0u8; y_size];
+        let mut uv = vec![0u8; uv_size];
+        std::ptr::copy_nonoverlapping(ctx.readback_ptr, y.as_mut_ptr(), y_size);
+        std::ptr::copy_nonoverlapping(ctx.readback_ptr.add(y_size), uv.as_mut_ptr(), uv_size);
+        ctx.busy = false;
+        Ok((
+            H265Frame {
+                width: self.coded_w,
+                height: self.coded_h,
+                stride: self.coded_w,
+                bit_depth: self.bit_depth,
+                y,
+                uv,
+            },
+            ctx.poc,
+        ))
+    }
+
+    unsafe fn submit_impl(
         &mut self,
         slices: &[&[u8]],
         header: &H265SliceHeader,
-    ) -> Result<(H265Frame, i32), NvDecError> {
+    ) -> Result<Option<(H265Frame, i32)>, NvDecError> {
+        // Ring full → retire the oldest submission first (its ctx is reused
+        // for this frame).
+        let out = if self.inflight.len() >= self.ctxs.len() {
+            let oldest = self.inflight.pop_front().unwrap();
+            Some(self.collect(oldest)?)
+        } else {
+            None
+        };
+        let ctx_idx = self
+            .ctxs
+            .iter()
+            .position(|c| !c.busy)
+            .expect("free ctx after retire");
+        // Copy the ctx's Vulkan handles out (all Copy) so `self` stays free
+        // for the DPB bookkeeping below.
+        let (cmd, fence, bitstream, bitstream_ptr) = {
+            let c = &self.ctxs[ctx_idx];
+            (c.cmd, c.fence, c.bitstream, c.bitstream_ptr)
+        };
+
         let poc = self.compute_poc(header);
         if is_idr(header.nal_type) {
             for s in &mut self.slots {
@@ -790,12 +899,12 @@ impl H265Decoder {
             }
             std::ptr::copy_nonoverlapping(
                 [0u8, 0, 1].as_ptr(),
-                self.bitstream_ptr.add(cursor),
+                bitstream_ptr.add(cursor),
                 3,
             );
             std::ptr::copy_nonoverlapping(
                 nal.as_ptr(),
-                self.bitstream_ptr.add(cursor + 3),
+                bitstream_ptr.add(cursor + 3),
                 nal.len(),
             );
             cursor += total;
@@ -819,15 +928,41 @@ impl H265Decoder {
             });
 
         let device = &self.device;
-        device.reset_command_buffer(self.cmd, vk::CommandBufferResetFlags::empty())?;
+        device.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())?;
         device.begin_command_buffer(
-            self.cmd,
+            cmd,
             &vk::CommandBufferBeginInfo::default()
                 .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
         )?;
 
+        // Pipelined submissions: order this decode's reference reads after
+        // ALL prior decode writes on the queue (per-image barriers only cover
+        // the setup/copy-out images; reference reads need a global fence —
+        // without it, overlapped decodes race on DPB contents).
+        let all_decode = vk::MemoryBarrier2::default()
+            .src_stage_mask(vk::PipelineStageFlags2::VIDEO_DECODE_KHR)
+            .src_access_mask(vk::AccessFlags2::VIDEO_DECODE_WRITE_KHR)
+            .dst_stage_mask(vk::PipelineStageFlags2::VIDEO_DECODE_KHR)
+            .dst_access_mask(
+                vk::AccessFlags2::VIDEO_DECODE_READ_KHR | vk::AccessFlags2::VIDEO_DECODE_WRITE_KHR,
+            );
+        device.cmd_pipeline_barrier2(
+            cmd,
+            &vk::DependencyInfo::default().memory_barriers(std::slice::from_ref(&all_decode)),
+        );
+
+        // src covers prior IN-FLIGHT work that may still read this image
+        // (reference use by an earlier decode, or its own copy-out) — with
+        // pipelined submissions a bare NONE source would race them.
         let barrier = vk::ImageMemoryBarrier2::default()
-            .src_stage_mask(vk::PipelineStageFlags2::NONE)
+            .src_stage_mask(
+                vk::PipelineStageFlags2::VIDEO_DECODE_KHR | vk::PipelineStageFlags2::TRANSFER,
+            )
+            .src_access_mask(
+                vk::AccessFlags2::VIDEO_DECODE_READ_KHR
+                    | vk::AccessFlags2::VIDEO_DECODE_WRITE_KHR
+                    | vk::AccessFlags2::TRANSFER_READ,
+            )
             .dst_stage_mask(vk::PipelineStageFlags2::VIDEO_DECODE_KHR)
             .dst_access_mask(
                 vk::AccessFlags2::VIDEO_DECODE_READ_KHR | vk::AccessFlags2::VIDEO_DECODE_WRITE_KHR,
@@ -837,7 +972,7 @@ impl H265Decoder {
             .image(self.slots[setup_idx].image)
             .subresource_range(full_range());
         device.cmd_pipeline_barrier2(
-            self.cmd,
+            cmd,
             &vk::DependencyInfo::default().image_memory_barriers(std::slice::from_ref(&barrier)),
         );
 
@@ -895,11 +1030,11 @@ impl H265Decoder {
             .video_session(self.session)
             .video_session_parameters(self.session_params)
             .reference_slots(&begin_slots);
-        (self.video_queue_fns.fp().cmd_begin_video_coding_khr)(self.cmd, &begin_info);
+        (self.video_queue_fns.fp().cmd_begin_video_coding_khr)(cmd, &begin_info);
 
         if !self.reset_done {
             (self.video_queue_fns.fp().cmd_control_video_coding_khr)(
-                self.cmd,
+                cmd,
                 &vk::VideoCodingControlInfoKHR::default()
                     .flags(vk::VideoCodingControlFlagsKHR::RESET),
             );
@@ -952,7 +1087,7 @@ impl H265Decoder {
         }
 
         let mut decode_info = vk::VideoDecodeInfoKHR::default()
-            .src_buffer(self.bitstream)
+            .src_buffer(bitstream)
             .src_buffer_offset(0)
             .src_buffer_range(range)
             .dst_picture_resource(pic_resources[setup_idx])
@@ -961,10 +1096,10 @@ impl H265Decoder {
         if !decode_ref_slots.is_empty() {
             decode_info = decode_info.reference_slots(&decode_ref_slots);
         }
-        (self.decode_queue_fns.fp().cmd_decode_video_khr)(self.cmd, &decode_info);
+        (self.decode_queue_fns.fp().cmd_decode_video_khr)(cmd, &decode_info);
 
         (self.video_queue_fns.fp().cmd_end_video_coding_khr)(
-            self.cmd,
+            cmd,
             &vk::VideoEndCodingInfoKHR::default(),
         );
 
@@ -980,7 +1115,7 @@ impl H265Decoder {
             .image(self.slots[setup_idx].image)
             .subresource_range(full_range());
         device.cmd_pipeline_barrier2(
-            self.cmd,
+            cmd,
             &vk::DependencyInfo::default().image_memory_barriers(std::slice::from_ref(&to_src)),
         );
         let regions = [
@@ -1020,10 +1155,10 @@ impl H265Decoder {
             },
         ];
         device.cmd_copy_image_to_buffer(
-            self.cmd,
+            cmd,
             self.slots[setup_idx].image,
             vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-            self.readback,
+            self.ctxs[ctx_idx].readback,
             &regions,
         );
         let back_to_dpb = vk::ImageMemoryBarrier2::default()
@@ -1038,18 +1173,19 @@ impl H265Decoder {
             .image(self.slots[setup_idx].image)
             .subresource_range(full_range());
         device.cmd_pipeline_barrier2(
-            self.cmd,
+            cmd,
             &vk::DependencyInfo::default()
                 .image_memory_barriers(std::slice::from_ref(&back_to_dpb)),
         );
 
-        device.end_command_buffer(self.cmd)?;
-        let cmds = [self.cmd];
+        device.end_command_buffer(cmd)?;
+        let cmds = [cmd];
         let submit = vk::SubmitInfo::default().command_buffers(&cmds);
-        device.queue_submit(self.queue, &[submit], self.fence)?;
-        device.wait_for_fences(&[self.fence], true, 10_000_000_000)?;
-        device.reset_fences(&[self.fence])?;
+        device.queue_submit(self.queue, &[submit], fence)?;
 
+        // CPU-side DPB bookkeeping happens at SUBMISSION time (the next
+        // frame's RPS resolution needs it); the GPU executes submissions in
+        // order, so reference contents are ready when its decode runs.
         self.age_counter += 1;
         {
             let slot = &mut self.slots[setup_idx];
@@ -1057,33 +1193,13 @@ impl H265Decoder {
             slot.poc = poc;
             slot.age = self.age_counter;
         }
-
-        let mapped = device.map_memory(
-            self.readback_mem,
-            0,
-            vk::WHOLE_SIZE,
-            vk::MemoryMapFlags::empty(),
-        )? as *const u8;
-        let bps = bytes_per_sample as usize;
-        let y_size = self.coded_w as usize * self.coded_h as usize * bps;
-        let uv_size = y_size / 2;
-        let mut y = vec![0u8; y_size];
-        let mut uv = vec![0u8; uv_size];
-        std::ptr::copy_nonoverlapping(mapped, y.as_mut_ptr(), y_size);
-        std::ptr::copy_nonoverlapping(mapped.add(y_size), uv.as_mut_ptr(), uv_size);
-        device.unmap_memory(self.readback_mem);
-
-        Ok((
-            H265Frame {
-                width: self.coded_w,
-                height: self.coded_h,
-                stride: self.coded_w,
-                bit_depth: self.bit_depth,
-                y,
-                uv,
-            },
-            poc,
-        ))
+        {
+            let ctx = &mut self.ctxs[ctx_idx];
+            ctx.poc = poc;
+            ctx.busy = true;
+        }
+        self.inflight.push_back(ctx_idx);
+        Ok(out)
     }
 
     /// Display size after the conformance window (luma pixels).
@@ -1103,13 +1219,16 @@ impl Drop for H265Decoder {
     fn drop(&mut self) {
         unsafe {
             let _ = self.device.device_wait_idle();
-            self.device.destroy_fence(self.fence, None);
+            for ctx in &self.ctxs {
+                self.device.destroy_fence(ctx.fence, None);
+                self.device.unmap_memory(ctx.readback_mem);
+                self.device.destroy_buffer(ctx.readback, None);
+                self.device.free_memory(ctx.readback_mem, None);
+                self.device.unmap_memory(ctx.bitstream_mem);
+                self.device.destroy_buffer(ctx.bitstream, None);
+                self.device.free_memory(ctx.bitstream_mem, None);
+            }
             self.device.destroy_command_pool(self.cmd_pool, None);
-            self.device.destroy_buffer(self.readback, None);
-            self.device.free_memory(self.readback_mem, None);
-            self.device.unmap_memory(self.bitstream_mem);
-            self.device.destroy_buffer(self.bitstream, None);
-            self.device.free_memory(self.bitstream_mem, None);
             for slot in &self.slots {
                 self.device.destroy_image_view(slot.view, None);
                 self.device.destroy_image(slot.image, None);

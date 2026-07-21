@@ -459,21 +459,46 @@ fn run_vo(
 
     let mut sent = 0u64;
     let mut sent_size = (0u32, 0u32);
-    while let Some(frame) = reader.next_frame().context("decode")? {
+    let (mut decode_s, mut send_s) = (0.0f64, 0.0f64);
+    // Debug isolation: FNV over every decoded luma plane, to tell decode
+    // nondeterminism from tracking nondeterminism.
+    let hash_decode = std::env::var_os("SPLATTAR_HASH_DECODE").is_some();
+    let mut fnv = 0xcbf29ce484222325u64;
+    loop {
+        let t = std::time::Instant::now();
+        let Some(frame) = reader.next_frame().context("decode")? else { break };
+        decode_s += t.elapsed().as_secs_f64();
+        if hash_decode {
+            for &b in &frame.y {
+                fnv = (fnv ^ b as u64).wrapping_mul(0x100000001b3);
+            }
+        }
         sent_size = (frame.width, frame.height);
         if sent == 0 {
             log::info!("video {}x{}", frame.width, frame.height);
         }
-        if raw_tx
+        let t = std::time::Instant::now();
+        let sent_ok = raw_tx
             .send((sent, frame.y, frame.width, frame.height, frame.pts))
-            .is_err()
-        {
+            .is_ok();
+        send_s += t.elapsed().as_secs_f64();
+        if !sent_ok {
             break; // pipeline died; the panic resurfaces at join
         }
         sent += 1;
         if max_frames > 0 && sent >= max_frames as u64 {
             break;
         }
+    }
+    if hash_decode {
+        log::info!("decoded-luma FNV: {fnv:016x}");
+    }
+    if let Some((read, submit, wait, post)) = reader.decode_timing() {
+        log::info!(
+            "decode thread: {decode_s:.1}s in next_frame ({read:.1} read / {submit:.1} submit / {wait:.1} fence-wait / {post:.1} post), {send_s:.1}s blocked on send"
+        );
+    } else {
+        log::info!("decode thread: {decode_s:.1}s in next_frame, {send_s:.1}s blocked on send");
     }
     let video_size = (sent_size.0, sent_size.1);
     drop(raw_tx);
@@ -500,6 +525,14 @@ fn run_vo(
         tm.desc_s,
         tm.detect_s
     );
+    if let (Ok(path), Some(trace)) = (std::env::var("SPLATTAR_KF_TRACE"), &fe.kf_trace) {
+        let mut s = String::new();
+        for (i, (flow, surv, live)) in trace.iter().enumerate() {
+            s.push_str(&format!("{i},{flow},{surv},{live}\n"));
+        }
+        let _ = std::fs::write(&path, s);
+        log::info!("kf trace written to {path}");
+    }
 
     let t1 = std::time::Instant::now();
     let segments = fe.solve_segments();

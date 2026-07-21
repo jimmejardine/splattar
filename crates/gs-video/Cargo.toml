@@ -12,6 +12,7 @@ mp4 = { workspace = true }
 ash = { workspace = true }
 log = { workspace = true }
 thiserror = { workspace = true }
+rayon = { workspace = true }
 
 [dev-dependencies]
 image = { workspace = true }

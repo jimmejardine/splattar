@@ -58,6 +58,15 @@ impl VideoReader {
             Self::H265(r) => r.next_frame(),
         }
     }
+
+    /// Decode-stage timing (container read, submit, fence wait,
+    /// post-process) — HEVC path only.
+    pub fn decode_timing(&self) -> Option<(f64, f64, f64, f64)> {
+        match self {
+            Self::H264(_) => None,
+            Self::H265(r) => Some(r.decode_timing()),
+        }
+    }
 }
 
 pub struct H264Reader {
@@ -284,8 +293,18 @@ pub struct Mp4H265Reader {
     /// newer ones exist, then emitted in PTS order.
     pending: Vec<DecodedFrame>,
     reorder_depth: usize,
+    /// PTS of submitted-but-not-yet-retired decodes, in submission order —
+    /// the pipelined decoder returns frames a few submissions late, and its
+    /// outputs arrive strictly in submission order.
+    pts_queue: std::collections::VecDeque<f64>,
     /// Display rotation (degrees CW) from the tkhd matrix.
     rotation: u32,
+    /// Accumulated wall time per stage (diagnostic): container read, decode
+    /// submit, post-processing (crop/fold/rotate). Fence-wait time lives on
+    /// the decoder (`wait_s`).
+    t_read: f64,
+    t_submit: f64,
+    t_post: f64,
 }
 
 impl Mp4H265Reader {
@@ -344,8 +363,17 @@ impl Mp4H265Reader {
             wide_gamut,
             pending: Vec::new(),
             reorder_depth,
+            pts_queue: std::collections::VecDeque::new(),
             rotation: info.rotation,
+            t_read: 0.0,
+            t_submit: 0.0,
+            t_post: 0.0,
         })
+    }
+
+    /// (container read, submit, fence wait, post-process) seconds so far.
+    pub fn decode_timing(&self) -> (f64, f64, f64, f64) {
+        (self.t_read, self.t_submit, self.decoder.wait_s, self.t_post)
     }
 
     pub fn sample_count(&self) -> u32 {
@@ -363,16 +391,39 @@ impl Mp4H265Reader {
         Some(self.pending.swap_remove(idx))
     }
 
+    /// Retire one completed decode from the pipelined decoder into the
+    /// reorder queue. Outputs arrive in submission order, so the front of
+    /// `pts_queue` is always the retired frame's PTS.
+    fn retire(&mut self, frame: crate::nvdec_h265::H265Frame) {
+        let t = std::time::Instant::now();
+        let pts = self.pts_queue.pop_front().expect("pts for retired frame");
+        let decoded = apply_rotation(self.to_display(frame, pts), self.rotation);
+        self.pending.push(decoded);
+        self.t_post += t.elapsed().as_secs_f64();
+    }
+
     pub fn next_frame(&mut self) -> Result<Option<DecodedFrame>, VideoError> {
         use crate::h265;
         loop {
             if self.next_sample >= self.sample_count {
-                return Ok(self.pop_earliest()); // drain the reorder queue
+                // Drain the decoder's in-flight ring, then the reorder queue.
+                while let Some((frame, _poc)) =
+                    self.decoder.drain().map_err(|e| VideoError::Decode {
+                        sample: self.next_sample,
+                        message: e.to_string(),
+                    })?
+                {
+                    self.retire(frame);
+                }
+                return Ok(self.pop_earliest());
             }
             self.next_sample += 1;
             let sample_id = self.next_sample;
-            let Some(sample) = self.mp4.read_sample(self.track_id, sample_id)? else {
-                return Ok(self.pop_earliest());
+            let t = std::time::Instant::now();
+            let sample = self.mp4.read_sample(self.track_id, sample_id)?;
+            self.t_read += t.elapsed().as_secs_f64();
+            let Some(sample) = sample else {
+                continue; // fall through to EOS drain on the next iteration
             };
             let pts =
                 (sample.start_time as f64 + sample.rendering_offset as f64) / self.timescale;
@@ -407,13 +458,20 @@ impl Mp4H265Reader {
                     message: format!("slice header: {e}"),
                 }
             })?;
-            let (frame, _poc) =
-                self.decoder.decode(&slices, &header).map_err(|e| VideoError::Decode {
+            // Pipelined submit: the returned frame (if any) is an OLDER
+            // submission retiring; this sample's own frame surfaces a few
+            // calls later.
+            self.pts_queue.push_back(pts);
+            let t = std::time::Instant::now();
+            let retired =
+                self.decoder.submit(&slices, &header).map_err(|e| VideoError::Decode {
                     sample: sample_id,
                     message: e.to_string(),
                 })?;
-            let decoded = apply_rotation(self.to_display(frame, pts), self.rotation);
-            self.pending.push(decoded);
+            self.t_submit += t.elapsed().as_secs_f64();
+            if let Some((frame, _poc)) = retired {
+                self.retire(frame);
+            }
             if self.pending.len() > self.reorder_depth {
                 return Ok(self.pop_earliest());
             }
@@ -433,57 +491,68 @@ impl Mp4H265Reader {
         let mut u = vec![0u8; cw * ch];
         let mut v = vec![0u8; cw * ch];
 
+        // Row-parallel: this conversion runs on the decode thread and was
+        // measured as (part of) the causal-pass wall on HEVC clips.
+        use rayon::prelude::*;
         if frame.bit_depth == 8 {
-            for row in 0..hu {
+            y.par_chunks_mut(wu).enumerate().for_each(|(row, dst)| {
                 let src = (y0u + row) * stride + x0u;
-                y[row * wu..(row + 1) * wu].copy_from_slice(&frame.y[src..src + wu]);
-            }
-            for row in 0..ch {
-                let src = (y0u / 2 + row) * stride + (x0u & !1);
-                for col in 0..cw {
-                    u[row * cw + col] = frame.uv[src + 2 * col];
-                    v[row * cw + col] = frame.uv[src + 2 * col + 1];
-                }
-            }
+                dst.copy_from_slice(&frame.y[src..src + wu]);
+            });
+            u.par_chunks_mut(cw)
+                .zip(v.par_chunks_mut(cw))
+                .enumerate()
+                .for_each(|(row, (ur, vr))| {
+                    let src = (y0u / 2 + row) * stride + (x0u & !1);
+                    for col in 0..cw {
+                        ur[col] = frame.uv[src + 2 * col];
+                        vr[col] = frame.uv[src + 2 * col + 1];
+                    }
+                });
         } else {
             // 10-bit X6-packed (value in the top 10 bits of each u16 LE).
             let y16 = le_u16(&frame.y);
             let uv16 = le_u16(&frame.uv);
             let (y16, uv16) = (&y16[..], &uv16[..]);
             let sample = |plane: &[u16], idx: usize| -> u16 { plane[idx] >> 6 };
-            for row in 0..hu {
+            let wide = self.wide_gamut;
+            y.par_chunks_mut(wu).enumerate().for_each(|(row, dst)| {
                 let ysrc = (y0u + row) * stride + x0u;
                 let csrc = (y0u / 2 + row / 2) * stride + (x0u & !1);
-                for col in 0..wu {
+                for (col, d) in dst.iter_mut().enumerate() {
                     let y10 = sample(y16, ysrc + col);
-                    if self.wide_gamut {
+                    if wide {
                         let cb10 = sample(uv16, csrc + (col & !1));
                         let cr10 = sample(uv16, csrc + (col & !1) + 1);
                         let (y8, _, _) = crate::color::px2020_10_to_709_8(y10, cb10, cr10);
-                        y[row * wu + col] = y8;
+                        *d = y8;
                     } else {
-                        y[row * wu + col] = (y10 >> 2) as u8;
+                        *d = (y10 >> 2) as u8;
                     }
                 }
-            }
-            for row in 0..ch {
-                let csrc = (y0u / 2 + row) * stride + (x0u & !1);
-                // Luma sample co-sited with this chroma pair, for the fold.
-                let ysrc = (y0u + row * 2) * stride + x0u;
-                for col in 0..cw {
-                    let cb10 = sample(uv16, csrc + 2 * col);
-                    let cr10 = sample(uv16, csrc + 2 * col + 1);
-                    if self.wide_gamut {
-                        let y10 = sample(y16, ysrc + 2 * col);
-                        let (_, cb8, cr8) = crate::color::px2020_10_to_709_8(y10, cb10, cr10);
-                        u[row * cw + col] = cb8;
-                        v[row * cw + col] = cr8;
-                    } else {
-                        u[row * cw + col] = (cb10 >> 2) as u8;
-                        v[row * cw + col] = (cr10 >> 2) as u8;
+            });
+            u.par_chunks_mut(cw)
+                .zip(v.par_chunks_mut(cw))
+                .enumerate()
+                .for_each(|(row, (ur, vr))| {
+                    let csrc = (y0u / 2 + row) * stride + (x0u & !1);
+                    // Luma sample co-sited with this chroma pair, for the fold.
+                    let ysrc = (y0u + row * 2) * stride + x0u;
+                    for col in 0..cw {
+                        let cb10 = sample(uv16, csrc + 2 * col);
+                        let cr10 = sample(uv16, csrc + 2 * col + 1);
+                        if wide {
+                            let y10 = sample(y16, ysrc + 2 * col);
+                            let (_, cb8, cr8) =
+                                crate::color::px2020_10_to_709_8(y10, cb10, cr10);
+                            ur[col] = cb8;
+                            vr[col] = cr8;
+                        } else {
+                            ur[col] = (cb10 >> 2) as u8;
+                            vr[col] = (cr10 >> 2) as u8;
+                        }
                     }
-                }
-            }
+                });
         }
         DecodedFrame {
             pts,
@@ -519,15 +588,17 @@ pub(crate) fn rotation_from_matrix(a: i32, b: i32, c: i32, d: i32) -> u32 {
 }
 
 fn rotate_plane(src: &[u8], w: usize, h: usize, rot: u32) -> Vec<u8> {
+    use rayon::prelude::*;
     let mut dst = vec![0u8; w * h];
     match rot {
         90 => {
-            // Clockwise: (x, y) → (h−1−y, x) in an h×w image.
-            for y in 0..h {
-                for x in 0..w {
-                    dst[x * h + (h - 1 - y)] = src[y * w + x];
+            // Clockwise: (x, y) → (h−1−y, x) in an h×w image. Parallel over
+            // destination rows (each reads one strided source column).
+            dst.par_chunks_mut(h).enumerate().for_each(|(x, drow)| {
+                for y in 0..h {
+                    drow[h - 1 - y] = src[y * w + x];
                 }
-            }
+            });
         }
         180 => {
             for (d, s) in dst.iter_mut().zip(src.iter().rev()) {
@@ -535,11 +606,12 @@ fn rotate_plane(src: &[u8], w: usize, h: usize, rot: u32) -> Vec<u8> {
             }
         }
         270 => {
-            for y in 0..h {
-                for x in 0..w {
-                    dst[(w - 1 - x) * h + y] = src[y * w + x];
+            dst.par_chunks_mut(h).enumerate().for_each(|(i, drow)| {
+                let x = w - 1 - i;
+                for (y, d) in drow.iter_mut().enumerate() {
+                    *d = src[y * w + x];
                 }
-            }
+            });
         }
         _ => dst.copy_from_slice(src),
     }

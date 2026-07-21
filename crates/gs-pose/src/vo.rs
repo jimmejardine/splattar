@@ -117,6 +117,9 @@ struct Track {
     obs_desc: Vec<crate::descriptor::MultiDescriptor>,
     /// Landmark index once triangulated.
     landmark: Option<usize>,
+    /// Spawn order — restores the exact historical track order when the
+    /// dead-track archive is merged back for the solve.
+    seq: u32,
 }
 
 pub struct Keyframe {
@@ -198,7 +201,14 @@ pub struct VoFrontEnd {
     cfg: VoConfig,
     prev: Option<Pyramid>,
     prev_median_flow: (f32, f32),
+    /// Live tracks (plus dead ones awaiting the next promotion). Dead tracks
+    /// with solvable geometry move to `archive` at promotions so the
+    /// per-frame KLT fan-out and statistics stay O(live) — on a long clip
+    /// the total track count reaches tens of thousands.
     tracks: Vec<Track>,
+    /// Dead tracks with ≥2 observations, kept for the solve.
+    archive: Vec<Track>,
+    next_seq: u32,
     pub keyframes: Vec<Keyframe>,
     n_frames: usize,
     frame_pts: Vec<f64>,
@@ -210,6 +220,9 @@ pub struct VoFrontEnd {
     kf_flow_px: f32,
     pub promotions: PromotionStats,
     pub timing: CausalTiming,
+    /// Per-frame (median flow, survival, live tracks) when `SPLATTAR_KF_TRACE`
+    /// is set — diffing two runs pinpoints the first nondeterministic frame.
+    pub kf_trace: Option<Vec<(f32, f32, u32)>>,
 }
 
 impl VoFrontEnd {
@@ -219,6 +232,8 @@ impl VoFrontEnd {
             prev: None,
             prev_median_flow: (0.0, 0.0),
             tracks: Vec::new(),
+            archive: Vec::new(),
+            next_seq: 0,
             keyframes: Vec::new(),
             n_frames: 0,
             frame_pts: Vec::new(),
@@ -227,6 +242,7 @@ impl VoFrontEnd {
             kf_flow_px: 0.0,
             promotions: PromotionStats::default(),
             timing: CausalTiming::default(),
+            kf_trace: std::env::var_os("SPLATTAR_KF_TRACE").map(|_| Vec::new()),
         }
     }
 
@@ -318,6 +334,12 @@ impl VoFrontEnd {
         // Keyframe decision (reasons counted for the causal summary log).
         let is_first = self.keyframes.is_empty();
         let (flow_med, survival) = self.kf_statistics();
+        if self.kf_trace.is_some() {
+            let live = self.live_count() as u32;
+            if let Some(trace) = &mut self.kf_trace {
+                trace.push((flow_med, survival, live));
+            }
+        }
         let promote = is_first
             || flow_med >= self.kf_flow_px
             || survival < self.cfg.kf_survival
@@ -377,9 +399,13 @@ impl VoFrontEnd {
                 tr.at_last_kf = tr.cur;
             }
             // Drop dead tracks that never got a second observation — they
-            // can't contribute geometry and bloat the causal pass.
+            // can't contribute geometry and bloat the causal pass — and
+            // archive the solvable dead ones (order-preserving on both
+            // sides; the solve merges them back in spawn order).
             self.tracks
                 .retain(|t| t.cur.is_some() || t.obs.len() >= 2);
+            self.archive
+                .extend(self.tracks.extract_if(.., |t| t.cur.is_none()));
             self.timing.desc_s += t_desc.elapsed().as_secs_f64();
             // Spawn fresh corners away from live tracks.
             let t_detect = std::time::Instant::now();
@@ -400,7 +426,9 @@ impl VoFrontEnd {
                     obs: vec![(kf_idx, (c.x, c.y))],
                     obs_desc: vec![d],
                     landmark: None,
+                    seq: self.next_seq,
                 });
+                self.next_seq += 1;
             }
         }
         self.prev = Some(pyr);
@@ -479,6 +507,14 @@ impl VoFrontEnd {
     /// boundaries land on low-quality footage by construction. Returned in
     /// temporal order.
     pub fn solve_segments(&mut self) -> Vec<VoResult> {
+        // Merge the dead-track archive back in exact spawn order — the solve
+        // then sees the same track vector the un-archived front-end built.
+        if !self.archive.is_empty() {
+            let mut all = std::mem::take(&mut self.archive);
+            all.append(&mut self.tracks);
+            all.sort_by_key(|t| t.seq);
+            self.tracks = all;
+        }
         /// Ranges shorter than this can't bootstrap + margin meaningfully.
         /// (Deliberately permissive — downstream training applies its own
         /// minimum view/landmark counts before a sliver becomes a submap.)

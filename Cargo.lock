@@ -1312,6 +1312,7 @@ dependencies = [
  "image",
  "log",
  "mp4",
+ "rayon",
  "thiserror 2.0.19",
 ]
 
