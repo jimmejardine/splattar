@@ -558,3 +558,32 @@ training. The `gs-cpu-ref` aux-loss gradient check verifies the kernel against a
 CPU port of the SAME convention, so a weighting-contract violation between
 trainer and kernel is invisible to it. Needed: a training test with geo losses
 ON asserting PSNR stays within ~0.5 dB of the geo-off baseline.
+
+### HEVC decode round: the wall was write-combined memory, not NVDEC (2026-07-21)
+
+Pipelined the H.265 Vulkan Video decoder (ring of in-flight frame
+contexts — own command buffer/fence/bitstream/persistently-mapped
+readback; submit/drain API with a PTS queue in the reader; global
+decode→decode memory barrier so overlapped submissions can't race on
+DPB contents; `SPLATTAR_DECODE_INFLIGHT` override). Instrumentation
+(read/submit/fence-wait/post split, logged per run) then showed fence
+waits were ~0.1 s — the actual cost was reading 1.4 MB/frame back
+through WRITE-COMBINED host memory (~74 s of the 88 s decode thread on
+the 4,315-frame clip). Fix: request HOST_VISIBLE|COHERENT|CACHED
+readback memory first. With row-parallel to_display/rotation and the
+VO dead-track archive (per-frame scans O(live), merged back in exact
+spawn order for the solve), the back-room clip's causal pass went
+**47 → 130+ fps**; full VO ≈ 2.5 min (was ~13.5 min this morning).
+Decode output proven bit-identical across runs (luma FNV).
+
+Open item — rare tracking-side nondeterminism (~1 run in 30): keyframe
+count flips by a few; one caught trace shows a normal borderline-motion
+frame whose KLT outcome differed wholesale (217 vs 133 survivors).
+Ruled out: decode (pixels hash-equal; flips also at INFLIGHT=1),
+thread-count variation (all reductions index-ordered). Tooling in
+place: `SPLATTAR_KF_TRACE` writes per-frame flow/survival/live +
+tracking-res luma FNV (prep-side, ~free), `SPLATTAR_CAUSAL_ONLY` skips
+the solve for fast hammering — diff two runs to the first divergent
+frame; the hash column attributes it to pixels vs tracking state. An
+absolute mass-death tripwire was tried and removed: 30–50% single-frame
+track loss is NORMAL during fast pans on this footage.
