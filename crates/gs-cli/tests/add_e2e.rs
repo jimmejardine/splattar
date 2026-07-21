@@ -99,6 +99,11 @@ fn hevc_three_segments_bridge() {
     let edges = read_edges(&project);
     assert_eq!(edges.len(), 3, "expected 3 submaps (3 VO segments)");
     let comps = component_count(&edges);
+    // INTENTIONALLY RED (2026-07-21): this clip's segment cuts are whip pans,
+    // where bridging is a documented negative result (RESULTS.md "segment
+    // bridging — instrumented negative result"; next lever: full-res pairwise
+    // matching). This is the acceptance gate for that work — make bridging
+    // succeed, don't loosen the assert.
     assert!(
         comps < 3,
         "temporal bridges should connect same-video segments (got {comps} components)"

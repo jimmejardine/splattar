@@ -379,3 +379,17 @@ registration RANSACs per component — pooling matches across components
 would mix unrelated gauges into one model. Ingestion order now affects
 only submap indices and layout, never connectivity; the
 `order_independence_cross_video` e2e test pins this on the Android pair.
+
+### First `add` e2e run: order independence holds; bridge gate red by design (2026-07-21)
+
+The two ignored gates in `gs-cli/tests/add_e2e.rs` ran end-to-end (51 min
+total). `order_independence_cross_video` PASSED: ingesting 1.mp4/2.mp4 in
+both orders produces identical structure — 11 submaps in 11 components
+either way. (Side observation: the pair used to solve as 4 segments; the
+five-point bootstrap now solves 11, picking up previously
+un-bootstrappable ranges.) `hevc_three_segments_bridge` is RED as
+expected: the back-room clip's 3 segments stay 3 components because its
+cuts are whip pans — the instrumented negative documented above ("segment
+bridging"). The strict `components < 3` assert is kept deliberately as
+the acceptance gate for the full-res pairwise-matching work; make
+bridging succeed rather than loosening the test.
