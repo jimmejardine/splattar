@@ -583,6 +583,9 @@ fn train_and_bake(
         // perturbed poses).
         pose_refine_lr: 2e-3,
         pose_refine_start: 500,
+        // Stop refining at mid-training so the back half converges against
+        // settled cameras (otherwise held-out collapses while train fits).
+        pose_refine_end: iters / 2,
         focal_refine: true,
         // Phone auto-exposure sweeps continuously — compensate per view.
         appearance_start: 300,
@@ -614,7 +617,7 @@ fn train_and_bake(
         // frozen eval cameras measure gauge drift, not model quality — align
         // each eval pose photometrically to the frozen model before scoring.
         let raw = trainer.eval_psnr(&ctx, &eval_views);
-        let refined = trainer.eval_psnr_refined(&ctx, &eval_views, 40);
+        let refined = trainer.eval_psnr_refined(&ctx, &eval_views, 100);
         log::info!("held-out PSNR: {raw:.2} dB raw poses, {refined:.2} dB pose-aligned");
         refined
     };

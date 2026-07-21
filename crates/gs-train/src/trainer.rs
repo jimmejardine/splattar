@@ -58,6 +58,10 @@ pub struct TrainConfig {
     /// Iteration at which pose refinement starts (the model must be good
     /// enough first that pose gradients point somewhere sensible).
     pub pose_refine_start: u32,
+    /// Iteration at which pose refinement stops. Long runs otherwise walk
+    /// the camera gauge all the way to the end and the model overfits a
+    /// moving target: train loss stays great, held-out collapses.
+    pub pose_refine_end: u32,
     /// Also refine the (shared) focal length in log-space.
     pub focal_refine: bool,
     /// Iteration at which per-view affine appearance compensation starts
@@ -93,6 +97,7 @@ impl Default for TrainConfig {
             mcmc_noise: 0.0,
             pose_refine_lr: 0.0,
             pose_refine_start: 500,
+            pose_refine_end: u32::MAX,
             focal_refine: false,
             appearance_start: u32::MAX,
         }
@@ -482,7 +487,10 @@ impl Trainer {
         // the host and Adam-step this view's rotation/center + shared focal.
         // LR decays with the same schedule as positions so late training
         // stops jittering converged cameras.
-        if self.config.pose_refine_lr > 0.0 && iter >= self.config.pose_refine_start {
+        if self.config.pose_refine_lr > 0.0
+            && iter >= self.config.pose_refine_start
+            && iter < self.config.pose_refine_end
+        {
             let decay = self.config.pos_lr_final_factor.powf(t);
             self.refine_pose(ctx, view_idx, &camera, decay);
         }
