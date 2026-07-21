@@ -83,11 +83,9 @@ fn orbit_camera(angle: f32, height: f32, dist: f32) -> RasterCamera {
     }
 }
 
-// ~45 s on the dev GPU — gated behind --ignored so routine development
-// doesn't pay for it. Run explicitly (also part of milestone acceptance):
-//   cargo test -p gs-train --release --test train_synthetic -- --ignored --nocapture
+// In the fast gate since the 2026-07 perf overhaul (~10 s on the dev GPU;
+// was ~45 s). Requires a GPU adapter — skips cleanly otherwise.
 #[test]
-#[ignore = "slow end-to-end training (~45 s GPU); run with --ignored"]
 fn trains_synthetic_scene_from_scratch() {
     let Some(ctx) = context() else { return };
 
@@ -156,8 +154,8 @@ fn trains_synthetic_scene_from_scratch() {
 /// M4 gate: with distortion + normal-consistency losses, regularizers, MCMC
 /// relocation/noise, and progressive SH all enabled, training must still
 /// converge to at least the M3-level bar at the same fixed budget.
+// In the fast gate since the 2026-07 perf overhaul (~9 s on the dev GPU).
 #[test]
-#[ignore = "slow end-to-end training (~45 s GPU); run with --ignored"]
 fn trains_with_m4_features_enabled() {
     let Some(ctx) = context() else { return };
 
@@ -228,7 +226,7 @@ fn trains_with_m4_features_enabled() {
 /// center error (like monocular VO noise). Without refinement this caps PSNR
 /// hard; with refinement the trainer should climb back near the clean bar.
 #[test]
-#[ignore = "slow end-to-end training (~90 s GPU); run with --ignored"]
+#[ignore = "slow end-to-end training (~17 s GPU, more under load); run with --ignored"]
 fn pose_refinement_recovers_perturbed_poses() {
     let Some(ctx) = context() else { return };
 
@@ -325,7 +323,7 @@ fn pose_refinement_recovers_perturbed_poses() {
 /// compensation the model averages exposures; with it, PSNR should recover
 /// most of the gap to the clean bar.
 #[test]
-#[ignore = "slow end-to-end training (~90 s GPU); run with --ignored"]
+#[ignore = "slow end-to-end training (two runs, ~25 s release / ~50 s dev GPU); run with --ignored"]
 fn appearance_compensation_recovers_exposure_swings() {
     let Some(ctx) = context() else { return };
 

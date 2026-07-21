@@ -23,9 +23,9 @@ fn gray(frame: &gs_video::DecodedFrame) -> GrayImage {
 }
 
 /// Diagnostic: frame-to-frame KLT survival on raw consecutive frames.
-/// Slow (decodes + tracks 40 frames): `cargo test -- --ignored`.
+/// In the fast gate since the 2026-07 perf overhaul (~14 s; was ~30 s).
+/// Needs the sample video + NVDEC — skips cleanly otherwise.
 #[test]
-#[ignore = "slow: real-video decode + tracking (~30 s)"]
 fn tracking_survival_diagnostic() {
     let Some(path) = sample() else { return };
     let mut reader = gs_video::Mp4H264Reader::open(&path).expect("open");
@@ -78,7 +78,7 @@ fn tracking_survival_diagnostic() {
 /// The M6 real-footage gate: causal pass + anchor-out solve succeed on the
 /// first 20 s of the walkthrough with a healthy solved ratio.
 #[test]
-#[ignore = "slow: full VO on 600 real frames (minutes)"]
+#[ignore = "slow: full VO on 600 real frames (~45 s since the 2026-07 overhaul); run with --ignored"]
 fn vo_solves_android_walkthrough() {
     let Some(path) = sample() else { return };
     let mut reader = gs_video::Mp4H264Reader::open(&path).expect("open");
