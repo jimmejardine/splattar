@@ -448,3 +448,61 @@ Next levers, in order of what the profiles say: (1) NVDEC H.265
 pipelining (frames in flight) for HEVC-bound clips; (2) GPU KLT (WGSL
 LK) for the spine-bound half; (3) descriptor cadence (obs_desc every
 keyframe is 25% of the spine and mostly unused downstream).
+
+## Convergence investigation — the trainer, not the poses (2026-07-21)
+
+Triggered by "a single room does not converge to anything visually
+identifiable". Bisected by holding one side perfect and measuring the other.
+
+**VO is healthy.** `add` on the back-room clip: 377/377 keyframes solved in
+one segment, 10,111 landmarks, 22 s. Not the bottleneck.
+
+**A real convention bug, small effect.** `KeyframePose::c2w()` transposed the
+camera-to-world rotation twice, so every training view saw an inverted camera
+(fixed; now pinned by `gs-pose/tests/c2w_convention.rs`). A/B on identical
+clip + config: **14.88 → 15.74 dB** (+0.86). Real, but not the cause.
+
+**The trainer plateaus at ~19 dB with PERFECT poses.** `train datasets/room`
+(mip-NeRF360, COLMAP poses and intrinsics, 779×519, 39 held-out views) —
+reference 2DGS/3DGS implementations reach 28-31 dB on this scene:
+
+| config | held-out PSNR |
+|---|---|
+| 3k iters, 150k budget, mcmc_noise 20 (default) | 19.51 dB |
+| 3k iters, 150k, mcmc_noise 0 | 19.43 dB |
+| 6k iters, 300k, MCMC relocation AND noise off | 19.15 dB |
+| 12k iters, 300k | **17.82 dB** (worse than 3k) |
+| 3k iters, 150k, splat radius cap 64→512 px | 14.39 dB (worse) |
+
+The plateau is insensitive to iteration count, surfel budget, and MCMC; more
+training does not help and can hurt. LRs match the 3DGS reference values
+(pos 1.6e-4×extent, scales 5e-3, quat 1e-3, opacity 5e-2, sh 2.5e-3).
+
+**Ruled out:** camera rotation convention (fixed, +0.9 dB only), MCMC
+exploration noise, MCMC relocation, the 64 px splat radius cap (protective —
+raising it hurts), pose↔target slot pairing (verified correct), the
+tracking→training focal lift (verified correct), LR values.
+
+**Note on reading the logs:** the per-iteration L1 swings 3× between logged
+iterations. That is per-view sampling variance (one random view per
+iteration), NOT instability — don't chase it.
+
+### Why every test stayed green
+
+Correctness is only ever verified at micro-scale: `raster_parity.rs` runs 50
+surfels at 128², `train_synthetic.rs` 300 surfels at 128². Both pass (28.6 dB).
+Nothing exercises 150k-300k surfels at 779×519, and nothing tested the
+VO→trainer seam at all. Two green suites, one non-converging pipeline.
+
+### Open leads, in priority order
+
+1. **No render-vs-target diagnostic exists.** `Trainer::render_view`
+   (`trainer.rs:1040`) is only used for PSNR. Dumping render/target pairs at
+   iteration N would immediately distinguish blurry-but-correct from
+   geometrically displaced from color-broken. This is the missing tool.
+2. **Scale-up the parity test** to 300k surfels at 779×519 — if GPU and CPU
+   oracle disagree there, the gradients are wrong in the regime that matters.
+3. **Bisect the async-trainer restructure** (already recorded: real-footage
+   configs dropped 21.2 → 16.6 dB while synthetic gates stayed green). Run
+   `train datasets/room` at the pre-async commit; that is a clean A/B the
+   earlier investigation never had.
