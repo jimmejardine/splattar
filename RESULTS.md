@@ -172,3 +172,25 @@ time-varying affine appearance model (phone auto-exposure is unmodeled and
 visibly swings across the walkthrough — PLAN already specifies this),
 rolling-shutter/EIS handling, geometry losses once task #32 lands, longer
 training + higher resolution, stronger VO global BA.
+
+## M8 — multi-video: persistence, registration, islands (2026-07-21, core landed)
+
+| Check | Gate | Measured |
+|---|---|---|
+| Project persistence | submaps with meta/landmarks/descriptors/trajectory/splat | pass (`run` writes submap-0; `add` writes submap-N) |
+| `gs-cli add <video>` | VO + registration attempt + train + persist | pass end-to-end on 2.mp4 (island path) |
+| Island handling | unregistered submap is first-class, composed side-by-side | pass — `view <project-dir>` composes registered submaps through Sim(3), islands offset along +x (presentation-only, never stored) |
+| Cross-video Sim(3) merge of the overlapping flat pair | coherent merge | **not yet** — descriptor matching is the bottleneck (3/348 geometric consensus with naive BRIEF), submap persisted as island; see below |
+
+Registration failure ladder actually hit (each now guarded in code):
+1. one-directional matching + duplicated landmarks (KLT respawns re-triangulate
+   the same corner ~20×) let a **scale-0.000 collapse** claim 749 "inliers" →
+   cross-check matching, spatial voxel dedup, RANSAC scale bounds, inlier
+   spread gate;
+2. with honest matching, non-oriented single-scale BRIEF across two videos
+   shot from different directions yields almost no geometric consensus —
+   the deferred AKAZE-class descriptor (or per-keyframe 2D matching with
+   epipolar verification) is the required next step (task list).
+
+The Sim(3) estimator itself is solid: Umeyama + RANSAC recovers scale 2.7 /
+arbitrary rotation through 40% outliers at 1e-6 accuracy in unit tests.

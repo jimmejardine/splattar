@@ -732,19 +732,24 @@ fn run_add(
             world_desc.push(l.desc);
         }
     }
-    log::info!("project DB: {} registered landmarks", world_pts.len());
+    // Spatial dedup: KLT respawns re-triangulate the same physical corner
+    // dozens of times across a long video; coincident duplicates let a
+    // degenerate collapse transform out-vote the true registration.
+    let (world_pts, world_desc) = dedup_landmarks(world_pts, world_desc);
+    log::info!("project DB: {} registered landmarks after dedup", world_pts.len());
 
     let vo = run_vo(video, focal, max_frames)?;
     let prepared = prepare_training(video, &vo, downscale, max_views)?;
 
     // Descriptor matching new-submap -> world, then Sim(3) RANSAC on 3D pairs.
-    let new_desc: Vec<gs_pose::descriptor::Descriptor> =
-        prepared.landmarks.iter().map(|l| l.desc).collect();
-    let new_pts: Vec<DVec3> = prepared
+    let new_pts_all: Vec<DVec3> = prepared
         .landmarks
         .iter()
         .map(|l| DVec3::new(l.pos[0] as f64, l.pos[1] as f64, l.pos[2] as f64))
         .collect();
+    let new_desc_all: Vec<gs_pose::descriptor::Descriptor> =
+        prepared.landmarks.iter().map(|l| l.desc).collect();
+    let (new_pts, new_desc) = dedup_landmarks(new_pts_all, new_desc_all);
     let pairs = match_descriptors(&new_desc, &world_desc, 55, 0.85);
     log::info!("descriptor matches: {}", pairs.len());
     let mut registration = None;
@@ -811,6 +816,36 @@ fn run_add(
     );
     println!("view the composed project with `gs-cli view {}`", project_root.display());
     Ok(())
+}
+
+/// Keep one landmark per voxel (0.5% of the median centroid distance): the
+/// registration wants distinct physical corners, not every re-triangulation.
+fn dedup_landmarks(
+    pts: Vec<glam::DVec3>,
+    desc: Vec<gs_pose::descriptor::Descriptor>,
+) -> (Vec<glam::DVec3>, Vec<gs_pose::descriptor::Descriptor>) {
+    if pts.is_empty() {
+        return (pts, desc);
+    }
+    let centroid = pts.iter().copied().sum::<glam::DVec3>() / pts.len() as f64;
+    let mut d: Vec<f64> = pts.iter().map(|p| (*p - centroid).length()).collect();
+    d.sort_by(f64::total_cmp);
+    let voxel = (0.005 * d[d.len() / 2]).max(1e-6);
+    let mut seen = std::collections::HashSet::new();
+    let mut out_p = Vec::new();
+    let mut out_d = Vec::new();
+    for (p, dsc) in pts.into_iter().zip(desc) {
+        let key = (
+            (p.x / voxel).floor() as i64,
+            (p.y / voxel).floor() as i64,
+            (p.z / voxel).floor() as i64,
+        );
+        if seen.insert(key) {
+            out_p.push(p);
+            out_d.push(dsc);
+        }
+    }
+    (out_p, out_d)
 }
 
 /// Compose a project's submaps into one SplatCloud for viewing: registered
