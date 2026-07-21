@@ -57,6 +57,8 @@ thiserror = "2"
 anyhow = "1"
 # nalgebra is QUARANTINED inside gs-pose (see CLAUDE.md) — glam elsewhere.
 nalgebra = "0.35"
+# Pure-Rust SIMD+rayon dense linear algebra — gs-pose's BA camera solve only.
+faer = { version = "0.24", default-features = false, features = ["std", "rayon"] }
 # CPU fan-out for the VO front-end (pure Rust).
 rayon = "1"
 log = "0.4"

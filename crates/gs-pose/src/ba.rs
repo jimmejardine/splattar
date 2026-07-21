@@ -101,6 +101,20 @@ fn total_cost(poses: &[Se3], landmarks: &[Vector3<f64>], obs: &[Obs], huber: f64
     chunk_sums.into_iter().sum()
 }
 
+/// Dense SPD solve via faer's Cholesky (runtime-dispatched SIMD + rayon —
+/// nalgebra's unblocked serial factorization was the global-BA bottleneck).
+/// The reduced camera system is SPD after LM damping; returns None if the
+/// factorization rejects it (caller falls back to LU).
+fn spd_solve(h: &DMatrix<f64>, neg_g: &DVector<f64>) -> Option<DVector<f64>> {
+    use faer::linalg::solvers::{Llt, Solve};
+    let n = h.nrows();
+    let a = faer::Mat::<f64>::from_fn(n, n, |i, j| h[(i, j)]);
+    let llt = Llt::new(a.as_ref(), faer::Side::Lower).ok()?;
+    let mut rhs = faer::Mat::<f64>::from_fn(n, 1, |i, _| neg_g[i]);
+    llt.solve_in_place(rhs.as_mut());
+    Some(DVector::from_fn(n, |i, _| rhs[(i, 0)]))
+}
+
 /// Per-landmark normal-equation contribution, built in parallel and merged
 /// in landmark order (deterministic).
 struct LmAcc {
@@ -250,10 +264,11 @@ pub fn optimize(p: &mut BaProblem, cfg: &BaConfig) -> f64 {
         }
 
         // The damped Schur complement is symmetric positive definite —
-        // Cholesky is ~2× cheaper than LU; keep LU as a numerical fallback.
-        let delta_c = match h_cc.clone().cholesky() {
-            Some(ch) => ch.solve(&(-&g_c)),
-            None => match h_cc.clone().lu().solve(&(-&g_c)) {
+        // faer Cholesky (SIMD + threaded); serial LU as numerical fallback.
+        let neg_g = -&g_c;
+        let delta_c = match spd_solve(&h_cc, &neg_g) {
+            Some(d) => d,
+            None => match h_cc.clone().lu().solve(&neg_g) {
                 Some(d) => d,
                 None => {
                     lambda *= 10.0;
