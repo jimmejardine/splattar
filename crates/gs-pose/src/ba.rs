@@ -115,6 +115,51 @@ fn spd_solve(h: &DMatrix<f64>, neg_g: &DVector<f64>) -> Option<DVector<f64>> {
     Some(DVector::from_fn(n, |i, _| rhs[(i, 0)]))
 }
 
+/// Sparse SPD solve of the block reduced camera system via faer's sparse
+/// Cholesky. `keys`/`values` hold 6×6 blocks over a FIXED pattern, so the
+/// symbolic factorization is computed once and cached in `symbolic`; each
+/// call only refactors numerically. Returns None when the matrix isn't PD
+/// at the current damping (caller raises lambda).
+fn sparse_spd_solve(
+    dim: usize,
+    keys: &[(u32, u32)],
+    values: &[Matrix6],
+    neg_g: &DVector<f64>,
+    symbolic: &mut Option<faer::sparse::linalg::solvers::SymbolicLlt<usize>>,
+) -> Option<DVector<f64>> {
+    use faer::linalg::solvers::Solve;
+    use faer::sparse::linalg::solvers::{Llt, SymbolicLlt};
+    use faer::sparse::{SparseColMat, Triplet};
+
+    // Lower triangle only (Side::Lower reads nothing else).
+    let mut triplets: Vec<Triplet<usize, usize, f64>> = Vec::new();
+    for (&(bi, bj), blk) in keys.iter().zip(values) {
+        if bi < bj {
+            continue;
+        }
+        let (r0, c0) = (6 * bi as usize, 6 * bj as usize);
+        for a in 0..6 {
+            let b_end = if bi == bj { a + 1 } else { 6 };
+            for b in 0..b_end {
+                triplets.push(Triplet::new(r0 + a, c0 + b, blk[(a, b)]));
+            }
+        }
+    }
+    let mat = SparseColMat::try_new_from_triplets(dim, dim, &triplets).ok()?;
+    if symbolic.is_none() {
+        *symbolic = SymbolicLlt::try_new(mat.symbolic(), faer::Side::Lower).ok();
+    }
+    let llt = Llt::try_new_with_symbolic(
+        symbolic.clone()?,
+        mat.as_ref(),
+        faer::Side::Lower,
+    )
+    .ok()?;
+    let mut rhs = faer::Mat::<f64>::from_fn(dim, 1, |i, _| neg_g[i]);
+    llt.solve_in_place(rhs.as_mut());
+    Some(DVector::from_fn(dim, |i, _| rhs[(i, 0)]))
+}
+
 /// Per-landmark normal-equation contribution, built in parallel and merged
 /// in landmark order (deterministic).
 struct LmAcc {
@@ -125,13 +170,23 @@ struct LmAcc {
     cams: Vec<(usize, Matrix6, Vector6, Matrix6x3)>,
 }
 
+/// Free-pose count from which the reduced camera system goes through faer's
+/// sparse Cholesky instead of a dense factorization. Video reduced systems
+/// are band-dominated (cameras couple only across a track's lifetime), so
+/// dense O(n³) work — and O(n²) memory — is waste at global-BA scale;
+/// windows stay dense (block bookkeeping beats sparse overhead there).
+const SPARSE_FREE_POSES: usize = 64;
+
 /// Run LM; mutates poses and landmarks in place. Returns final cost.
 ///
 /// Parallelism: assembly, Schur, cost, and landmark back-substitution fan
 /// out per landmark / per chunk with all floating-point merges done in
 /// landmark (or chunk) order — results are deterministic under any thread
-/// count. The dense reduced-camera solve stays serial (Cholesky, LU
-/// fallback) and is the remaining scaling wall for very large windows.
+/// count. The reduced camera system is accumulated as 6×6 blocks over a
+/// FIXED pattern (all camera pairs that could couple through a landmark,
+/// computed once from the observations): small windows densify and solve
+/// with faer's dense Cholesky, large ones build a sparse matrix whose
+/// symbolic Cholesky is factored once and reused every LM iteration.
 pub fn optimize(p: &mut BaProblem, cfg: &BaConfig) -> f64 {
     let n_pose = p.poses.len();
     let n_free = n_pose.saturating_sub(cfg.fixed_poses);
@@ -146,6 +201,43 @@ pub fn optimize(p: &mut BaProblem, cfg: &BaConfig) -> f64 {
     for (i, o) in p.obs.iter().enumerate() {
         obs_of_lm[o.lm].push(i as u32);
     }
+
+    // Fixed block pattern of the reduced camera system: every diagonal plus
+    // every (free) camera pair sharing a landmark, from the observations —
+    // NOT from per-iteration evaluations (cheirality dropouts must not
+    // change the pattern, or the cached symbolic factorization dies).
+    let block_keys: Vec<(u32, u32)> = {
+        let mut set = std::collections::BTreeSet::new();
+        for ci in 0..n_free as u32 {
+            set.insert((ci, ci));
+        }
+        for idxs in &obs_of_lm {
+            let mut cams: Vec<u32> = idxs
+                .iter()
+                .filter_map(|&i| {
+                    let c = p.obs[i as usize].cam;
+                    c.checked_sub(cfg.fixed_poses).map(|ci| ci as u32)
+                })
+                .collect();
+            cams.sort_unstable();
+            cams.dedup();
+            for &a in &cams {
+                for &b in &cams {
+                    set.insert((a, b));
+                }
+            }
+        }
+        set.into_iter().collect()
+    };
+    let key_index: std::collections::HashMap<(u32, u32), usize> = block_keys
+        .iter()
+        .enumerate()
+        .map(|(i, &k)| (k, i))
+        .collect();
+    let sparse = n_free >= SPARSE_FREE_POSES;
+    let mut symbolic: Option<faer::sparse::linalg::solvers::SymbolicLlt<usize>> = None;
+    let mut values: Vec<Matrix6> = vec![Matrix6::zeros(); block_keys.len()];
+
     // Only very large (global-BA-sized) problems log progress.
     let chatty = p.obs.len() > 20_000;
     let mut lambda = 1e-4;
@@ -192,15 +284,15 @@ pub fn optimize(p: &mut BaProblem, cfg: &BaConfig) -> f64 {
             })
             .collect();
 
-        let mut h_cc = DMatrix::<f64>::zeros(dim, dim);
+        for v in &mut values {
+            *v = Matrix6::zeros();
+        }
         let mut g_c = DVector::<f64>::zeros(dim);
         for acc in &accs {
             for &(ci, ref jtj, ref gc, _) in &acc.cams {
+                values[key_index[&(ci as u32, ci as u32)]] += jtj;
                 let r0 = 6 * ci;
                 for a in 0..6 {
-                    for b in 0..6 {
-                        h_cc[(r0 + a, r0 + b)] += jtj[(a, b)];
-                    }
                     g_c[r0 + a] += gc[a];
                 }
             }
@@ -216,7 +308,7 @@ pub fn optimize(p: &mut BaProblem, cfg: &BaConfig) -> f64 {
             type SchurOut = (
                 Matrix3<f64>,
                 Vec<(usize, Vector6)>,
-                Vec<(usize, usize, Matrix6)>,
+                Vec<(u32, u32, Matrix6)>,
             );
             let outs: Vec<SchurOut> = chunk
                 .par_iter()
@@ -236,7 +328,7 @@ pub fn optimize(p: &mut BaProblem, cfg: &BaConfig) -> f64 {
                     for &(ci, .., ref cl) in &acc.cams {
                         gcs.push((6 * ci, cl * tmp));
                         for &(cj, .., ref cl2) in &acc.cams {
-                            blocks.push((6 * ci, 6 * cj, cl * inv * cl2.transpose()));
+                            blocks.push((ci as u32, cj as u32, cl * inv * cl2.transpose()));
                         }
                     }
                     (inv, gcs, blocks)
@@ -249,32 +341,52 @@ pub fn optimize(p: &mut BaProblem, cfg: &BaConfig) -> f64 {
                         g_c[r0 + a] -= v[a];
                     }
                 }
-                for (r0, c0, blk) in blocks {
-                    for a in 0..6 {
-                        for b in 0..6 {
-                            h_cc[(r0 + a, c0 + b)] -= blk[(a, b)];
-                        }
-                    }
+                for (bi, bj, blk) in blocks {
+                    values[key_index[&(bi, bj)]] -= blk;
                 }
             }
         }
-        for d in 0..dim {
-            h_cc[(d, d)] *= 1.0 + lambda;
-            h_cc[(d, d)] += 1e-12;
+        // LM damping on the (block-)diagonal.
+        for ci in 0..n_free as u32 {
+            let v = &mut values[key_index[&(ci, ci)]];
+            for d in 0..6 {
+                v[(d, d)] *= 1.0 + lambda;
+                v[(d, d)] += 1e-12;
+            }
         }
 
-        // The damped Schur complement is symmetric positive definite —
-        // faer Cholesky (SIMD + threaded); serial LU as numerical fallback.
+        // Solve the damped SPD reduced system.
         let neg_g = -&g_c;
-        let delta_c = match spd_solve(&h_cc, &neg_g) {
-            Some(d) => d,
-            None => match h_cc.clone().lu().solve(&neg_g) {
+        let delta_c = if sparse {
+            match sparse_spd_solve(dim, &block_keys, &values, &neg_g, &mut symbolic) {
                 Some(d) => d,
                 None => {
+                    // Not PD at this damping — the LM remedy, without ever
+                    // densifying a global-sized matrix.
                     lambda *= 10.0;
                     continue;
                 }
-            },
+            }
+        } else {
+            let mut h_cc = DMatrix::<f64>::zeros(dim, dim);
+            for (&(bi, bj), blk) in block_keys.iter().zip(&values) {
+                let (r0, c0) = (6 * bi as usize, 6 * bj as usize);
+                for a in 0..6 {
+                    for b in 0..6 {
+                        h_cc[(r0 + a, c0 + b)] = blk[(a, b)];
+                    }
+                }
+            }
+            match spd_solve(&h_cc, &neg_g) {
+                Some(d) => d,
+                None => match h_cc.clone().lu().solve(&neg_g) {
+                    Some(d) => d,
+                    None => {
+                        lambda *= 10.0;
+                        continue;
+                    }
+                },
+            }
         };
 
         // Back-substitute landmarks: δl = −H_ll⁻¹ (g_l + H_lc δc).
@@ -404,6 +516,87 @@ mod tests {
         }
         for (est, gt) in p.landmarks.iter().zip(&gt_lms) {
             assert!((est - gt).norm() < 1e-5);
+        }
+    }
+
+    /// 80 free-ish poses (> SPARSE_FREE_POSES) with windowed landmark
+    /// visibility: a banded reduced system exercising the sparse-Cholesky
+    /// path end-to-end, gated on full noiseless recovery.
+    #[test]
+    fn sparse_path_recovers_banded_geometry() {
+        let n_pose = 80usize;
+        let n_lm = 400usize;
+        let mut rng = Rng64::new(41);
+        let mut r = |s: f64| (rng.next_u64() as f64 / u64::MAX as f64 * 2.0 - 1.0) * s;
+        let gt_poses: Vec<Se3> = (0..n_pose)
+            .map(|k| {
+                Se3::exp(&Vector6::new(
+                    0.12 * k as f64,
+                    r(0.02),
+                    r(0.02),
+                    r(0.005),
+                    r(0.005),
+                    r(0.005),
+                ))
+            })
+            .collect();
+        let gt_lms: Vec<Vector3<f64>> = (0..n_lm)
+            .map(|j| {
+                let along = j as f64 / n_lm as f64 * n_pose as f64 * 0.12;
+                Vector3::new(-along + r(0.4), r(1.2), 5.0 + r(2.0))
+            })
+            .collect();
+        let mut obs = Vec::new();
+        for (ci, pose) in gt_poses.iter().enumerate() {
+            for (li, lm) in gt_lms.iter().enumerate() {
+                // Track-lifetime-style visibility window → banded coupling.
+                let owner = li * n_pose / n_lm;
+                if ci.abs_diff(owner) > 6 {
+                    continue;
+                }
+                let c = pose.act(lm);
+                if c[2] > 0.5 {
+                    obs.push(Obs {
+                        cam: ci,
+                        lm: li,
+                        xy: (c[0] / c[2], c[1] / c[2]),
+                    });
+                }
+            }
+        }
+        let mut poses = gt_poses.clone();
+        for pose in poses.iter_mut().skip(2) {
+            *pose = pose.boxplus(&Vector6::new(
+                r(0.02),
+                r(0.02),
+                r(0.02),
+                r(0.008),
+                r(0.008),
+                r(0.008),
+            ));
+        }
+        let landmarks: Vec<Vector3<f64>> = gt_lms
+            .iter()
+            .map(|l| l + Vector3::new(r(0.03), r(0.03), r(0.05)))
+            .collect();
+        let mut p = BaProblem {
+            poses,
+            landmarks,
+            obs,
+        };
+        let cfg = BaConfig {
+            fixed_poses: 2,
+            max_iters: 30,
+            ..Default::default()
+        };
+        let cost = optimize(&mut p, &cfg);
+        assert!(cost < 1e-10, "final cost {cost}");
+        for (est, gt) in p.poses.iter().zip(&gt_poses) {
+            assert!((est.r.inverse() * gt.r).angle() < 1e-5);
+            assert!((est.t - gt.t).norm() < 1e-4);
+        }
+        for (est, gt) in p.landmarks.iter().zip(&gt_lms) {
+            assert!((est - gt).norm() < 1e-4);
         }
     }
 
