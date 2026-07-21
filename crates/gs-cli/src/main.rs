@@ -1578,31 +1578,38 @@ fn run_register(
         let new_meta = &proj.submaps[submap];
         let poses = load_seg_poses(&sub_dir(submap).join("poses.csv")).unwrap_or_default();
 
-        // Observation snap indices: (submap, kf) → [(px, py, world pos)] and
-        // kf → [(px, py, seg pos)] for the target.
-        type ObsIndex = std::collections::HashMap<(usize, u32), Vec<(f32, f32, glam::DVec3)>>;
-        let mut w_index: ObsIndex = std::collections::HashMap::new();
-        for (i, raw) in &world_raw {
-            let s = world_sims[i];
+        // Snap sets come from PROJECTING every landmark into the keyframe
+        // through its known (gauge-local) pose — matching against the sparse
+        // stored KLT observations starved the stage (measured 0-2 snaps per
+        // 11-13 verified corners; fresh dense corners rarely coincide with
+        // tracking corners).
+        let per_submap_poses = |i: usize| load_seg_poses(&sub_dir(i).join("poses.csv"));
+        let project_set = |raw: &[project::Landmark],
+                           pose: &(glam::DQuat, glam::DVec3),
+                           meta: &project::SubmapMeta,
+                           to_world: Option<&gs_pose::sim3::Sim3G>|
+         -> Vec<(f32, f32, DVec3)> {
+            let (r, t) = pose;
+            let mut out = Vec::new();
             for l in raw {
-                let wpos =
-                    s.apply(DVec3::new(l.pos[0] as f64, l.pos[1] as f64, l.pos[2] as f64));
-                for (kf, p) in &l.obs_all {
-                    w_index.entry((*i, *kf)).or_default().push((p[0], p[1], wpos));
+                let p = DVec3::new(l.pos[0] as f64, l.pos[1] as f64, l.pos[2] as f64);
+                let c = *r * p + *t;
+                if c.z < 0.1 {
+                    continue;
                 }
+                let px = (c.x / c.z * meta.focal + meta.width as f64 / 2.0) as f32;
+                let py = (c.y / c.z * meta.focal + meta.height as f64 / 2.0) as f32;
+                if px < 0.0 || py < 0.0 || px >= meta.width as f32 || py >= meta.height as f32
+                {
+                    continue;
+                }
+                let stored = to_world.map(|s| s.apply(p)).unwrap_or(p);
+                out.push((px, py, stored));
             }
-        }
-        let mut n_index: std::collections::HashMap<u32, Vec<(f32, f32, DVec3)>> =
-            std::collections::HashMap::new();
-        for l in &new_raw {
-            let spos = DVec3::new(l.pos[0] as f64, l.pos[1] as f64, l.pos[2] as f64);
-            for (kf, p) in &l.obs_all {
-                n_index.entry(*kf).or_default().push((p[0], p[1], spos));
-            }
-        }
-        let snap = |list: Option<&Vec<(f32, f32, DVec3)>>, px: (f32, f32)| -> Option<DVec3> {
-            let list = list?;
-            let (mut best, mut best_d2) = (None, 8.0f32 * 8.0);
+            out
+        };
+        let snap = |list: &[(f32, f32, DVec3)], px: (f32, f32)| -> Option<DVec3> {
+            let (mut best, mut best_d2) = (None, 14.0f32 * 14.0);
             for &(x, y, p) in list {
                 let d2 = (x - px.0).powi(2) + (y - px.1).powi(2);
                 if d2 < best_d2 {
@@ -1615,6 +1622,12 @@ fn run_register(
         let nearest = |kfs: &[u32], target: u32| -> Option<u32> {
             kfs.iter().copied().min_by_key(|k| k.abs_diff(target))
         };
+
+        // Verified+snapped pairs pooled across ALL regions (they share the
+        // same two gauges — per-pair counts are small but they add up).
+        let mut pool_a: Vec<DVec3> = Vec::new();
+        let mut pool_b: Vec<DVec3> = Vec::new();
+        let mut pool_submap: Option<usize> = None;
 
         'regions: for &((nk, ws, wk), v) in &top_regions {
             let w_thumbs = list_thumbs(&sub_dir(ws));
@@ -1641,7 +1654,37 @@ fn run_register(
                 "pairwise ({v} votes): world s{ws} kf {kw} <-> kf {kn}: {} verified",
                 verified.len()
             );
-            if verified.len() < 15 {
+            // Projected snap sets for this specific keyframe pair.
+            let w_meta = &proj.submaps[ws];
+            let Some(w_pose) = per_submap_poses(ws).ok().and_then(|p| p.get(&kw).copied())
+            else {
+                continue;
+            };
+            let Some(n_pose) = poses.get(&kn).copied() else { continue };
+            let w_raw = world_raw
+                .iter()
+                .find(|(i, _)| *i == ws)
+                .map(|(_, r)| r.as_slice())
+                .unwrap_or(&[]);
+            let w_proj = project_set(w_raw, &w_pose, w_meta, Some(&world_sims[&ws]));
+            let n_proj = project_set(&new_raw, &n_pose, new_meta, None);
+            if log::log_enabled!(log::Level::Debug) {
+                let min_d = |list: &[(f32, f32, DVec3)], px: (f32, f32)| -> f32 {
+                    list.iter()
+                        .map(|&(x, y, _)| ((x - px.0).powi(2) + (y - px.1).powi(2)).sqrt())
+                        .fold(f32::INFINITY, f32::min)
+                };
+                let dw: Vec<i32> =
+                    verified.iter().map(|m| min_d(&w_proj, m.a_px) as i32).collect();
+                let dn: Vec<i32> =
+                    verified.iter().map(|m| min_d(&n_proj, m.b_px) as i32).collect();
+                log::debug!(
+                    "snap diag: {} w-proj / {} n-proj; corner→proj px dists w{dw:?} n{dn:?}",
+                    w_proj.len(),
+                    n_proj.len()
+                );
+            }
+            if verified.len() < 10 {
                 continue;
             }
             // Snap verified endpoints to landmark observations.
@@ -1649,8 +1692,8 @@ fn run_register(
             let mut b3 = Vec::new(); // world side
             let mut bridge = Vec::new();
             for m in &verified {
-                let wsnap = snap(w_index.get(&(ws, kw)), m.a_px);
-                let nsnap = snap(n_index.get(&kn), m.b_px);
+                let wsnap = snap(&w_proj, m.a_px);
+                let nsnap = snap(&n_proj, m.b_px);
                 if let (Some(wp), Some(np)) = (wsnap, nsnap) {
                     a3.push(np);
                     b3.push(wp);
@@ -1665,8 +1708,13 @@ fn run_register(
                 }
             }
             println!("  snapped to {} landmark pairs", a3.len());
-            if a3.len() >= 10
-                && let Some(s) = attempt_sim3(&a3, &b3, 0.08, 10, "pairwise 3D")
+            if pool_submap.is_none() || pool_submap == Some(ws) {
+                pool_submap = Some(ws);
+                pool_a.extend_from_slice(&a3);
+                pool_b.extend_from_slice(&b3);
+            }
+            if a3.len() >= 8
+                && let Some(s) = attempt_sim3(&a3, &b3, 0.08, 8, "pairwise 3D")
             {
                 registration = Some(s);
                 break 'regions;
@@ -1691,6 +1739,13 @@ fn run_register(
                     break 'regions;
                 }
             }
+        }
+
+        // Pooled attempt: every epipolar-verified, landmark-snapped pair
+        // across all vote regions, one Sim(3).
+        if registration.is_none() && pool_a.len() >= 10 {
+            println!("pooled pairwise: {} pairs across regions", pool_a.len());
+            registration = attempt_sim3(&pool_a, &pool_b, 0.18, 8, "pairwise pooled");
         }
     }
 

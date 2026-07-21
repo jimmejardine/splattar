@@ -300,3 +300,27 @@ expected successes). The arithmetic fix is a FIVE-point essential solver
 (0.2⁵ × 8k ≈ 2.6) — M6's originally-planned five-point bootstrap, now
 with a measured, quantitative justification. Everything downstream of the
 solver is already built and waiting.
+
+### Five-point solver landed — cross-take pairs verify (2026-07-21)
+
+Implemented the Nistér/Stewénius five-point essential solver from scratch
+(`gs-pose::fivepoint`): 4-dim null-space parametrization, det + trace
+constraints expanded symbolically over 20 monomials, Gauss-Jordan to a
+10×10 action matrix, real eigen-solutions via Schur eigenvalues + per-λ
+null spaces. Gates: constraints vanish at GT (1.7e-12), exact E recovery
+on held-out points across seeds, solves the all-planar scene that
+degenerates eight-point, and survives the 20%-inlier regime that
+motivated it. Both consumers switched: pairwise verification and the VO
+bootstrap (all 41 gs-pose tests green).
+
+Measured payoff on the flat pair: pairwise epipolar verification went
+0 → 11–13 inliers on 5 of 6 vote-nominated keyframe pairs — the two
+walkthroughs now geometrically verify against each other. Registration
+remains one step short: snapped landmark pairs (2–6/pair, 20 pooled)
+don't reach Sim(3) consensus because each submap's geometry is warped by
+the unrefined focal guess (trainer measures the true focal at +6.5%, VO
+geometry never receives it) — a non-similarity warp no Sim(3) can fit
+tighter than a few percent of depth. Next step (well-scoped): feed the
+trainer-refined focal back through a VO re-BA per submap, then the
+existing ladder should close; alternatively accept coarse registration
+and lean on PLAN's photometric Sim(3) polish.

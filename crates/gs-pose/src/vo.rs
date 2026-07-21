@@ -26,7 +26,7 @@ use crate::pnp::{PnpConfig, solve_pnp};
 use crate::se3::Se3;
 use crate::spline::PoseSpline;
 use crate::triangulate::{parallax_angle, triangulate_n};
-use crate::twoview::{Match2, ransac_essential, recover_pose};
+use crate::twoview::{Match2, recover_pose};
 
 #[derive(Debug, Clone, Copy)]
 pub struct Intrinsics {
@@ -506,7 +506,7 @@ impl VoFrontEnd {
                 continue;
             }
             let Some(rr) =
-                ransac_essential(&matches, self.cfg.ransac_iters, thresh, 0xC0FFEE)
+                crate::fivepoint::ransac_essential_5pt(&matches, self.cfg.ransac_iters, thresh, 0xC0FFEE)
             else {
                 log::debug!("boot ({ka},{kb}): RANSAC found no model");
                 continue;

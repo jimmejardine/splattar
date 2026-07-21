@@ -9,8 +9,9 @@
 
 use crate::descriptor::{describe_multi, match_descriptors, MultiDescriptor};
 use crate::detect::{DetectConfig, detect};
+use crate::fivepoint::ransac_essential_5pt;
 use crate::image::{GrayImage, Pyramid};
-use crate::twoview::{Match2, ransac_essential};
+use crate::twoview::Match2;
 
 /// A verified correspondence, endpoints in FULL-RESOLUTION pixel coords.
 #[derive(Debug, Clone, Copy)]
@@ -54,8 +55,8 @@ impl Default for PairwiseConfig {
             ratio: 0.85,
             // Half-res corner localization + rolling shutter between takes.
             epi_px: 4.0,
-            min_inliers: 12,
-            ransac_iters: 8000,
+            min_inliers: 10,
+            ransac_iters: 5000,
         }
     }
 }
@@ -122,8 +123,11 @@ pub fn match_image_pair(a: &GrayImage, b: &GrayImage, cfg: &PairwiseConfig) -> V
             b: norm(pb[j]),
         })
         .collect();
+    // Five-point minimal samples: the whole reason this stage works at
+    // cross-take precision (~20% inliers ⇒ 0.2⁵ per draw, vs 0.2⁸ for the
+    // eight-point solver — 1000× fewer usable draws).
     let Some(rr) =
-        ransac_essential(&matches, cfg.ransac_iters, cfg.epi_px / cfg.focal, 0xEB1B01A)
+        ransac_essential_5pt(&matches, cfg.ransac_iters, cfg.epi_px / cfg.focal, 0xEB1B01A)
     else {
         log::debug!("pairwise: essential RANSAC found no model");
         return Vec::new();
