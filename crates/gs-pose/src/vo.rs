@@ -163,6 +163,15 @@ pub struct VoResult {
     pub anchor: usize,
 }
 
+/// Half-resolution grayscale snapshot of a keyframe (pyramid level 1,
+/// quantized to u8) — the raw material for pairwise image registration.
+pub struct Thumb {
+    pub kf: usize,
+    pub width: usize,
+    pub height: usize,
+    pub data: Vec<u8>,
+}
+
 pub struct VoFrontEnd {
     cfg: VoConfig,
     prev: Option<Pyramid>,
@@ -173,6 +182,8 @@ pub struct VoFrontEnd {
     frame_pts: Vec<f64>,
     /// Per-frame log radial-flow scale (zoom signal; ≈0 when focal constant).
     pub zoom_log_scale: Vec<f64>,
+    /// Every 4th keyframe's half-res image, kept for registration.
+    pub thumbs: Vec<Thumb>,
 }
 
 impl VoFrontEnd {
@@ -186,6 +197,7 @@ impl VoFrontEnd {
             n_frames: 0,
             frame_pts: Vec::new(),
             zoom_log_scale: Vec::new(),
+            thumbs: Vec::new(),
         }
     }
 
@@ -270,6 +282,22 @@ impl VoFrontEnd {
                 pts,
                 sharpness,
             });
+            // Keep every 4th keyframe's half-res image for pairwise
+            // registration (vote buckets are 8 keyframes wide, so this
+            // guarantees ≥2 snapshots per bucket).
+            if kf_idx.is_multiple_of(4) {
+                let lvl = &pyr.levels[1.min(pyr.levels.len() - 1)];
+                self.thumbs.push(Thumb {
+                    kf: kf_idx,
+                    width: lvl.width,
+                    height: lvl.height,
+                    data: lvl
+                        .data
+                        .iter()
+                        .map(|v| (v * 255.0).clamp(0.0, 255.0) as u8)
+                        .collect(),
+                });
+            }
             for tr in &mut self.tracks {
                 if let Some(p) = tr.cur {
                     tr.obs.push((kf_idx, p));

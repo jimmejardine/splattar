@@ -8,6 +8,7 @@ pub mod descriptor;
 pub mod detect;
 pub mod image;
 pub mod klt;
+pub mod pairwise;
 pub mod pnp;
 pub mod se3;
 pub mod sim3;

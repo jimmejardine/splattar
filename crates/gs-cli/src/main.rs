@@ -309,6 +309,8 @@ struct VoOutput {
     keyframes: Vec<gs_pose::vo::Keyframe>,
     intrinsics: gs_pose::vo::Intrinsics,
     video_size: (u32, u32),
+    /// Half-res snapshots of every 4th keyframe (pairwise registration).
+    thumbs: Vec<gs_pose::vo::Thumb>,
 }
 
 fn solved_count(seg: &gs_pose::VoResult) -> usize {
@@ -410,7 +412,59 @@ fn run_vo(
         keyframes: std::mem::take(&mut fe.keyframes),
         intrinsics,
         video_size,
+        thumbs: std::mem::take(&mut fe.thumbs),
     })
+}
+
+/// Persist this segment's keyframe thumbnails as grayscale PNGs.
+fn write_thumbs(
+    dir: &std::path::Path,
+    thumbs: &[gs_pose::vo::Thumb],
+    range: Option<(u32, u32)>,
+) -> anyhow::Result<()> {
+    let Some((lo, hi)) = range else { return Ok(()) };
+    let tdir = dir.join("thumbs");
+    std::fs::create_dir_all(&tdir)?;
+    for t in thumbs {
+        let kf = t.kf as u32;
+        if kf < lo || kf > hi {
+            continue;
+        }
+        let img = image::GrayImage::from_raw(t.width as u32, t.height as u32, t.data.clone())
+            .context("thumb size")?;
+        img.save(tdir.join(format!("{kf:05}.png")))?;
+    }
+    Ok(())
+}
+
+/// Load one persisted thumbnail as an f32 gray image.
+fn load_thumb(dir: &std::path::Path, kf: u32) -> Option<gs_pose::GrayImage> {
+    let img = image::open(dir.join("thumbs").join(format!("{kf:05}.png"))).ok()?;
+    let g = img.to_luma8();
+    Some(gs_pose::GrayImage {
+        width: g.width() as usize,
+        height: g.height() as usize,
+        data: g.as_raw().iter().map(|&v| v as f32 / 255.0).collect(),
+    })
+}
+
+/// Thumbnail keyframe indices available in a submap dir.
+fn list_thumbs(dir: &std::path::Path) -> Vec<u32> {
+    let mut out: Vec<u32> = std::fs::read_dir(dir.join("thumbs"))
+        .map(|rd| {
+            rd.filter_map(|e| {
+                e.ok()?
+                    .path()
+                    .file_stem()?
+                    .to_str()?
+                    .parse::<u32>()
+                    .ok()
+            })
+            .collect()
+        })
+        .unwrap_or_default();
+    out.sort_unstable();
+    out
 }
 
 fn run_pose(
@@ -813,6 +867,7 @@ fn run_pipeline(
     project::write_landmarks(&dir.join("landmarks.bin"), &prepared.landmarks)?;
     write_trajectory_csv(&dir.join("trajectory.csv"), &vo)?;
     write_seg_poses(&dir.join("poses.csv"), primary)?;
+    write_thumbs(&dir, &vo.thumbs, seg_kf_range(primary))?;
 
     let ply = dir.join("splat.ply");
     let (psnr, num) = train_and_bake(prepared, iters, budget, pose_window, &ply)?;
@@ -975,6 +1030,7 @@ fn add_segment_submap(
     project::write_landmarks(&dir.join("landmarks.bin"), &prepared.landmarks)?;
     write_trajectory_csv(&dir.join("trajectory.csv"), vo)?;
     write_seg_poses(&dir.join("poses.csv"), seg)?;
+    write_thumbs(&dir, &vo.thumbs, seg_kf_range(seg))?;
 
     let ply = dir.join("splat.ply");
     let (psnr, num) = train_and_bake(prepared, iters, budget, 1.0, &ply)?;
@@ -1319,8 +1375,12 @@ fn run_register(
             &project::Project::submap_dir(project_root, i).join("landmarks.bin"),
         )
     };
-    // World: all registered submaps except the target.
+    // World: all registered submaps except the target. Raw per-submap lists
+    // are retained for observation snapping in the pairwise stage.
     let mut world: Vec<DbLandmark> = Vec::new();
+    let mut world_raw: Vec<(usize, Vec<project::Landmark>)> = Vec::new();
+    let mut world_sims: std::collections::HashMap<usize, Sim3G> =
+        std::collections::HashMap::new();
     for (i, meta) in proj.submaps.iter().enumerate() {
         if i == submap {
             continue;
@@ -1331,8 +1391,9 @@ fn run_register(
             rot: glam::DQuat::from_xyzw(w.quat[1], w.quat[2], w.quat[3], w.quat[0]),
             trans: DVec3::from_array(w.trans),
         };
-        let entries: Vec<DbLandmark> = load(i)?
-            .into_iter()
+        let raw = load(i)?;
+        let entries: Vec<DbLandmark> = raw
+            .iter()
             .map(|l| DbLandmark {
                 pos: s.apply(DVec3::new(l.pos[0] as f64, l.pos[1] as f64, l.pos[2] as f64)),
                 desc: l.desc,
@@ -1342,6 +1403,8 @@ fn run_register(
             })
             .collect();
         world.extend(dedup_db_landmarks(entries));
+        world_sims.insert(i, s);
+        world_raw.push((i, raw));
     }
     let new_raw = load(submap)?;
     let new_pts_all: Vec<DVec3> = new_raw
@@ -1400,6 +1463,14 @@ fn run_register(
             (wk + 1) * BUCKET
         );
     }
+    // Vote-nominated regions for the pairwise image stage (votes ≥ 2 —
+    // pairwise verification supplies its own precision).
+    let top_regions: Vec<((u32, usize, u32), usize)> = top
+        .iter()
+        .filter(|(_, v)| **v >= 2)
+        .take(6)
+        .map(|(k, v)| (**k, **v))
+        .collect();
     let good: std::collections::HashSet<(u32, usize, u32)> = votes
         .into_iter()
         .filter(|(_, v)| *v >= min_votes)
@@ -1496,22 +1567,149 @@ fn run_register(
             }
         }
     }
+    // Pairwise image stage: for vote-nominated keyframe regions, match the
+    // two actual images and epipolar-verify, then snap verified corners to
+    // stored landmark observations — precision comes from the geometry of
+    // the specific pair, not from global descriptor uniqueness.
+    if registration.is_none() && !top_regions.is_empty() {
+        use gs_pose::pairwise::{PairwiseConfig, match_image_pair};
+        let sub_dir = |i: usize| project::Project::submap_dir(project_root, i);
+        let new_thumbs = list_thumbs(&sub_dir(submap));
+        let new_meta = &proj.submaps[submap];
+        let poses = load_seg_poses(&sub_dir(submap).join("poses.csv")).unwrap_or_default();
+
+        // Observation snap indices: (submap, kf) → [(px, py, world pos)] and
+        // kf → [(px, py, seg pos)] for the target.
+        type ObsIndex = std::collections::HashMap<(usize, u32), Vec<(f32, f32, glam::DVec3)>>;
+        let mut w_index: ObsIndex = std::collections::HashMap::new();
+        for (i, raw) in &world_raw {
+            let s = world_sims[i];
+            for l in raw {
+                let wpos =
+                    s.apply(DVec3::new(l.pos[0] as f64, l.pos[1] as f64, l.pos[2] as f64));
+                for (kf, p) in &l.obs_all {
+                    w_index.entry((*i, *kf)).or_default().push((p[0], p[1], wpos));
+                }
+            }
+        }
+        let mut n_index: std::collections::HashMap<u32, Vec<(f32, f32, DVec3)>> =
+            std::collections::HashMap::new();
+        for l in &new_raw {
+            let spos = DVec3::new(l.pos[0] as f64, l.pos[1] as f64, l.pos[2] as f64);
+            for (kf, p) in &l.obs_all {
+                n_index.entry(*kf).or_default().push((p[0], p[1], spos));
+            }
+        }
+        let snap = |list: Option<&Vec<(f32, f32, DVec3)>>, px: (f32, f32)| -> Option<DVec3> {
+            let list = list?;
+            let (mut best, mut best_d2) = (None, 8.0f32 * 8.0);
+            for &(x, y, p) in list {
+                let d2 = (x - px.0).powi(2) + (y - px.1).powi(2);
+                if d2 < best_d2 {
+                    best_d2 = d2;
+                    best = Some(p);
+                }
+            }
+            best
+        };
+        let nearest = |kfs: &[u32], target: u32| -> Option<u32> {
+            kfs.iter().copied().min_by_key(|k| k.abs_diff(target))
+        };
+
+        'regions: for &((nk, ws, wk), v) in &top_regions {
+            let w_thumbs = list_thumbs(&sub_dir(ws));
+            let (Some(kn), Some(kw)) = (
+                nearest(&new_thumbs, nk * BUCKET + BUCKET / 2),
+                nearest(&w_thumbs, wk * BUCKET + BUCKET / 2),
+            ) else {
+                continue;
+            };
+            let (Some(n_img), Some(w_img)) =
+                (load_thumb(&sub_dir(submap), kn), load_thumb(&sub_dir(ws), kw))
+            else {
+                continue;
+            };
+            let cfg2 = PairwiseConfig {
+                image_scale: 0.5,
+                focal: new_meta.focal,
+                cx: new_meta.width as f64 / 2.0,
+                cy: new_meta.height as f64 / 2.0,
+                ..Default::default()
+            };
+            let verified = match_image_pair(&w_img, &n_img, &cfg2);
+            println!(
+                "pairwise ({v} votes): world s{ws} kf {kw} <-> kf {kn}: {} verified",
+                verified.len()
+            );
+            if verified.len() < 15 {
+                continue;
+            }
+            // Snap verified endpoints to landmark observations.
+            let mut a3 = Vec::new(); // new/seg side
+            let mut b3 = Vec::new(); // world side
+            let mut bridge = Vec::new();
+            for m in &verified {
+                let wsnap = snap(w_index.get(&(ws, kw)), m.a_px);
+                let nsnap = snap(n_index.get(&kn), m.b_px);
+                if let (Some(wp), Some(np)) = (wsnap, nsnap) {
+                    a3.push(np);
+                    b3.push(wp);
+                    bridge.push(gs_pose::sim3::BridgeObs {
+                        obs: (
+                            (m.b_px.0 as f64 - new_meta.width as f64 / 2.0) / new_meta.focal,
+                            (m.b_px.1 as f64 - new_meta.height as f64 / 2.0) / new_meta.focal,
+                        ),
+                        world: wp,
+                        seg: np,
+                    });
+                }
+            }
+            println!("  snapped to {} landmark pairs", a3.len());
+            if a3.len() >= 10
+                && let Some(s) = attempt_sim3(&a3, &b3, 0.08, 10, "pairwise 3D")
+            {
+                registration = Some(s);
+                break 'regions;
+            }
+            if bridge.len() >= 8
+                && let Some((r_wc, t_wc)) = poses.get(&kn)
+                && let Some((s, inl)) = gs_pose::sim3::sim3_from_bridge(
+                    *r_wc,
+                    *t_wc,
+                    &bridge,
+                    8.0 / new_meta.focal,
+                    0x9a1f,
+                )
+            {
+                println!(
+                    "  pairwise 2D: {inl}/{} inliers (scale {:.3})",
+                    bridge.len(),
+                    s.scale
+                );
+                if inl >= 8 && (0.05..=20.0).contains(&s.scale) {
+                    registration = Some(s);
+                    break 'regions;
+                }
+            }
+        }
+    }
+
     match &registration {
         Some(s) => println!("REGISTERED: scale {:.3}", s.scale),
         None => println!("no registration"),
     }
-    if write {
-        if let Some(s) = registration {
-            let dir = project::Project::submap_dir(project_root, submap);
-            let mut meta = project::read_meta(&dir.join("meta.txt"))?;
-            meta.world_from_submap = Some(project::WorldFromSubmap {
-                scale: s.scale,
-                quat: [s.rot.w, s.rot.x, s.rot.y, s.rot.z],
-                trans: s.trans.to_array(),
-            });
-            project::write_meta(&dir.join("meta.txt"), &meta)?;
-            println!("written to submap-{submap}/meta.txt");
-        }
+    if write
+        && let Some(s) = registration
+    {
+        let dir = project::Project::submap_dir(project_root, submap);
+        let mut meta = project::read_meta(&dir.join("meta.txt"))?;
+        meta.world_from_submap = Some(project::WorldFromSubmap {
+            scale: s.scale,
+            quat: [s.rot.w, s.rot.x, s.rot.y, s.rot.z],
+            trans: s.trans.to_array(),
+        });
+        project::write_meta(&dir.join("meta.txt"), &meta)?;
+        println!("written to submap-{submap}/meta.txt");
     }
     Ok(())
 }
