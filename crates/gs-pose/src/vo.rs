@@ -50,8 +50,11 @@ pub struct VoConfig {
     pub pyramid_levels: usize,
     pub klt: KltConfig,
     pub detect: DetectConfig,
-    /// Median flow (px) since the last keyframe that forces a new keyframe.
-    pub kf_flow_px: f32,
+    /// Median flow since the last keyframe that forces a new keyframe, as a
+    /// FRACTION of the image diagonal (resolution-independent; an absolute
+    /// pixel threshold promoted ~90% of frames on high-res phone footage).
+    /// Resolved to pixels when the first frame arrives.
+    pub kf_flow_frac: f32,
     /// Track-survival ratio (vs the last keyframe) that forces a keyframe.
     pub kf_survival: f32,
     /// Respawn detection when live tracks drop below this.
@@ -86,7 +89,8 @@ impl Default for VoConfig {
             pyramid_levels: 4,
             klt: KltConfig::default(),
             detect: DetectConfig::default(),
-            kf_flow_px: 15.0,
+            // 0.015 ≈ the field-proven 15 px at 478×850 (diag ~975).
+            kf_flow_frac: 0.015,
             // Per-frame attrition compounds between keyframes (~0.9^k on
             // handheld footage); 0.5 keeps promotion driven by flow, not churn.
             kf_survival: 0.5,
@@ -172,6 +176,14 @@ pub struct Thumb {
     pub data: Vec<u8>,
 }
 
+/// Why keyframes were promoted (diagnostic; logged with the causal summary).
+#[derive(Default, Debug, Clone, Copy)]
+pub struct PromotionStats {
+    pub flow: u32,
+    pub survival: u32,
+    pub tracks: u32,
+}
+
 pub struct VoFrontEnd {
     cfg: VoConfig,
     prev: Option<Pyramid>,
@@ -184,6 +196,9 @@ pub struct VoFrontEnd {
     pub zoom_log_scale: Vec<f64>,
     /// Every 4th keyframe's half-res image, kept for registration.
     pub thumbs: Vec<Thumb>,
+    /// kf_flow_frac resolved to pixels from the first frame's diagonal.
+    kf_flow_px: f32,
+    pub promotions: PromotionStats,
 }
 
 impl VoFrontEnd {
@@ -198,13 +213,22 @@ impl VoFrontEnd {
             frame_pts: Vec::new(),
             zoom_log_scale: Vec::new(),
             thumbs: Vec::new(),
+            kf_flow_px: 0.0,
+            promotions: PromotionStats::default(),
         }
     }
 
     /// Causal pass: feed frames in decode order with their PTS.
     pub fn push_frame(&mut self, gray: GrayImage, pts: f64) {
-        let sharpness = gradient_energy(&gray);
+        if self.n_frames == 0 {
+            let diag =
+                ((gray.width * gray.width + gray.height * gray.height) as f32).sqrt();
+            self.kf_flow_px = self.cfg.kf_flow_frac * diag;
+        }
         let pyr = Pyramid::build(gray, self.cfg.pyramid_levels);
+        // Sharpness from the half-res pyramid level: scores are only compared
+        // relatively across frames, and this skips a full-res pass per frame.
+        let sharpness = gradient_energy(&pyr.levels[1.min(pyr.levels.len() - 1)]);
         let frame_idx = self.n_frames;
         self.n_frames += 1;
         self.frame_pts.push(pts);
@@ -268,13 +292,22 @@ impl VoFrontEnd {
         }
         self.zoom_log_scale.push(zoom);
 
-        // Keyframe decision.
+        // Keyframe decision (reasons counted for the causal summary log).
         let is_first = self.keyframes.is_empty();
         let (flow_med, survival) = self.kf_statistics();
         let promote = is_first
-            || flow_med >= self.cfg.kf_flow_px
+            || flow_med >= self.kf_flow_px
             || survival < self.cfg.kf_survival
             || self.live_count() < self.cfg.min_tracks;
+        if promote && !is_first {
+            if flow_med >= self.kf_flow_px {
+                self.promotions.flow += 1;
+            } else if survival < self.cfg.kf_survival {
+                self.promotions.survival += 1;
+            } else {
+                self.promotions.tracks += 1;
+            }
+        }
         if promote {
             let kf_idx = self.keyframes.len();
             self.keyframes.push(Keyframe {
@@ -298,11 +331,21 @@ impl VoFrontEnd {
                         .collect(),
                 });
             }
-            for tr in &mut self.tracks {
-                if let Some(p) = tr.cur {
+            // Descriptor extraction fans out over tracks (indexed map applied
+            // in track order — deterministic under any thread count); it was
+            // the dominant serial per-keyframe cost.
+            let descs: Vec<Option<crate::descriptor::MultiDescriptor>> = self
+                .tracks
+                .par_iter()
+                .map(|tr| {
+                    tr.cur
+                        .map(|p| crate::descriptor::describe_multi(&pyr, p.0, p.1))
+                })
+                .collect();
+            for (tr, desc) in self.tracks.iter_mut().zip(descs) {
+                if let (Some(p), Some(d)) = (tr.cur, desc) {
                     tr.obs.push((kf_idx, p));
-                    tr.obs_desc
-                        .push(crate::descriptor::describe_multi(&pyr, p.0, p.1));
+                    tr.obs_desc.push(d);
                 }
                 // Dead tracks must drop out of the survival statistics, or
                 // the ratio decays monotonically and every frame becomes a
@@ -317,12 +360,16 @@ impl VoFrontEnd {
             let existing: Vec<(f32, f32)> =
                 self.tracks.iter().filter_map(|t| t.cur).collect();
             let corners = detect(&pyr.levels[0], &self.cfg.detect, &existing);
-            for c in corners {
+            let corner_descs: Vec<crate::descriptor::MultiDescriptor> = corners
+                .par_iter()
+                .map(|c| crate::descriptor::describe_multi(&pyr, c.x, c.y))
+                .collect();
+            for (c, d) in corners.into_iter().zip(corner_descs) {
                 self.tracks.push(Track {
                     cur: Some((c.x, c.y)),
                     at_last_kf: Some((c.x, c.y)),
                     obs: vec![(kf_idx, (c.x, c.y))],
-                    obs_desc: vec![crate::descriptor::describe_multi(&pyr, c.x, c.y)],
+                    obs_desc: vec![d],
                     landmark: None,
                 });
             }

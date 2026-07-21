@@ -124,7 +124,7 @@ fn vo_recovers_translating_trajectory() {
         },
         // The yaw partially cancels translation flow in image space, so a
         // lower threshold keeps keyframes dense enough for the window BA.
-        kf_flow_px: 6.0,
+        kf_flow_frac: 0.012, // 6 px at 400x300 (diag 500)
         ..Default::default()
     };
     let mut vo = VoFrontEnd::new(cfg);
@@ -197,7 +197,7 @@ fn vo_segments_across_a_hard_cut() {
             cx: W as f64 / 2.0,
             cy: H as f64 / 2.0,
         },
-        kf_flow_px: 6.0,
+        kf_flow_frac: 0.012, // 6 px at 400x300 (diag 500)
         ..Default::default()
     };
     let mut vo = VoFrontEnd::new(cfg);
@@ -226,7 +226,7 @@ fn vo_segments_across_a_hard_cut() {
                     cx: W as f64 / 2.0,
                     cy: H as f64 / 2.0,
                 },
-                kf_flow_px: 6.0,
+                kf_flow_frac: 0.012, // 6 px at 400x300 (diag 500)
                 ..Default::default()
             });
             for k in 0..n_half + 3 {

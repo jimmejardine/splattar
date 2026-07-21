@@ -4,6 +4,7 @@
 //! above threshold is kept.
 
 use crate::image::GrayImage;
+use rayon::prelude::*;
 
 #[derive(Debug, Clone, Copy)]
 pub struct Corner {
@@ -41,12 +42,19 @@ fn gradients(img: &GrayImage) -> (Vec<f32>, Vec<f32>) {
     let (w, h) = (img.width, img.height);
     let mut gx = vec![0.0f32; w * h];
     let mut gy = vec![0.0f32; w * h];
-    for y in 1..h - 1 {
-        for x in 1..w - 1 {
-            gx[y * w + x] = 0.5 * (img.get(x + 1, y) - img.get(x - 1, y));
-            gy[y * w + x] = 0.5 * (img.get(x, y + 1) - img.get(x, y - 1));
-        }
-    }
+    // Rows in parallel — pure per-pixel, deterministic.
+    gx.par_chunks_mut(w)
+        .zip(gy.par_chunks_mut(w))
+        .enumerate()
+        .for_each(|(y, (gxr, gyr))| {
+            if y == 0 || y >= h - 1 {
+                return;
+            }
+            for x in 1..w - 1 {
+                gxr[x] = 0.5 * (img.get(x + 1, y) - img.get(x - 1, y));
+                gyr[x] = 0.5 * (img.get(x, y + 1) - img.get(x, y - 1));
+            }
+        });
     (gx, gy)
 }
 
@@ -75,40 +83,49 @@ pub fn detect(img: &GrayImage, cfg: &DetectConfig, existing: &[(f32, f32)]) -> V
 
     let hw = cfg.half_win;
     let margin = hw + 1;
-    for y in margin..h - margin {
-        for x in margin..w - margin {
-            let cell_i = (y / cfg.cell) * cells_x + x / cfg.cell;
-            if occupied[cell_i] {
-                continue;
-            }
-            // Structure tensor over the window.
-            let (mut a, mut b, mut c) = (0.0f32, 0.0f32, 0.0f32);
-            for wy in y - hw..=y + hw {
-                for wx in x - hw..=x + hw {
-                    let ix = gx[wy * w + wx];
-                    let iy = gy[wy * w + wx];
-                    a += ix * ix;
-                    b += ix * iy;
-                    c += iy * iy;
+    if h <= 2 * margin || w <= 2 * margin {
+        return Vec::new();
+    }
+    // One cell row per band, computed in parallel — each cell's best is an
+    // ordered scan of its own pixels, so results are thread-count-invariant.
+    best.par_chunks_mut(cells_x).enumerate().for_each(|(cy, row)| {
+        let y0 = (cy * cfg.cell).max(margin);
+        let y1 = ((cy + 1) * cfg.cell).min(h - margin);
+        for y in y0..y1 {
+            for x in margin..w - margin {
+                let cx = x / cfg.cell;
+                if occupied[cy * cells_x + cx] {
+                    continue;
+                }
+                // Structure tensor over the window.
+                let (mut a, mut b, mut c) = (0.0f32, 0.0f32, 0.0f32);
+                for wy in y - hw..=y + hw {
+                    for wx in x - hw..=x + hw {
+                        let ix = gx[wy * w + wx];
+                        let iy = gy[wy * w + wx];
+                        a += ix * ix;
+                        b += ix * iy;
+                        c += iy * iy;
+                    }
+                }
+                // min eigenvalue of [[a,b],[b,c]]
+                let tr = 0.5 * (a + c);
+                let det = a * c - b * b;
+                let disc = (tr * tr - det).max(0.0).sqrt();
+                let lmin = tr - disc;
+                if lmin < cfg.min_score {
+                    continue;
+                }
+                if row[cx].is_none_or(|prev| lmin > prev.score) {
+                    row[cx] = Some(Corner {
+                        x: x as f32,
+                        y: y as f32,
+                        score: lmin,
+                    });
                 }
             }
-            // min eigenvalue of [[a,b],[b,c]]
-            let tr = 0.5 * (a + c);
-            let det = a * c - b * b;
-            let disc = (tr * tr - det).max(0.0).sqrt();
-            let lmin = tr - disc;
-            if lmin < cfg.min_score {
-                continue;
-            }
-            if best[cell_i].is_none_or(|prev| lmin > prev.score) {
-                best[cell_i] = Some(Corner {
-                    x: x as f32,
-                    y: y as f32,
-                    score: lmin,
-                });
-            }
         }
-    }
+    });
     best.into_iter().flatten().collect()
 }
 

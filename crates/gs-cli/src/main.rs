@@ -299,14 +299,48 @@ struct VoOutput {
     /// island placement joins the submaps built from them).
     segments: Vec<gs_pose::VoResult>,
     keyframes: Vec<gs_pose::vo::Keyframe>,
+    /// Tracking-resolution convention: focal/cx/cy, landmark observations,
+    /// poses, and thumbs all live at `track_size`; `track_scale` maps back
+    /// to decoded pixels (applied once, at the training boundary).
     intrinsics: gs_pose::vo::Intrinsics,
+    /// Decoded frame size (full resolution).
     video_size: (u32, u32),
+    /// Size KLT actually tracked at (long side capped; ≤ video_size).
+    track_size: (u32, u32),
+    /// video_size / track_size integer factor.
+    track_scale: u32,
     /// Half-res snapshots of every 4th keyframe (pairwise registration).
     thumbs: Vec<gs_pose::vo::Thumb>,
 }
 
 fn solved_count(seg: &gs_pose::VoResult) -> usize {
     seg.keyframe_poses.iter().flatten().count()
+}
+
+/// KLT tracks at most this long-side resolution (integer decimation of the
+/// decoded luma) — subpixel LK doesn't need full phone resolution, and the
+/// causal pass is tracking-bound, not decode-bound.
+const TRACK_MAX_SIDE: u32 = 960;
+
+/// Integer box-average decimation of a tight-packed luma plane.
+fn downscale_luma(y: &[u8], w: usize, f: usize) -> Vec<u8> {
+    let h = y.len() / w;
+    let (tw, th) = (w / f, h / f);
+    let mut out = Vec::with_capacity(tw * th);
+    let norm = (f * f) as u32;
+    for ty in 0..th {
+        for tx in 0..tw {
+            let mut acc = 0u32;
+            for sy in 0..f {
+                let row = (ty * f + sy) * w + tx * f;
+                for sx in 0..f {
+                    acc += y[row + sx] as u32;
+                }
+            }
+            out.push((acc / norm) as u8);
+        }
+    }
+    out
 }
 
 fn run_vo(
@@ -324,16 +358,23 @@ fn run_vo(
     // causal-pass wall clock is max(decode, track) instead of their sum.
     let (tx, rx) = std::sync::mpsc::sync_channel::<(Vec<u8>, u32, u32, f64)>(3);
     let worker = std::thread::spawn(move || {
-        let mut vo: Option<(VoFrontEnd, Intrinsics, (u32, u32))> = None;
+        let mut vo: Option<(VoFrontEnd, Intrinsics, (u32, u32), u32)> = None;
         let mut n = 0u32;
         while let Ok((y, width, height, pts)) = rx.recv() {
-            let (fe, ..) = vo.get_or_insert_with(|| {
-                let f = focal.unwrap_or(0.85 * width.max(height) as f64);
-                log::info!("video {width}x{height}, focal guess {f:.0}px");
+            let (fe, _, _, scale) = vo.get_or_insert_with(|| {
+                // VO doesn't need full decode resolution — cap the tracked
+                // long side (subpixel KLT at this scale is standard SLAM
+                // practice) and run the whole front-end in tracking coords.
+                let scale = width.max(height).div_ceil(TRACK_MAX_SIDE);
+                let (tw, th) = (width / scale, height / scale);
+                let f = focal.unwrap_or(0.85 * tw.max(th) as f64);
+                log::info!(
+                    "video {width}x{height}, tracking at {tw}x{th} (1/{scale}), focal guess {f:.0}px"
+                );
                 let intr = Intrinsics {
                     focal: f,
-                    cx: width as f64 / 2.0,
-                    cy: height as f64 / 2.0,
+                    cx: tw as f64 / 2.0,
+                    cy: th as f64 / 2.0,
                 };
                 (
                     VoFrontEnd::new(VoConfig {
@@ -341,11 +382,21 @@ fn run_vo(
                         ..Default::default()
                     }),
                     intr,
-                    (width, height),
+                    (tw, th),
+                    scale,
                 )
             });
-            let gray =
-                gs_pose::GrayImage::from_luma8(&y, width as usize, height as usize);
+            let s = *scale as usize;
+            let gray = if s > 1 {
+                let (tw, th) = (width as usize / s, height as usize / s);
+                gs_pose::GrayImage::from_luma8(
+                    &downscale_luma(&y, width as usize, s),
+                    tw,
+                    th,
+                )
+            } else {
+                gs_pose::GrayImage::from_luma8(&y, width as usize, height as usize)
+            };
             fe.push_frame(gray, pts);
             n += 1;
             if n.is_multiple_of(200) {
@@ -355,7 +406,9 @@ fn run_vo(
         (vo, n)
     });
     let mut sent = 0u32;
+    let mut sent_size = (0u32, 0u32);
     while let Some(frame) = reader.next_frame().context("decode")? {
+        sent_size = (frame.width, frame.height);
         if tx
             .send((frame.y, frame.width, frame.height, frame.pts))
             .is_err()
@@ -367,13 +420,18 @@ fn run_vo(
             break;
         }
     }
+    let video_size = (sent_size.0, sent_size.1);
     drop(tx);
     let (vo, n) = worker.join().expect("tracking worker panicked");
-    let (mut fe, intrinsics, video_size) = vo.context("no frames decoded")?;
+    let (mut fe, intrinsics, track_size, track_scale) = vo.context("no frames decoded")?;
     let decode_track_s = t0.elapsed().as_secs_f64();
+    let p = fe.promotions;
     log::info!(
-        "causal pass: {n} frames, {} keyframes, {:.1} fps",
+        "causal pass: {n} frames, {} keyframes ({} flow / {} survival / {} low-tracks), {:.1} fps",
         fe.keyframes.len(),
+        p.flow,
+        p.survival,
+        p.tracks,
         n as f64 / decode_track_s
     );
 
@@ -404,6 +462,8 @@ fn run_vo(
         keyframes: std::mem::take(&mut fe.keyframes),
         intrinsics,
         video_size,
+        track_size,
+        track_scale,
         thumbs: std::mem::take(&mut fe.thumbs),
     })
 }
@@ -612,8 +672,10 @@ fn prepare_training(
             .get(&kf)
             .and_then(|&slot| images[slot].as_ref())
             .map(|img| {
-                let x = ((px as usize) / ds).min(tw - 1);
-                let y = ((py as usize) / ds).min(th - 1);
+                // obs is in tracking coords; targets are decode-res / ds.
+                let ts = vo.track_scale as usize;
+                let x = ((px as usize * ts) / ds).min(tw - 1);
+                let y = ((py as usize * ts) / ds).min(th - 1);
                 let p = img[y * tw + x];
                 [
                     (p[0] * 255.0) as u8,
@@ -643,8 +705,9 @@ fn prepare_training(
         seg.landmarks.len()
     );
 
-    // Cameras in the renderer convention; every 8th view held out.
-    let focal_t = (vo.intrinsics.focal / ds as f64) as f32;
+    // Cameras in the renderer convention; every 8th view held out. The VO
+    // focal is in tracking-res pixels — lift to decode res, then downscale.
+    let focal_t = (vo.intrinsics.focal * vo.track_scale as f64 / ds as f64) as f32;
     let mut train_views = Vec::new();
     let mut eval_views = Vec::new();
     for (slot, &k) in chosen.iter().enumerate() {
@@ -986,9 +1049,11 @@ fn add_segment_submap(
         &dir.join("meta.txt"),
         &project::SubmapMeta {
             video: video.display().to_string(),
+            // Meta stays in the VO tracking-res convention (matches the
+            // persisted observations, poses, and thumbs).
             focal: vo.intrinsics.focal,
-            width: vo.video_size.0,
-            height: vo.video_size.1,
+            width: vo.track_size.0,
+            height: vo.track_size.1,
             kf_range: seg_kf_range(seg),
             focal_refined: None,
             edges,

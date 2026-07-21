@@ -51,12 +51,14 @@ impl GrayImage {
 
     /// Half-resolution downsample: 2×2 box then a light 1-2-1 pre-blur folded
     /// in by sampling the 3×3 neighborhood (standard KLT pyramid kernel).
+    /// Rows are computed in parallel (pure per-pixel — deterministic).
     pub fn downsample(&self) -> GrayImage {
+        use rayon::prelude::*;
         let w = (self.width / 2).max(1);
         let h = (self.height / 2).max(1);
         let mut out = GrayImage::new(w, h);
-        for oy in 0..h {
-            for ox in 0..w {
+        out.data.par_chunks_mut(w).enumerate().for_each(|(oy, row)| {
+            for (ox, px) in row.iter_mut().enumerate() {
                 let cx = 2 * ox;
                 let cy = 2 * oy;
                 let xm = cx.saturating_sub(1);
@@ -74,9 +76,9 @@ impl GrayImage {
                             + self.get(xp, ym)
                             + self.get(xm, yp)
                             + self.get(xp, yp));
-                out.data[oy * w + ox] = v;
+                *px = v;
             }
-        }
+        });
         out
     }
 }
