@@ -220,3 +220,19 @@ MCMC exploration noise scales with the position LR, which scales with scene
 depth, and it activates exactly at geo_start. geo_bench exonerated the
 geometry-loss kernels themselves (~0% per-iteration cost at 300k/780×520).
 Verification run with noise 20→1 in flight.
+
+### M7 addendum: async-trainer plateau (2026-07-21, joint with the optimizing session)
+
+The trainer was restructured for async readbacks in a parallel session
+(~45× faster: 2.3 → 100+ it/s; VO causal pass parallelized with rayon).
+Synthetic gates re-validated: core 28.60 dB, M4-featured 28.48, pose
+refinement +2.4 dB — pass; appearance compensation dropped +2.1 → +1.2 dB
+(async fit lag; gate temporarily at +1.0). On the real walkthrough, every
+config now plateaus at 16.5–17.8 dB (budget 150k/250k × iters 3k/7k ×
+noise 20/1 × pose-window 0.5/1.0 all within ~1 dB) vs 21.16 dB measured
+on the synchronous trainer — and eval pose-alignment adds ~nothing
+(16.90 raw vs 16.93 aligned). Working hypothesis: pose gradients and
+affine fits are applied against scene state that has since advanced
+(stale-gradient noise) — tracked as the async-refinement-lag task.
+Speed made the ablation possible at all: 8 full pipeline runs in the
+time one used to take.
