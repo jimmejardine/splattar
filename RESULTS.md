@@ -236,3 +236,24 @@ affine fits are applied against scene state that has since advanced
 (stale-gradient noise) — tracked as the async-refinement-lag task.
 Speed made the ablation possible at all: 8 full pipeline runs in the
 time one used to take.
+
+### M8 addendum: segment bridging — instrumented negative result (2026-07-21)
+
+Landed: landmark persistence v3 (per-landmark reference keyframe + pixel
+observation), submap keyframe ranges in meta, a registration strategy
+ladder (temporal bridge → covisibility-voted global → island), and a
+2D bridge solver (`sim3_from_bridge`: DLT-P6P RANSAC of a boundary
+keyframe against world 3D + gauge scale from median depth ratios —
+GT-verified to 12%/0.02 rad under heavy segment-side depth noise and
+observation outliers).
+
+Real-footage verdict on the flat's cut (kf 522↔535): descriptor matching
+across the cut produces 17–24 candidates, but < 6 are ever geometrically
+consistent (4,000 RANSAC iterations, 8 px tolerance). Root cause: the
+track-killing cut is a whip pan — the camera faces different content on
+each side, so boundary windows share almost no true field of view; the
+"matches" are repeated-texture aliases. Same conclusion as the cross-video
+case: registration needs viewpoint-robust (AKAZE-class) descriptors, used
+with the covisibility-voted matcher over whole segments (real overlap
+exists at NON-boundary times — the walkthrough revisits rooms). The 2D
+solver and instrumentation carry over unchanged once descriptors improve.

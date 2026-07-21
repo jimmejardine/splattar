@@ -152,6 +152,10 @@ pub struct VoResult {
     /// One reference observation per landmark: (keyframe index, pixel
     /// position). Lets callers sample appearance for initialization.
     pub landmark_obs: Vec<(usize, (f32, f32))>,
+    /// ALL keyframe observations per landmark — (keyframe index, pixel).
+    /// Registration bridges need to assemble many matched landmarks observed
+    /// in ONE keyframe (single-camera PnP), which the median obs alone can't.
+    pub landmark_obs_all: Vec<Vec<(usize, (f32, f32))>>,
     /// Binary descriptor at the reference observation (cross-video matching).
     pub landmark_desc: Vec<crate::descriptor::Descriptor>,
     pub spline: Option<PoseSpline>,
@@ -652,6 +656,8 @@ impl VoFrontEnd {
         // Reference observation per landmark: the middle keyframe obs of the
         // owning track (median viewpoint → least grazing appearance sample).
         let mut landmark_obs = vec![(usize::MAX, (0.0f32, 0.0f32)); landmarks.len()];
+        let mut landmark_obs_all: Vec<Vec<(usize, (f32, f32))>> =
+            vec![Vec::new(); landmarks.len()];
         let mut landmark_desc =
             vec![[0u8; crate::descriptor::DESC_BYTES]; landmarks.len()];
         for tr in &self.tracks {
@@ -660,6 +666,7 @@ impl VoFrontEnd {
                 let mid = tr.obs.len() / 2;
                 let (kf, p) = tr.obs[mid];
                 landmark_obs[l] = (kf, p);
+                landmark_obs_all[l] = tr.obs.clone();
                 landmark_desc[l] = tr.obs_desc[mid];
             }
         }
@@ -670,6 +677,7 @@ impl VoFrontEnd {
                 .map(|l| DVec3::new(l[0], l[1], l[2]))
                 .collect(),
             landmark_obs,
+            landmark_obs_all,
             landmark_desc,
             spline,
             anchor,

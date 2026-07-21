@@ -471,7 +471,7 @@ fn prepare_training(
             .map(|i| chosen[(i as f64 * stride) as usize])
             .collect();
     }
-    anyhow::ensure!(chosen.len() >= 12, "too few usable views: {}", chosen.len());
+    anyhow::ensure!(chosen.len() >= 4, "too few usable views: {}", chosen.len());
     log::info!(
         "selected {} training views (downscale {ds} -> {tw}x{th})",
         chosen.len()
@@ -548,9 +548,11 @@ fn prepare_training(
             pos,
             color,
             desc: seg.landmark_desc[li],
+            kf: kf as u32,
+            obs: [px, py],
         });
     }
-    anyhow::ensure!(points.len() >= 500, "too few init points: {}", points.len());
+    anyhow::ensure!(points.len() >= 150, "too few init points: {}", points.len());
     log::info!(
         "init: {} landmarks kept of {} (median-distance filter)",
         points.len(),
@@ -729,6 +731,7 @@ fn run_pipeline(
             focal: vo.intrinsics.focal,
             width: vo.video_size.0,
             height: vo.video_size.1,
+            kf_range: seg_kf_range(primary),
             world_from_submap: Some(project::WorldFromSubmap::identity()),
         },
     )?;
@@ -816,14 +819,16 @@ fn add_segment_submap(
     max_views: u32,
 ) -> anyhow::Result<()> {
     use glam::DVec3;
-    use gs_pose::descriptor::match_descriptors;
-    use gs_pose::sim3::{Sim3G, register_point_sets};
+    use gs_pose::sim3::Sim3G;
 
     let proj = project::Project::load(project_root)?;
 
-    // Pool the registered submaps' landmarks in project-world coordinates.
-    let mut world_pts: Vec<DVec3> = Vec::new();
-    let mut world_desc: Vec<gs_pose::descriptor::Descriptor> = Vec::new();
+    // Registered submaps' landmarks in project-world coordinates, retaining
+    // per-submap identity + keyframe index (both matter for registration
+    // strategies), spatially deduped per submap (KLT respawns re-triangulate
+    // the same corner dozens of times; coincident duplicates let a collapse
+    // transform out-vote the true registration).
+    let mut world: Vec<DbLandmark> = Vec::new();
     for (i, meta) in proj.submaps.iter().enumerate() {
         let Some(w) = &meta.world_from_submap else { continue };
         let lms = project::read_landmarks(
@@ -834,64 +839,43 @@ fn add_segment_submap(
             rot: glam::DQuat::from_xyzw(w.quat[1], w.quat[2], w.quat[3], w.quat[0]),
             trans: DVec3::from_array(w.trans),
         };
-        for l in lms {
-            world_pts.push(s.apply(DVec3::new(
-                l.pos[0] as f64,
-                l.pos[1] as f64,
-                l.pos[2] as f64,
-            )));
-            world_desc.push(l.desc);
-        }
+        let entries: Vec<DbLandmark> = lms
+            .into_iter()
+            .map(|l| DbLandmark {
+                pos: s.apply(DVec3::new(l.pos[0] as f64, l.pos[1] as f64, l.pos[2] as f64)),
+                desc: l.desc,
+                kf: l.kf,
+                obs: (l.obs[0], l.obs[1]),
+                submap: i,
+            })
+            .collect();
+        world.extend(dedup_db_landmarks(entries));
     }
-    // Spatial dedup: KLT respawns re-triangulate the same physical corner
-    // dozens of times across a long video; coincident duplicates let a
-    // degenerate collapse transform out-vote the true registration.
-    let (world_pts, world_desc) = dedup_landmarks(world_pts, world_desc);
-    log::info!("project DB: {} registered landmarks after dedup", world_pts.len());
+    log::info!("project DB: {} registered landmarks after dedup", world.len());
 
     let prepared = prepare_training(video, vo, seg, downscale, max_views)?;
 
-    // Descriptor matching new-submap -> world, then Sim(3) RANSAC on 3D pairs.
-    let new_pts_all: Vec<DVec3> = prepared
+    let new_all: Vec<DbLandmark> = prepared
         .landmarks
         .iter()
-        .map(|l| DVec3::new(l.pos[0] as f64, l.pos[1] as f64, l.pos[2] as f64))
+        .map(|l| DbLandmark {
+            pos: DVec3::new(l.pos[0] as f64, l.pos[1] as f64, l.pos[2] as f64),
+            desc: l.desc,
+            kf: l.kf,
+            obs: (l.obs[0], l.obs[1]),
+            submap: usize::MAX,
+        })
         .collect();
-    let new_desc_all: Vec<gs_pose::descriptor::Descriptor> =
-        prepared.landmarks.iter().map(|l| l.desc).collect();
-    let (new_pts, new_desc) = dedup_landmarks(new_pts_all, new_desc_all);
-    let pairs = match_descriptors(&new_desc, &world_desc, 55, 0.85);
-    log::info!("descriptor matches: {}", pairs.len());
-    let mut registration = None;
-    if pairs.len() >= 20 {
-        let a: Vec<DVec3> = pairs.iter().map(|&(i, _)| new_pts[i]).collect();
-        let b: Vec<DVec3> = pairs.iter().map(|&(_, j)| world_pts[j]).collect();
-        // Threshold relative to the world scene scale.
-        let centroid = b.iter().copied().sum::<DVec3>() / b.len() as f64;
-        let mut d: Vec<f64> = b.iter().map(|p| (*p - centroid).length()).collect();
-        d.sort_by(f64::total_cmp);
-        let thresh = 0.05 * d[d.len() / 2];
-        if let Some((sim3, inliers)) = register_point_sets(&a, &b, 800, thresh, 0x5133) {
-            // Inlier spread gate: a genuine overlap spans structure, it isn't
-            // a tight cluster barely wider than the RANSAC threshold.
-            let inl_b: Vec<DVec3> = inliers.iter().map(|&i| b[i]).collect();
-            let cen = inl_b.iter().copied().sum::<DVec3>() / inl_b.len() as f64;
-            let spread = (inl_b.iter().map(|p| (*p - cen).length_squared()).sum::<f64>()
-                / inl_b.len() as f64)
-                .sqrt();
-            log::info!(
-                "Sim(3): {} of {} matches agree (scale {:.3}, inlier spread {:.2} vs thresh {:.2})",
-                inliers.len(),
-                pairs.len(),
-                sim3.scale,
-                spread,
-                thresh
-            );
-            if inliers.len() >= 25 && (0.05..=20.0).contains(&sim3.scale) && spread > 4.0 * thresh
-            {
-                registration = Some(sim3);
-            }
-        }
+    let new = dedup_db_landmarks(new_all);
+
+    // Strategy ladder: temporal bridge (same-video neighbor segments — small
+    // viewpoint change, descriptors reliable), then covisibility-voted global
+    // matching. No success → island (first-class, per PLAN).
+    let seg_range = seg_kf_range(seg);
+    let mut registration =
+        try_bridge_registration(&proj, video, seg, &vo.intrinsics, seg_range, &world, &new);
+    if registration.is_none() {
+        registration = try_global_registration(&world, &new);
     }
 
     let (idx, dir) = project::Project::next_submap_dir(project_root)?;
@@ -908,6 +892,7 @@ fn add_segment_submap(
             focal: vo.intrinsics.focal,
             width: vo.video_size.0,
             height: vo.video_size.1,
+            kf_range: seg_kf_range(seg),
             world_from_submap,
         },
     )?;
@@ -927,35 +912,303 @@ fn add_segment_submap(
     Ok(())
 }
 
-/// Keep one landmark per voxel (0.5% of the median centroid distance): the
-/// registration wants distinct physical corners, not every re-triangulation.
-fn dedup_landmarks(
-    pts: Vec<glam::DVec3>,
-    desc: Vec<gs_pose::descriptor::Descriptor>,
-) -> (Vec<glam::DVec3>, Vec<gs_pose::descriptor::Descriptor>) {
-    if pts.is_empty() {
-        return (pts, desc);
+/// A registration-DB landmark: world/segment position + descriptor +
+/// reference keyframe + owning submap (usize::MAX for the new side).
+struct DbLandmark {
+    pos: glam::DVec3,
+    desc: gs_pose::descriptor::Descriptor,
+    kf: u32,
+    /// Reference observation pixel (NaN when unknown, e.g. pre-v3 files).
+    /// Persisted for the world side of future 2D-based registration; the
+    /// current bridge reads new-side observations from the VO result instead.
+    #[allow(dead_code)]
+    obs: (f32, f32),
+    submap: usize,
+}
+
+/// Voxel dedup (0.5% of median centroid distance), keeping full records.
+fn dedup_db_landmarks(lms: Vec<DbLandmark>) -> Vec<DbLandmark> {
+    if lms.is_empty() {
+        return lms;
     }
-    let centroid = pts.iter().copied().sum::<glam::DVec3>() / pts.len() as f64;
-    let mut d: Vec<f64> = pts.iter().map(|p| (*p - centroid).length()).collect();
+    let centroid = lms.iter().map(|l| l.pos).sum::<glam::DVec3>() / lms.len() as f64;
+    let mut d: Vec<f64> = lms.iter().map(|l| (l.pos - centroid).length()).collect();
     d.sort_by(f64::total_cmp);
     let voxel = (0.005 * d[d.len() / 2]).max(1e-6);
     let mut seen = std::collections::HashSet::new();
-    let mut out_p = Vec::new();
-    let mut out_d = Vec::new();
-    for (p, dsc) in pts.into_iter().zip(desc) {
-        let key = (
-            (p.x / voxel).floor() as i64,
-            (p.y / voxel).floor() as i64,
-            (p.z / voxel).floor() as i64,
+    lms.into_iter()
+        .filter(|l| {
+            seen.insert((
+                (l.pos.x / voxel).floor() as i64,
+                (l.pos.y / voxel).floor() as i64,
+                (l.pos.z / voxel).floor() as i64,
+            ))
+        })
+        .collect()
+}
+
+/// Shared Sim(3) attempt over candidate 3D-3D pairs with degeneracy gates.
+/// `thresh_frac` scales the RANSAC threshold off the world-side cloud spread;
+/// `min_inliers` differs per strategy (a temporal bridge has a strong prior).
+fn attempt_sim3(
+    a: &[glam::DVec3],
+    b: &[glam::DVec3],
+    thresh_frac: f64,
+    min_inliers: usize,
+    label: &str,
+) -> Option<gs_pose::sim3::Sim3G> {
+    use gs_pose::sim3::register_point_sets;
+    if a.len() < min_inliers {
+        return None;
+    }
+    let centroid = b.iter().copied().sum::<glam::DVec3>() / b.len() as f64;
+    let mut d: Vec<f64> = b.iter().map(|p| (*p - centroid).length()).collect();
+    d.sort_by(f64::total_cmp);
+    let thresh = (thresh_frac * d[d.len() / 2]).max(1e-9);
+    let (sim3, inliers) = register_point_sets(a, b, 1000, thresh, 0x5133)?;
+    let inl_b: Vec<glam::DVec3> = inliers.iter().map(|&i| b[i]).collect();
+    let cen = inl_b.iter().copied().sum::<glam::DVec3>() / inl_b.len() as f64;
+    let spread = (inl_b.iter().map(|p| (*p - cen).length_squared()).sum::<f64>()
+        / inl_b.len() as f64)
+        .sqrt();
+    log::info!(
+        "Sim(3) [{label}]: {}/{} agree (scale {:.3}, spread {:.2} vs thresh {:.2})",
+        inliers.len(),
+        a.len(),
+        sim3.scale,
+        spread,
+        thresh
+    );
+    (inliers.len() >= min_inliers
+        && (0.05..=20.0).contains(&sim3.scale)
+        && spread > 4.0 * thresh)
+        .then_some(sim3)
+}
+
+/// Temporal bridge: consecutive segments of the SAME video are separated by
+/// a track-loss cut, but their boundary keyframes view the same space seconds
+/// apart — small viewpoint change, where the patch descriptors are reliable.
+/// Match only boundary-window landmarks against each temporally adjacent
+/// registered submap.
+fn try_bridge_registration(
+    proj: &project::Project,
+    video: &std::path::Path,
+    seg: &gs_pose::VoResult,
+    intr: &gs_pose::vo::Intrinsics,
+    seg_range: Option<(u32, u32)>,
+    world: &[DbLandmark],
+    _new: &[DbLandmark],
+) -> Option<gs_pose::sim3::Sim3G> {
+    use gs_pose::descriptor::match_descriptors;
+    const WINDOW: u32 = 60; // keyframes each side of the cut
+    const MAX_GAP: u32 = 200; // dropped stretches between segments can be long
+
+    let (s0, s1) = seg_range?;
+    let video_str = video.display().to_string();
+    for (i, meta) in proj.submaps.iter().enumerate() {
+        if meta.world_from_submap.is_none() || meta.video != video_str {
+            continue;
+        }
+        let Some((o0, o1)) = meta.kf_range else { continue };
+        // Which side is adjacent? (other before seg, or after)
+        let (world_edge, new_edge) = if o1 <= s0 && s0 - o1 <= MAX_GAP {
+            (o1, s0)
+        } else if s1 <= o0 && o0 - s1 <= MAX_GAP {
+            (o0, s1)
+        } else {
+            continue;
+        };
+        let w_sub: Vec<&DbLandmark> = world
+            .iter()
+            .filter(|l| l.submap == i && l.kf.abs_diff(world_edge) <= WINDOW)
+            .collect();
+        // New side straight from the segment (indices retained — the 2D stage
+        // needs each landmark's full observation list).
+        let n_sub: Vec<(usize, glam::DVec3)> = seg
+            .landmark_obs
+            .iter()
+            .enumerate()
+            .filter(|(_, (kf, _))| {
+                *kf != usize::MAX && (*kf as u32).abs_diff(new_edge) <= WINDOW
+            })
+            .map(|(li, _)| (li, seg.landmarks[li]))
+            .collect();
+        if w_sub.len() < 12 || n_sub.len() < 12 {
+            continue;
+        }
+        let wd: Vec<_> = w_sub.iter().map(|l| l.desc).collect();
+        let nd: Vec<_> = n_sub
+            .iter()
+            .map(|(li, _)| seg.landmark_desc[*li])
+            .collect();
+        // TIGHT matching for the 3D-3D attempt: indoor texture repeats, and
+        // false matches drown Umeyama RANSAC (measured: 131 loose, 3 true).
+        let pairs = match_descriptors(&nd, &wd, 40, 0.75);
+        log::info!(
+            "bridge to submap-{i} (kf {world_edge}↔{new_edge}): {} window landmarks vs {}, {} tight matches",
+            n_sub.len(),
+            w_sub.len(),
+            pairs.len()
         );
-        if seen.insert(key) {
-            out_p.push(p);
-            out_d.push(dsc);
+        if pairs.len() >= 8 {
+            let a: Vec<glam::DVec3> = pairs.iter().map(|&(x, _)| n_sub[x].1).collect();
+            let b: Vec<glam::DVec3> = pairs.iter().map(|&(_, y)| w_sub[y].pos).collect();
+            if let Some(s) = attempt_sim3(&a, &b, 0.15, 8, &format!("bridge s{i}")) {
+                return Some(s);
+            }
+        }
+        // 2D bridge: boundary landmarks on the new side come from short
+        // tracks truncated by the cut — depths are the noisiest in the map,
+        // but the 2D observations are exact. DLT-PnP a boundary keyframe
+        // against the world 3D; gauge scale via median depth ratio. Looser
+        // matches are fine here — reprojection RANSAC absorbs outliers.
+        // Tight matches first (high inlier fraction — best for the 6-point
+        // minimal sample), loose as fallback for sparse boundaries.
+        let loose = match_descriptors(&nd, &wd, 55, 0.85);
+        log::info!(
+            "2D-bridge stage: {} tight / {} loose matches",
+            pairs.len(),
+            loose.len()
+        );
+        let match_sets = [&pairs, &loose];
+        let mut cand: Vec<usize> = seg
+            .keyframe_poses
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| p.is_some())
+            .map(|(k, _)| k)
+            .collect();
+        cand.sort_by_key(|&k| (k as u32).abs_diff(new_edge));
+        for (set_idx, match_set) in match_sets.iter().enumerate() {
+            let min_obs = if set_idx == 0 { 6 } else { 8 };
+            for &k in cand.iter().take(10) {
+                let kp = seg.keyframe_poses[k].as_ref().unwrap();
+                let obs: Vec<gs_pose::sim3::BridgeObs> = match_set
+                    .iter()
+                    .filter_map(|&(x, y)| {
+                        let li = n_sub[x].0;
+                        let px = seg.landmark_obs_all[li]
+                            .iter()
+                            .find(|(kk, _)| *kk == k)?
+                            .1;
+                        Some(gs_pose::sim3::BridgeObs {
+                            obs: (
+                                (px.0 as f64 - intr.cx) / intr.focal,
+                                (px.1 as f64 - intr.cy) / intr.focal,
+                            ),
+                            world: w_sub[y].pos,
+                            seg: n_sub[x].1,
+                        })
+                    })
+                    .collect();
+                log::debug!(
+                    "2D bridge candidate kf {k} (set {set_idx}): {} co-observed",
+                    obs.len()
+                );
+                if obs.len() < min_obs {
+                    continue;
+                }
+                let q = kp.pose.r.quaternion();
+                let t = &kp.pose.t;
+                let result = gs_pose::sim3::sim3_from_bridge(
+                    glam::DQuat::from_xyzw(q.i, q.j, q.k, q.w),
+                    glam::DVec3::new(t[0], t[1], t[2]),
+                    &obs,
+                    8.0 / intr.focal, // ~8 px reprojection tolerance
+                    0x2b71d6e,
+                );
+                match result {
+                    Some((s, inl)) => {
+                        log::info!(
+                            "2D bridge via kf {k} (set {set_idx}): {inl}/{} inliers (scale {:.3})",
+                            obs.len(),
+                            s.scale
+                        );
+                        if inl >= min_obs && (0.05..=20.0).contains(&s.scale) {
+                            return Some(s);
+                        }
+                    }
+                    None => {
+                        log::debug!(
+                            "2D bridge kf {k} (set {set_idx}): solver rejected ({} obs)",
+                            obs.len()
+                        );
+                    }
+                }
+            }
         }
     }
-    (out_p, out_d)
+    None
 }
+
+/// Covisibility-voted global matching: match everything loosely, then keep
+/// only matches whose (new-kf, world-kf) neighborhood pair gathers multiple
+/// independent votes — genuine overlap concentrates on covisible keyframe
+/// pairs, noise scatters. This replaces blind pooled matching.
+fn try_global_registration(
+    world: &[DbLandmark],
+    new: &[DbLandmark],
+) -> Option<gs_pose::sim3::Sim3G> {
+    use gs_pose::descriptor::match_descriptors;
+    const BUCKET: u32 = 8; // keyframes per vote bucket
+    const MIN_VOTES: usize = 5;
+
+    let wd: Vec<_> = world.iter().map(|l| l.desc).collect();
+    let nd: Vec<_> = new.iter().map(|l| l.desc).collect();
+    let pairs = match_descriptors(&nd, &wd, 55, 0.85);
+    log::info!("global descriptor matches: {}", pairs.len());
+    if pairs.len() < 20 {
+        return None;
+    }
+    // Vote by (new bucket, world submap, world bucket).
+    let mut votes: std::collections::HashMap<(u32, usize, u32), usize> =
+        std::collections::HashMap::new();
+    for &(x, y) in &pairs {
+        if new[x].kf == u32::MAX || world[y].kf == u32::MAX {
+            continue;
+        }
+        *votes
+            .entry((new[x].kf / BUCKET, world[y].submap, world[y].kf / BUCKET))
+            .or_default() += 1;
+    }
+    let good: std::collections::HashSet<(u32, usize, u32)> = votes
+        .into_iter()
+        .filter(|(_, v)| *v >= MIN_VOTES)
+        .map(|(k, _)| k)
+        .collect();
+    let filtered: Vec<(usize, usize)> = pairs
+        .into_iter()
+        .filter(|&(x, y)| {
+            new[x].kf != u32::MAX
+                && world[y].kf != u32::MAX
+                && good.contains(&(new[x].kf / BUCKET, world[y].submap, world[y].kf / BUCKET))
+        })
+        .collect();
+    log::info!(
+        "covisibility vote: {} matches in {} agreeing keyframe-pair buckets",
+        filtered.len(),
+        good.len()
+    );
+    if filtered.len() < 20 {
+        return None;
+    }
+    let a: Vec<glam::DVec3> = filtered.iter().map(|&(x, _)| new[x].pos).collect();
+    let b: Vec<glam::DVec3> = filtered.iter().map(|&(_, y)| world[y].pos).collect();
+    attempt_sim3(&a, &b, 0.05, 25, "covis")
+}
+
+/// Solved keyframe index range (inclusive) of a VO segment.
+fn seg_kf_range(seg: &gs_pose::VoResult) -> Option<(u32, u32)> {
+    let solved: Vec<u32> = seg
+        .keyframe_poses
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| p.is_some())
+        .map(|(k, _)| k as u32)
+        .collect();
+    Some((*solved.first()?, *solved.last()?))
+}
+
 
 /// Bake the composed project into one compat .ply + a manifest sidecar.
 fn run_export(project_root: &std::path::Path, out: Option<PathBuf>) -> anyhow::Result<()> {

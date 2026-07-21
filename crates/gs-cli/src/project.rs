@@ -14,13 +14,22 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
 
-pub const LANDMARK_MAGIC: &[u8; 8] = b"SPLLM01\n";
+pub const LANDMARK_MAGIC_V1: &[u8; 8] = b"SPLLM01\n";
+pub const LANDMARK_MAGIC_V2: &[u8; 8] = b"SPLLM02\n";
+pub const LANDMARK_MAGIC: &[u8; 8] = b"SPLLM03\n";
 pub const DESC_BYTES: usize = 32;
 
 pub struct Landmark {
     pub pos: [f32; 3],
     pub color: [u8; 3],
     pub desc: [u8; DESC_BYTES],
+    /// Reference keyframe index (VO-global within the source video); enables
+    /// temporal-bridge and covisibility-grouped registration. `u32::MAX` for
+    /// landmarks loaded from v1 files.
+    pub kf: u32,
+    /// Pixel position of the reference observation in keyframe `kf` (2D
+    /// anchor for PnP-style bridging). NaN when loaded from pre-v3 files.
+    pub obs: [f32; 2],
 }
 
 /// Sim(3) mapping submap coordinates into project-world coordinates.
@@ -47,6 +56,9 @@ pub struct SubmapMeta {
     pub focal: f64,
     pub width: u32,
     pub height: u32,
+    /// Solved keyframe index range of the source VO segment (inclusive) —
+    /// lets same-video segments find their temporal neighbors.
+    pub kf_range: Option<(u32, u32)>,
     /// None = unregistered island.
     pub world_from_submap: Option<WorldFromSubmap>,
 }
@@ -94,6 +106,9 @@ pub fn write_meta(path: &Path, meta: &SubmapMeta) -> anyhow::Result<()> {
         "video={}\nfocal={}\nwidth={}\nheight={}\n",
         meta.video, meta.focal, meta.width, meta.height
     );
+    if let Some((a, b)) = meta.kf_range {
+        s.push_str(&format!("kf_range={a} {b}\n"));
+    }
     if let Some(w) = &meta.world_from_submap {
         s.push_str(&format!(
             "sim3={} {} {} {} {} {} {} {}\n",
@@ -118,6 +133,7 @@ pub fn read_meta(path: &Path) -> anyhow::Result<SubmapMeta> {
     let mut focal = 0.0f64;
     let (mut width, mut height) = (0u32, 0u32);
     let mut sim3 = None;
+    let mut kf_range = None;
     for line in text.lines() {
         let Some((k, v)) = line.split_once('=') else { continue };
         match k {
@@ -125,6 +141,11 @@ pub fn read_meta(path: &Path) -> anyhow::Result<SubmapMeta> {
             "focal" => focal = v.parse()?,
             "width" => width = v.parse()?,
             "height" => height = v.parse()?,
+            "kf_range" => {
+                if let Some((a, b)) = v.split_once(' ') {
+                    kf_range = Some((a.trim().parse()?, b.trim().parse()?));
+                }
+            }
             "sim3" => {
                 let nums: Vec<f64> = v
                     .split_whitespace()
@@ -150,6 +171,7 @@ pub fn read_meta(path: &Path) -> anyhow::Result<SubmapMeta> {
         focal,
         width,
         height,
+        kf_range,
         world_from_submap: sim3,
     })
 }
@@ -164,6 +186,9 @@ pub fn write_landmarks(path: &Path, landmarks: &[Landmark]) -> anyhow::Result<()
         }
         f.write_all(&l.color)?;
         f.write_all(&l.desc)?;
+        f.write_all(&l.kf.to_le_bytes())?;
+        f.write_all(&l.obs[0].to_le_bytes())?;
+        f.write_all(&l.obs[1].to_le_bytes())?;
     }
     Ok(())
 }
@@ -174,9 +199,12 @@ pub fn read_landmarks(path: &Path) -> anyhow::Result<Vec<Landmark>> {
     );
     let mut magic = [0u8; 8];
     f.read_exact(&mut magic)?;
-    if &magic != LANDMARK_MAGIC {
-        bail!("bad landmark file magic in {}", path.display());
-    }
+    let version = match &magic {
+        m if m == LANDMARK_MAGIC => 3,
+        m if m == LANDMARK_MAGIC_V2 => 2,
+        m if m == LANDMARK_MAGIC_V1 => 1,
+        _ => bail!("bad landmark file magic in {}", path.display()),
+    };
     let mut n8 = [0u8; 8];
     f.read_exact(&mut n8)?;
     let n = u64::from_le_bytes(n8) as usize;
@@ -192,7 +220,30 @@ pub fn read_landmarks(path: &Path) -> anyhow::Result<Vec<Landmark>> {
         f.read_exact(&mut color)?;
         let mut desc = [0u8; DESC_BYTES];
         f.read_exact(&mut desc)?;
-        out.push(Landmark { pos, color, desc });
+        let kf = if version >= 2 {
+            let mut b = [0u8; 4];
+            f.read_exact(&mut b)?;
+            u32::from_le_bytes(b)
+        } else {
+            u32::MAX
+        };
+        let obs = if version >= 3 {
+            let mut b = [0u8; 8];
+            f.read_exact(&mut b)?;
+            [
+                f32::from_le_bytes(b[0..4].try_into().unwrap()),
+                f32::from_le_bytes(b[4..8].try_into().unwrap()),
+            ]
+        } else {
+            [f32::NAN; 2]
+        };
+        out.push(Landmark {
+            pos,
+            color,
+            desc,
+            kf,
+            obs,
+        });
     }
     Ok(out)
 }
@@ -211,6 +262,7 @@ mod tests {
             focal: 722.5,
             width: 478,
             height: 850,
+            kf_range: Some((535, 1290)),
             world_from_submap: Some(WorldFromSubmap {
                 scale: 2.5,
                 quat: [0.9, 0.1, -0.2, 0.3],
@@ -221,6 +273,7 @@ mod tests {
         let back = read_meta(&p).unwrap();
         assert_eq!(back.video, meta.video);
         assert_eq!(back.width, 478);
+        assert_eq!(back.kf_range, Some((535, 1290)));
         let w = back.world_from_submap.unwrap();
         assert_eq!(w.scale, 2.5);
         assert_eq!(w.trans, [1.0, -2.0, 3.0]);
@@ -236,6 +289,8 @@ mod tests {
                 pos: [k as f32, -(k as f32), 0.5 * k as f32],
                 color: [k as u8, 2 * k as u8, 255 - k as u8],
                 desc: [k as u8; DESC_BYTES],
+                kf: 100 + k as u32,
+                obs: [10.0 * k as f32, 5.0 + k as f32],
             })
             .collect();
         write_landmarks(&p, &lms).unwrap();
@@ -243,5 +298,6 @@ mod tests {
         assert_eq!(back.len(), 10);
         assert_eq!(back[3].pos, [3.0, -3.0, 1.5]);
         assert_eq!(back[7].desc, [7u8; DESC_BYTES]);
+        assert_eq!(back[7].kf, 107);
     }
 }
