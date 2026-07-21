@@ -596,15 +596,20 @@ fn train_and_bake(
     let psnr = if eval_views.is_empty() {
         f64::NAN
     } else {
-        // Focal is shared — apply the refined value to the held-out cameras
-        // (their poses stay as VO produced them).
+        // Focal is shared — apply the refined value to the held-out cameras.
         if trainer.focal_scale != 1.0 {
             log::info!("refined focal scale: {:.4}", trainer.focal_scale);
             for v in &mut eval_views {
                 v.camera.focal *= trainer.focal_scale;
             }
         }
-        trainer.eval_psnr(&ctx, &eval_views)
+        // Training legitimately drifts the gauge away from raw VO poses, so
+        // frozen eval cameras measure gauge drift, not model quality — align
+        // each eval pose photometrically to the frozen model before scoring.
+        let raw = trainer.eval_psnr(&ctx, &eval_views);
+        let refined = trainer.eval_psnr_refined(&ctx, &eval_views, 40);
+        log::info!("held-out PSNR: {raw:.2} dB raw poses, {refined:.2} dB pose-aligned");
+        refined
     };
     log::info!(
         "trained {iters} iters in {elapsed:.0?} ({:.1} it/s); held-out PSNR {psnr:.2} dB",

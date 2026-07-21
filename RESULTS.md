@@ -150,3 +150,25 @@ Deferred from M6 (tracked for M8 prep): AKAZE-style descriptor DB + Sim(3)
 relocalization primitive, TUM RGB-D ATE benchmark (dataset not on disk), VO
 solve perf (188 s for 404 keyframes in a dev build — local-BA cadence and
 match indexing are the known hotspots).
+
+## M7 — video-native training end-to-end (2026-07-21, in progress)
+
+| Check | Gate | Measured |
+|---|---|---|
+| `gs-cli run <video>` end-to-end | video → walkable .ply | **works**: 600 frames → VO (404 kf) → 73 views → 150k surfels → project dir + baked splat, ~40 min wall total (dominated by VO solve 3 min + training 21 min @ 2.3 it/s, 239×425) |
+| Held-out keyframe PSNR | > 24 dB | **20.33 dB** (pose-aligned eval; 18.80 frozen-pose baseline). Gate open — see levers below |
+| Pose+focal refinement in trainer | improves over frozen VO poses | pass on synthetic (25.35 → 27.58 dB on ~2° perturbed poses); on real footage raw-pose eval drops to 16.56 dB while aligned eval gains — training drifts the gauge, as expected for monocular |
+| Project persistence | submap-0 written | meta.txt, landmarks.bin (pos+color+descriptor), trajectory.csv, splat.ply |
+
+Findings encoded in code: camera-center refinement LR must scale with the
+view's **median scene depth**, not scene extent (a walkthrough's extent is
+~30× the room depth — extent scaling produced 0.16-unit camera steps and
+destabilized training); held-out eval must photometrically align eval poses
+to the frozen model before scoring (BARF-style), since gauge drift otherwise
+masquerades as model error.
+
+Open levers for the 24 dB gate, in expected order of impact: per-submap
+time-varying affine appearance model (phone auto-exposure is unmodeled and
+visibly swings across the walkthrough — PLAN already specifies this),
+rolling-shutter/EIS handling, geometry losses once task #32 lands, longer
+training + higher resolution, stronger VO global BA.

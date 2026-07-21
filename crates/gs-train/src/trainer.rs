@@ -125,6 +125,11 @@ pub struct Trainer {
     /// Multiplier on the initial focal (shared across views), refined in
     /// log-space when `focal_refine` is on.
     pub focal_scale: f32,
+    /// Subsampled init positions for per-view depth statistics: the camera
+    /// center LR must scale with the *local viewing depth*, not the scene
+    /// extent (a long walkthrough's extent is ~30× the room depth).
+    probe_positions: Vec<Vec3>,
+    pose_depth: Vec<f32>,
 }
 
 #[repr(C)]
@@ -163,6 +168,14 @@ impl Trainer {
             hi = hi.max(*p);
         }
         let extent = (hi - lo).length().max(1e-3) * 0.5;
+        // Depth probes for pose-refinement LR scaling.
+        let probe_stride = (init.positions.len() / 2048).max(1);
+        let probe_positions: Vec<Vec3> = init
+            .positions
+            .iter()
+            .step_by(probe_stride)
+            .copied()
+            .collect();
 
         let mut optim = Optimizer::new(ctx);
         optim.add_class(ctx, "pos", n * 4, Activation::Identity, config.lr_pos * extent, &raster.grad_pos, &raster.positions);
@@ -280,7 +293,34 @@ impl Trainer {
             pose_t: vec![0; n_views],
             focal_state: (0.0, 0.0, 0),
             focal_scale: 1.0,
+            probe_positions,
+            pose_depth: vec![0.0; n_views],
         }
+    }
+
+    /// Median depth of the probe positions in front of this camera (cached).
+    fn view_depth(&mut self, view_idx: usize) -> f32 {
+        if self.pose_depth[view_idx] > 0.0 {
+            return self.pose_depth[view_idx];
+        }
+        let cam = &self.views[view_idx].camera;
+        let inv = cam.quat.conjugate();
+        let mut depths: Vec<f32> = self
+            .probe_positions
+            .iter()
+            .map(|p| -(inv * (*p - cam.center)).z)
+            .filter(|d| *d > 0.05)
+            .collect();
+        let d = if depths.is_empty() {
+            self.extent * 0.1
+        } else {
+            let mid = depths.len() / 2;
+            *depths
+                .select_nth_unstable_by(mid, f32::total_cmp)
+                .1
+        };
+        self.pose_depth[view_idx] = d.max(1e-3);
+        self.pose_depth[view_idx]
     }
 
     fn next_view(&mut self) -> usize {
@@ -386,53 +426,25 @@ impl Trainer {
     /// Rotation uses the right-perturbation R' = R·exp([δ]×): the Riemannian
     /// gradient is the antisymmetric part of B = Rᵀ·(dl/dR).
     fn refine_pose(&mut self, ctx: &GpuContext, view_idx: usize, camera: &RasterCamera) {
-        let g: Vec<f32> = bytemuck::cast_slice(&gs_wgpu::buffers::readback(
-            &ctx.device,
-            &ctx.queue,
-            &self.raster.grad_cam,
-        ))
-        .to_vec();
-        if g.iter().take(13).any(|v| !v.is_finite()) {
+        let g = read_cam_grads(ctx, &self.raster.grad_cam);
+        let Some(grad) = camera_step_grad(&g, camera.quat) else {
             return;
-        }
-        let a = glam::Mat3::from_cols(
-            glam::Vec3::new(g[0], g[1], g[2]),
-            glam::Vec3::new(g[3], g[4], g[5]),
-            glam::Vec3::new(g[6], g[7], g[8]),
-        );
-        let r = glam::Mat3::from_quat(camera.quat);
-        let b = r.transpose() * a;
-        let grad = [
-            b.col(1)[2] - b.col(2)[1], // B32 − B23
-            b.col(2)[0] - b.col(0)[2], // B13 − B31
-            b.col(0)[1] - b.col(1)[0], // B21 − B12
-            g[9],
-            g[10],
-            g[11],
-        ];
-
-        // Adam (β1 0.9, β2 0.999) with per-block LRs.
+        };
+        // Center LR scales with this view's median scene depth: a center
+        // move of d·δθ shifts the image about as much as a rotation of δθ.
+        let depth = self.view_depth(view_idx);
         let t = self.pose_t[view_idx] + 1;
         self.pose_t[view_idx] = t;
-        let bc1 = 1.0 - 0.9f32.powi(t as i32);
-        let bc2 = 1.0 - 0.999f32.powi(t as i32);
-        let lr_rot = self.config.pose_refine_lr;
-        let lr_cen = self.config.pose_refine_lr * self.extent;
-        let mut step = [0.0f32; 6];
-        for k in 0..6 {
-            let m = &mut self.pose_m[view_idx][k];
-            let v = &mut self.pose_v[view_idx][k];
-            *m = 0.9 * *m + 0.1 * grad[k];
-            *v = 0.999 * *v + 0.001 * grad[k] * grad[k];
-            let mhat = *m / bc1;
-            let vhat = *v / bc2;
-            let lr = if k < 3 { lr_rot } else { lr_cen };
-            step[k] = lr * mhat / (vhat.sqrt() + 1e-10);
-        }
+        let step = adam6(
+            &mut self.pose_m[view_idx],
+            &mut self.pose_v[view_idx],
+            t,
+            &grad,
+            self.config.pose_refine_lr,
+            self.config.pose_refine_lr * depth,
+        );
         let view = &mut self.views[view_idx];
-        let delta = glam::Vec3::new(-step[0], -step[1], -step[2]);
-        view.camera.quat = (view.camera.quat * glam::Quat::from_scaled_axis(delta)).normalize();
-        view.camera.center -= glam::Vec3::new(step[3], step[4], step[5]);
+        apply_camera_step(&mut view.camera, &step);
 
         // Shared focal in log-space (dL/d log f = f · dL/df).
         if self.config.focal_refine {
@@ -446,6 +458,69 @@ impl Trainer {
             let lr_f = self.config.pose_refine_lr * 0.5;
             self.focal_scale *= (-lr_f * mhat / (vhat.sqrt() + 1e-10)).exp();
         }
+    }
+
+    /// Held-out PSNR with test-time pose refinement: each eval camera is
+    /// photometrically aligned to the *frozen* model for `steps` iterations
+    /// before scoring. This is the honest monocular protocol (BARF-style):
+    /// training legitimately drifts the gauge away from the raw VO poses, so
+    /// frozen eval cameras measure gauge drift, not model quality. The model
+    /// is never touched (the optimizer step is simply not encoded).
+    pub fn eval_psnr_refined(
+        &mut self,
+        ctx: &GpuContext,
+        views: &[TrainView],
+        steps: u32,
+    ) -> f64 {
+        let mut refined: Vec<TrainView> = views.to_vec();
+        for view in &mut refined {
+            let mut m = [0.0f32; 6];
+            let mut v = [0.0f32; 6];
+            // Depth for LR scaling, from the probe cloud.
+            let inv = view.camera.quat.conjugate();
+            let mut depths: Vec<f32> = self
+                .probe_positions
+                .iter()
+                .map(|p| -(inv * (*p - view.camera.center)).z)
+                .filter(|d| *d > 0.05)
+                .collect();
+            let depth = if depths.is_empty() {
+                self.extent * 0.1
+            } else {
+                let mid = depths.len() / 2;
+                *depths.select_nth_unstable_by(mid, f32::total_cmp).1
+            };
+            ctx.queue
+                .write_buffer(&self.loss.target, 0, bytemuck::cast_slice(&view.target));
+            for t in 1..=steps {
+                let mut encoder = ctx
+                    .device
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+                self.raster
+                    .forward(ctx, &mut encoder, &view.camera, self.num_surfels);
+                self.loss.encode(&mut encoder);
+                ctx.queue.submit([encoder.finish()]);
+                let mut encoder = ctx
+                    .device
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+                self.raster.backward(&mut encoder, self.num_surfels);
+                ctx.queue.submit([encoder.finish()]);
+                let g = read_cam_grads(ctx, &self.raster.grad_cam);
+                let Some(grad) = camera_step_grad(&g, view.camera.quat) else {
+                    break;
+                };
+                let step = adam6(
+                    &mut m,
+                    &mut v,
+                    t,
+                    &grad,
+                    self.config.pose_refine_lr.max(1e-3),
+                    self.config.pose_refine_lr.max(1e-3) * depth,
+                );
+                apply_camera_step(&mut view.camera, &step);
+            }
+        }
+        self.eval_psnr(ctx, &refined)
     }
 
     /// MCMC relocation: dead surfels (activated opacity below threshold) move
@@ -621,3 +696,60 @@ pub struct ExportScene {
     pub num: usize,
 }
 
+
+// --- Pose-refinement helpers (host-side; grad_cam layout:
+// [dl/dR col-major 3x3 | dl/dcenter (3) | dl/dfocal | ...]) ---
+
+fn read_cam_grads(ctx: &GpuContext, buf: &wgpu::Buffer) -> Vec<f32> {
+    bytemuck::cast_slice(&gs_wgpu::buffers::readback(&ctx.device, &ctx.queue, buf)).to_vec()
+}
+
+/// [rot(3), center(3)] gradient. Rotation uses the right-perturbation
+/// R' = R·exp([δ]×): the Riemannian gradient is the antisymmetric part of
+/// B = Rᵀ·(dl/dR). Returns None on non-finite grads (skip the step).
+fn camera_step_grad(g: &[f32], quat: glam::Quat) -> Option<[f32; 6]> {
+    if g.iter().take(13).any(|v| !v.is_finite()) {
+        return None;
+    }
+    let a = glam::Mat3::from_cols(
+        glam::Vec3::new(g[0], g[1], g[2]),
+        glam::Vec3::new(g[3], g[4], g[5]),
+        glam::Vec3::new(g[6], g[7], g[8]),
+    );
+    let b = glam::Mat3::from_quat(quat).transpose() * a;
+    Some([
+        b.col(1)[2] - b.col(2)[1], // B32 − B23
+        b.col(2)[0] - b.col(0)[2], // B13 − B31
+        b.col(0)[1] - b.col(1)[0], // B21 − B12
+        g[9],
+        g[10],
+        g[11],
+    ])
+}
+
+/// One Adam step (β1 0.9, β2 0.999) over [rot, center] with separate LRs.
+fn adam6(
+    m: &mut [f32; 6],
+    v: &mut [f32; 6],
+    t: u32,
+    grad: &[f32; 6],
+    lr_rot: f32,
+    lr_cen: f32,
+) -> [f32; 6] {
+    let bc1 = 1.0 - 0.9f32.powi(t as i32);
+    let bc2 = 1.0 - 0.999f32.powi(t as i32);
+    let mut step = [0.0f32; 6];
+    for k in 0..6 {
+        m[k] = 0.9 * m[k] + 0.1 * grad[k];
+        v[k] = 0.999 * v[k] + 0.001 * grad[k] * grad[k];
+        let lr = if k < 3 { lr_rot } else { lr_cen };
+        step[k] = lr * (m[k] / bc1) / ((v[k] / bc2).sqrt() + 1e-10);
+    }
+    step
+}
+
+fn apply_camera_step(camera: &mut gs_kernels::RasterCamera, step: &[f32; 6]) {
+    let delta = glam::Vec3::new(-step[0], -step[1], -step[2]);
+    camera.quat = (camera.quat * glam::Quat::from_scaled_axis(delta)).normalize();
+    camera.center -= glam::Vec3::new(step[3], step[4], step[5]);
+}
