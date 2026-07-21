@@ -39,8 +39,9 @@ pub struct ParamClass {
     /// Raw parameters (identity classes alias the activated buffer's content
     /// layout but live in their own buffer; `activate` copies through).
     pub raw: wgpu::Buffer,
-    m: wgpu::Buffer,
-    v: wgpu::Buffer,
+    /// Adam moments — crate-visible for the MCMC relocate kernel's bind group.
+    pub(crate) m: wgpu::Buffer,
+    pub(crate) v: wgpu::Buffer,
     uniform: wgpu::Buffer,
     step_bg: wgpu::BindGroup,
     act_bg: wgpu::BindGroup,
@@ -149,18 +150,6 @@ impl Optimizer {
 
     pub fn set_reg(&mut self, name: &str, reg: f32) {
         self.classes.iter_mut().find(|c| c.name == name).unwrap().reg = reg;
-    }
-
-    /// Zero the Adam moments for specific parameter indices (MCMC relocation:
-    /// moved surfels must not inherit momentum). `comps` = floats per index.
-    pub fn zero_moments(&self, ctx: &GpuContext, name: &str, indices: &[u32], comps: u32) {
-        let c = self.class(name);
-        let zeros = vec![0f32; comps as usize];
-        for &i in indices {
-            let offset = (i * comps) as u64 * 4;
-            ctx.queue.write_buffer(&c.m, offset, bytemuck::cast_slice(&zeros));
-            ctx.queue.write_buffer(&c.v, offset, bytemuck::cast_slice(&zeros));
-        }
     }
 
     fn write_uniforms(&self, ctx: &GpuContext, t: u32) {

@@ -155,12 +155,105 @@ pub struct Trainer {
     /// Async ring for the 64-byte grad_cam readback: pose updates apply 1-2
     /// iterations late instead of stalling the queue every iteration.
     pose_ring: gs_wgpu::ReadbackRing<PendingPose>,
+    /// GPU MCMC relocation (host keeps the sampling, GPU moves the data).
+    relocate: RelocateKernel,
     /// Per-kernel GPU timing, sampled on log iterations (None when the
     /// adapter lacks TIMESTAMP_QUERY).
     timer: Option<gs_wgpu::GpuTimer>,
     /// Host wall-clock per step phase, accumulated between log lines. The
     /// host timers are what reveal CPU↔GPU stalls — GPU timestamps can't.
     phases: PhaseTimes,
+}
+
+/// Pipelines + buffers for GPU-side MCMC relocation (shaders/relocate.wgsl):
+/// the host samples (dead, alive) pairs from one opacity readback every
+/// `mcmc_every` iterations; the kernels do the parameter copies, opacity
+/// split, scale shrink, and Adam-moment zeroing that used to be a
+/// 6-readback / 5-upload host round-trip.
+struct RelocateKernel {
+    params_pipeline: wgpu::ComputePipeline,
+    moments_pipeline: wgpu::ComputePipeline,
+    params_bg: wgpu::BindGroup,
+    moments_bg: wgpu::BindGroup,
+    pairs: wgpu::Buffer,
+    uniform: wgpu::Buffer,
+}
+
+impl RelocateKernel {
+    fn new(ctx: &GpuContext, capacity: u32, optim: &Optimizer, opac_act: &wgpu::Buffer) -> Self {
+        let device = &ctx.device;
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("mcmc-relocate"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/relocate.wgsl").into()),
+        });
+        let make = |entry: &str| {
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some(entry),
+                layout: None,
+                module: &module,
+                entry_point: Some(entry),
+                compilation_options: Default::default(),
+                cache: None,
+            })
+        };
+        let params_pipeline = make("relocate_params");
+        let moments_pipeline = make("relocate_moments");
+        // Worst case every surfel is in a pair.
+        let pairs =
+            gs_wgpu::buffers::storage_empty(device, "relocate-pairs", capacity as u64 * 8);
+        let uniform = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("relocate-uniform"),
+            size: 16,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        fn bind(binding: u32, buffer: &wgpu::Buffer) -> wgpu::BindGroupEntry<'_> {
+            wgpu::BindGroupEntry {
+                binding,
+                resource: buffer.as_entire_binding(),
+            }
+        }
+        let params_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("relocate-params-bg"),
+            layout: &params_pipeline.get_bind_group_layout(0),
+            entries: &[
+                bind(0, &uniform),
+                bind(1, &pairs),
+                bind(2, opac_act),
+                bind(3, &optim.class("pos").raw),
+                bind(4, &optim.class("scales").raw),
+                bind(5, &optim.class("quat").raw),
+                bind(6, &optim.class("opacity").raw),
+                bind(7, &optim.class("sh").raw),
+            ],
+        });
+        let moments_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("relocate-moments-bg"),
+            layout: &moments_pipeline.get_bind_group_layout(0),
+            entries: &[
+                bind(0, &uniform),
+                bind(1, &pairs),
+                bind(8, &optim.class("pos").m),
+                bind(9, &optim.class("pos").v),
+                bind(10, &optim.class("scales").m),
+                bind(11, &optim.class("scales").v),
+                bind(12, &optim.class("quat").m),
+                bind(13, &optim.class("quat").v),
+                bind(14, &optim.class("opacity").m),
+                bind(15, &optim.class("opacity").v),
+                bind(16, &optim.class("sh").m),
+                bind(17, &optim.class("sh").v),
+            ],
+        });
+        Self {
+            params_pipeline,
+            moments_pipeline,
+            params_bg,
+            moments_bg,
+            pairs,
+            uniform,
+        }
+    }
 }
 
 /// Snapshot taken when a pose-gradient readback is issued — the host Adam
@@ -351,6 +444,7 @@ impl Trainer {
         optim.encode_activate(ctx, &mut encoder);
         ctx.queue.submit([encoder.finish()]);
 
+        let relocate = RelocateKernel::new(ctx, n, &optim, &raster.opacities);
         let seed = config.seed;
         let n_views = views.len();
         Self {
@@ -376,6 +470,7 @@ impl Trainer {
             appear: vec![[1.0, 1.0, 1.0, 0.0, 0.0, 0.0]; n_views],
             appearance,
             pose_ring: gs_wgpu::ReadbackRing::new(&ctx.device, "pose-grad", 16 * 4, 4),
+            relocate,
             timer: ctx
                 .device
                 .features()
@@ -765,11 +860,17 @@ impl Trainer {
     /// MCMC relocation: dead surfels (activated opacity below threshold) move
     /// onto opacity-sampled alive surfels; both get the split opacity
     /// α' = 1 − √(1−α) and slightly reduced scales; Adam moments reset.
+    /// The host owns only the sampling (one opacity readback); the data
+    /// movement runs on the GPU (shaders/relocate.wgsl). Alive targets are
+    /// sampled WITHOUT replacement within a batch so pairs never alias — a
+    /// dead surfel whose pick collides waits for the next round.
     fn mcmc_relocate(&mut self, ctx: &GpuContext) {
-        let read = |b: &wgpu::Buffer| -> Vec<f32> {
-            bytemuck::cast_slice(&gs_wgpu::buffers::readback(&ctx.device, &ctx.queue, b)).to_vec()
-        };
-        let opacity_act = read(&self.raster.opacities);
+        let opacity_act: Vec<f32> = bytemuck::cast_slice(&gs_wgpu::buffers::readback(
+            &ctx.device,
+            &ctx.queue,
+            &self.raster.opacities,
+        ))
+        .to_vec();
         let n = self.num_surfels as usize;
         let dead: Vec<u32> = (0..n)
             .filter(|&i| opacity_act[i] < self.config.mcmc_dead)
@@ -782,24 +883,18 @@ impl Trainer {
         // Opacity-proportional alive sampling via a cumulative table.
         let mut cum = Vec::with_capacity(n);
         let mut total = 0f64;
-        for (i, &o) in opacity_act.iter().enumerate() {
+        for &o in &opacity_act {
             if o >= self.config.mcmc_dead {
                 total += o as f64;
             }
-            let _ = i;
             cum.push(total);
         }
         if total <= 0.0 {
             return;
         }
 
-        let mut pos = read(&self.optim.class("pos").raw);
-        let mut scales = read(&self.optim.class("scales").raw);
-        let mut quats = read(&self.optim.class("quat").raw);
-        let mut opac = read(&self.optim.class("opacity").raw);
-        let mut sh = read(&self.optim.class("sh").raw);
-
-        let mut touched = dead.clone();
+        let mut used = vec![false; n];
+        let mut pairs: Vec<[u32; 2]> = Vec::with_capacity(dead.len());
         for &d in &dead {
             // Sample an alive target ∝ opacity.
             let mut x = self.rng;
@@ -809,54 +904,46 @@ impl Trainer {
             self.rng = x;
             let r = (x >> 11) as f64 / (1u64 << 53) as f64 * total;
             let a = cum.partition_point(|&c| c < r).min(n - 1);
-            let (d, a) = (d as usize, a);
-            if a == d {
+            if a == d as usize || used[a] {
                 continue;
             }
-            touched.push(a as u32);
-
-            // Copy target params; split opacity; shrink scales ~15%.
-            let alpha_a = opacity_act[a].clamp(1e-4, 0.999);
-            let alpha_new = (1.0 - (1.0 - alpha_a).sqrt()).clamp(1e-4, 0.999);
-            let logit = (alpha_new / (1.0 - alpha_new)).ln();
-            opac[d] = logit;
-            opac[a] = logit;
-            for k in 0..4 {
-                pos[d * 4 + k] = pos[a * 4 + k];
-                quats[d * 4 + k] = quats[a * 4 + k];
-            }
-            for k in 0..2 {
-                let s = scales[a * 2 + k] - 0.16; // log-space ×0.85
-                scales[a * 2 + k] = s;
-                scales[d * 2 + k] = s;
-            }
-            let src: Vec<f32> = sh[a * 48..(a + 1) * 48].to_vec();
-            sh[d * 48..(d + 1) * 48].copy_from_slice(&src);
+            used[a] = true;
+            pairs.push([d, a as u32]);
+        }
+        if pairs.is_empty() {
+            return;
         }
 
         ctx.queue
-            .write_buffer(&self.optim.class("pos").raw, 0, bytemuck::cast_slice(&pos));
-        ctx.queue
-            .write_buffer(&self.optim.class("scales").raw, 0, bytemuck::cast_slice(&scales));
-        ctx.queue
-            .write_buffer(&self.optim.class("quat").raw, 0, bytemuck::cast_slice(&quats));
-        ctx.queue
-            .write_buffer(&self.optim.class("opacity").raw, 0, bytemuck::cast_slice(&opac));
-        ctx.queue
-            .write_buffer(&self.optim.class("sh").raw, 0, bytemuck::cast_slice(&sh));
-
-        self.optim.zero_moments(ctx, "pos", &touched, 4);
-        self.optim.zero_moments(ctx, "scales", &touched, 2);
-        self.optim.zero_moments(ctx, "quat", &touched, 4);
-        self.optim.zero_moments(ctx, "opacity", &touched, 1);
-        self.optim.zero_moments(ctx, "sh", &touched, 48);
-
+            .write_buffer(&self.relocate.pairs, 0, bytemuck::cast_slice(&pairs));
+        ctx.queue.write_buffer(
+            &self.relocate.uniform,
+            0,
+            bytemuck::cast_slice(&[pairs.len() as u32, 0, 0, 0]),
+        );
         let mut encoder = ctx
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("mcmc-relocate"),
+                timestamp_writes: None,
+            });
+            let groups = (pairs.len() as u32).div_ceil(256);
+            pass.set_pipeline(&self.relocate.params_pipeline);
+            pass.set_bind_group(0, &self.relocate.params_bg, &[]);
+            pass.dispatch_workgroups(groups, 1, 1);
+            pass.set_pipeline(&self.relocate.moments_pipeline);
+            pass.set_bind_group(0, &self.relocate.moments_bg, &[]);
+            pass.dispatch_workgroups(groups, 1, 1);
+        }
         self.optim.encode_activate(ctx, &mut encoder);
         ctx.queue.submit([encoder.finish()]);
-        log::debug!("mcmc: relocated {} dead surfels", dead.len());
+        log::debug!(
+            "mcmc: relocated {} dead surfels ({} deferred on collision)",
+            pairs.len(),
+            dead.len() - pairs.len()
+        );
     }
 
     /// Apply every in-flight async result (pose updates, appearance fits).
@@ -1055,4 +1142,156 @@ fn apply_camera_step(camera: &mut gs_kernels::RasterCamera, step: &[f32; 6]) {
     let delta = glam::Vec3::new(-step[0], -step[1], -step[2]);
     camera.quat = (camera.quat * glam::Quat::from_scaled_axis(delta)).normalize();
     camera.center -= glam::Vec3::new(step[3], step[4], step[5]);
+}
+
+#[cfg(test)]
+mod relocate_tests {
+    use super::*;
+
+    fn readf(ctx: &GpuContext, b: &wgpu::Buffer) -> Vec<f32> {
+        bytemuck::cast_slice(&gs_wgpu::buffers::readback(&ctx.device, &ctx.queue, b)).to_vec()
+    }
+
+    /// GPU relocation vs a host replay of the same sampling: all five raw
+    /// parameter buffers must match and the touched indices' Adam moments
+    /// must be zeroed (untouched ones preserved).
+    #[test]
+    fn gpu_relocate_matches_host_reference() {
+        let ctx = pollster::block_on(GpuContext::new(
+            gs_wgpu::backends_from_str(None).unwrap(),
+        ))
+        .unwrap();
+        let n = 48usize;
+        let mut seed = 0x1234u64;
+        let mut r = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed >> 40) as f32 / (1u64 << 24) as f32
+        };
+        let init = InitialSurfels {
+            positions: (0..n).map(|_| Vec3::new(r(), r(), r())).collect(),
+            scales: (0..n).map(|_| [0.05 + 0.1 * r(), 0.05 + 0.1 * r()]).collect(),
+            quats: (0..n)
+                .map(|_| {
+                    let q = glam::Quat::from_xyzw(r() - 0.5, r() - 0.5, r() - 0.5, r() + 0.5)
+                        .normalize();
+                    [q.x, q.y, q.z, q.w]
+                })
+                .collect(),
+            opacities: (0..n)
+                .map(|i| if i % 7 == 3 { 1e-4 } else { 0.3 + 0.5 * r() })
+                .collect(),
+            sh: (0..n * 3).map(|_| r() - 0.5).collect(),
+            sh_coeffs: 1,
+        };
+        let view = TrainView {
+            camera: RasterCamera {
+                center: Vec3::ZERO,
+                quat: glam::Quat::IDENTITY,
+                focal: 30.0,
+                sh_degree: 0,
+            },
+            target: vec![[0.0; 4]; 256],
+        };
+        let mut trainer = Trainer::new(&ctx, 16, 16, vec![view], init, TrainConfig::default());
+
+        // Seed nonzero Adam moments everywhere so zeroing is observable.
+        for name in ["pos", "scales", "quat", "opacity", "sh"] {
+            let c = trainer.optim.class(name);
+            let ones = vec![1.0f32; c.n as usize];
+            ctx.queue.write_buffer(&c.m, 0, bytemuck::cast_slice(&ones));
+            ctx.queue.write_buffer(&c.v, 0, bytemuck::cast_slice(&ones));
+        }
+
+        // Host replay of the sampling + data movement on snapshots.
+        let opacity_act = readf(&ctx, &trainer.raster.opacities);
+        let mut pos = readf(&ctx, &trainer.optim.class("pos").raw);
+        let mut scales = readf(&ctx, &trainer.optim.class("scales").raw);
+        let mut quats = readf(&ctx, &trainer.optim.class("quat").raw);
+        let mut opac = readf(&ctx, &trainer.optim.class("opacity").raw);
+        let mut sh = readf(&ctx, &trainer.optim.class("sh").raw);
+        let dead: Vec<u32> = (0..n)
+            .filter(|&i| opacity_act[i] < trainer.config.mcmc_dead)
+            .map(|i| i as u32)
+            .collect();
+        assert!(!dead.is_empty(), "test scene must contain dead surfels");
+        let mut cum = Vec::with_capacity(n);
+        let mut total = 0f64;
+        for &o in &opacity_act {
+            if o >= trainer.config.mcmc_dead {
+                total += o as f64;
+            }
+            cum.push(total);
+        }
+        let mut x = trainer.rng;
+        let mut used = vec![false; n];
+        let mut touched: Vec<u32> = Vec::new();
+        for &d in &dead {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let rr = (x >> 11) as f64 / (1u64 << 53) as f64 * total;
+            let a = cum.partition_point(|&c| c < rr).min(n - 1);
+            if a == d as usize || used[a] {
+                continue;
+            }
+            used[a] = true;
+            let d = d as usize;
+            touched.push(d as u32);
+            touched.push(a as u32);
+            let alpha_a = opacity_act[a].clamp(1e-4, 0.999);
+            let alpha_new = (1.0 - (1.0 - alpha_a).sqrt()).clamp(1e-4, 0.999);
+            let logit = (alpha_new / (1.0 - alpha_new)).ln();
+            opac[d] = logit;
+            opac[a] = logit;
+            for k in 0..4 {
+                pos[d * 4 + k] = pos[a * 4 + k];
+                quats[d * 4 + k] = quats[a * 4 + k];
+            }
+            for k in 0..2 {
+                let s = scales[a * 2 + k] - 0.16;
+                scales[a * 2 + k] = s;
+                scales[d * 2 + k] = s;
+            }
+            let src: Vec<f32> = sh[a * 48..(a + 1) * 48].to_vec();
+            sh[d * 48..(d + 1) * 48].copy_from_slice(&src);
+        }
+        assert!(!touched.is_empty(), "sampling must produce at least one pair");
+
+        trainer.mcmc_relocate(&ctx);
+
+        for (name, expect) in [
+            ("pos", &pos),
+            ("scales", &scales),
+            ("quat", &quats),
+            ("opacity", &opac),
+            ("sh", &sh),
+        ] {
+            let got = readf(&ctx, &trainer.optim.class(name).raw);
+            for (i, (g, e)) in got.iter().zip(expect.iter()).enumerate() {
+                assert!(
+                    (g - e).abs() < 1e-5,
+                    "{name}[{i}]: gpu {g} vs host {e}"
+                );
+            }
+        }
+        let is_touched = |i: usize| touched.contains(&(i as u32));
+        for (name, comps) in [("pos", 4), ("scales", 2), ("quat", 4), ("opacity", 1), ("sh", 48)] {
+            let c = trainer.optim.class(name);
+            for (label, buf) in [("m", &c.m), ("v", &c.v)] {
+                let vals = readf(&ctx, buf);
+                for i in 0..n {
+                    let want = if is_touched(i) { 0.0 } else { 1.0 };
+                    for k in 0..comps {
+                        let got = vals[i * comps + k];
+                        assert_eq!(
+                            got, want,
+                            "{name}.{label}[{i}*{comps}+{k}]: {got} vs {want}"
+                        );
+                    }
+                }
+            }
+        }
+    }
 }
