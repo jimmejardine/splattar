@@ -366,8 +366,8 @@ rotation bake is unconditionally correct and on by default.
 
 ### Order-independent project model: pairwise Sim(3) edges (2026-07-21)
 
-`gs-cli run` is gone; `add <video>` is the only ingestion command and
-creates `./gs-project` by default (`--project` overrides). The absolute
+`gs-cli run` is gone; `add <video>` is the only ingestion command and by
+default creates `gs-project` next to the video (`--project` overrides). The absolute
 `sim3=` world transform in submap meta.txt is replaced by zero-or-more
 pairwise `edge=` lines (this submap's coords → target submap's coords; no
 edges = island; legacy metas migrate on read: identity `sim3=` drops, any

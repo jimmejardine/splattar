@@ -72,9 +72,10 @@ enum Command {
     Add {
         /// Path to an H.264/H.265 .mp4 walkthrough video.
         video: PathBuf,
-        /// Project directory (created if absent).
-        #[arg(long, default_value = "gs-project")]
-        project: PathBuf,
+        /// Project directory (created if absent; default: `gs-project`
+        /// next to the video).
+        #[arg(long)]
+        project: Option<PathBuf>,
         #[arg(long)]
         focal: Option<f64>,
         #[arg(long, default_value_t = 0)]
@@ -234,10 +235,19 @@ fn main() -> anyhow::Result<()> {
             downscale,
             max_views,
             pose_window,
-        } => run_add(
-            &video, &project, focal, max_frames, iters, budget, downscale, max_views,
-            pose_window,
-        ),
+        } => {
+            // Default project dir lives next to the video, not in the cwd.
+            let project = project.unwrap_or_else(|| {
+                video
+                    .parent()
+                    .unwrap_or_else(|| std::path::Path::new(""))
+                    .join("gs-project")
+            });
+            run_add(
+                &video, &project, focal, max_frames, iters, budget, downscale, max_views,
+                pose_window,
+            )
+        }
         Command::Train {
             dataset,
             iters,

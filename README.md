@@ -33,14 +33,14 @@ cargo build --workspace --release
 cargo run --release -p gs-cli -- view samples/ply/cactus-high.ply
 
 # Full pipeline: walkthrough video → project + walkable splat
-# (creates ./gs-project on first use; add order doesn't matter)
-cargo run --release -p gs-cli -- add walkthrough.mp4
+# (creates gs-project next to the video on first use; add order doesn't matter)
+cargo run --release -p gs-cli -- add clips/walkthrough.mp4
 
 # Extend the project with another video (registers or becomes an island)
-cargo run --release -p gs-cli -- add patch.mp4
+cargo run --release -p gs-cli -- add clips/patch.mp4
 
 # View the composed project (connected submaps merged, islands side by side)
-cargo run --release -p gs-cli -- view gs-project
+cargo run --release -p gs-cli -- view clips/gs-project
 
 # Visual odometry only: trajectory CSV from a video
 cargo run --release -p gs-cli -- pose walkthrough.mp4
