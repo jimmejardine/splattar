@@ -443,7 +443,7 @@ impl H265Decoder {
         f.set_transquant_bypass_enabled_flag(u32::from(pps.transquant_bypass));
         f.set_tiles_enabled_flag(u32::from(pps.tiles_enabled));
         f.set_entropy_coding_sync_enabled_flag(u32::from(pps.entropy_coding_sync));
-        f.set_uniform_spacing_flag(1);
+        f.set_uniform_spacing_flag(u32::from(pps.uniform_spacing));
         f.set_loop_filter_across_tiles_enabled_flag(u32::from(pps.loop_filter_across_tiles));
         f.set_pps_loop_filter_across_slices_enabled_flag(
             u32::from(pps.loop_filter_across_slices),
@@ -471,6 +471,14 @@ impl H265Decoder {
         std_pps.pps_tc_offset_div2 = pps.tc_offset_div2 as i8;
         std_pps.log2_parallel_merge_level_minus2 =
             pps.log2_parallel_merge_level_minus2 as u8;
+        std_pps.num_tile_columns_minus1 = pps.num_tile_columns_minus1 as u8;
+        std_pps.num_tile_rows_minus1 = pps.num_tile_rows_minus1 as u8;
+        for (i, &w) in pps.tile_col_widths_minus1.iter().enumerate().take(19) {
+            std_pps.column_width_minus1[i] = w as u16;
+        }
+        for (i, &h) in pps.tile_row_heights_minus1.iter().enumerate().take(21) {
+            std_pps.row_height_minus1[i] = h as u16;
+        }
 
         let std_vps_arr = [std_vps];
         let std_sps_arr = [std_sps];

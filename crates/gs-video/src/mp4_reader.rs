@@ -71,6 +71,14 @@ pub struct H264Reader {
     decoder: NvDecoder,
     /// Bytes of the AVCC length prefix (usually 4).
     length_size: usize,
+    /// B-frame reorder queue (Main/High profiles): decoded frames held
+    /// until `reorder_depth` newer ones exist, emitted in PTS order.
+    /// Baseline streams get depth 0 — behavior identical to before.
+    pending: Vec<DecodedFrame>,
+    reorder_depth: usize,
+    /// Display rotation (degrees CW) from the tkhd matrix, baked into the
+    /// emitted pixels.
+    rotation: u32,
 }
 
 impl H264Reader {
@@ -117,8 +125,10 @@ impl H264Reader {
 
         let timescale = track.timescale() as f64;
         let sample_count = track.sample_count();
+        let m = &track.trak.tkhd.matrix;
+        let rotation = rotation_from_matrix(m.a, m.b, m.c, m.d);
         log::info!(
-            "h264 track {track_id}: {}x{}, {} samples, timescale {}",
+            "h264 track {track_id}: {}x{}, {} samples, timescale {}, rotation {rotation}°",
             track.width(),
             track.height(),
             sample_count,
@@ -126,6 +136,14 @@ impl H264Reader {
         );
 
         let decoder = NvDecoder::new(&sps, &pps)?;
+        // Baseline (66) can't contain B slices → decode order is already
+        // presentation order and the queue stays empty. Anything else may
+        // reorder; buffer a few frames and emit by PTS.
+        let reorder_depth = if sps.profile_idc > 66 {
+            (sps.max_num_ref_frames as usize).max(2)
+        } else {
+            0
+        };
 
         Ok(Self {
             mp4,
@@ -137,6 +155,9 @@ impl H264Reader {
             pps,
             decoder,
             length_size,
+            pending: Vec::new(),
+            reorder_depth,
+            rotation,
         })
     }
 
@@ -144,11 +165,22 @@ impl H264Reader {
         self.sample_count
     }
 
-    /// Decode the next access unit. Returns None at end of stream.
+    /// Pop the earliest pending frame (presentation order).
+    fn pop_earliest(&mut self) -> Option<DecodedFrame> {
+        let idx = self
+            .pending
+            .iter()
+            .enumerate()
+            .min_by(|(_, a), (_, b)| a.pts.total_cmp(&b.pts))
+            .map(|(i, _)| i)?;
+        Some(self.pending.swap_remove(idx))
+    }
+
+    /// Decode the next access unit (presentation order). None at end.
     pub fn next_frame(&mut self) -> Result<Option<DecodedFrame>, VideoError> {
         loop {
             if self.next_sample >= self.sample_count {
-                return Ok(None);
+                return Ok(self.pop_earliest()); // drain the reorder queue
             }
             self.next_sample += 1;
             let sample_id = self.next_sample; // 1-based
@@ -218,14 +250,20 @@ impl H264Reader {
                 }
             }
 
-            return Ok(Some(DecodedFrame {
-                pts,
-                width: w,
-                height: h,
-                y,
-                u,
-                v,
-            }));
+            self.pending.push(apply_rotation(
+                DecodedFrame {
+                    pts,
+                    width: w,
+                    height: h,
+                    y,
+                    u,
+                    v,
+                },
+                self.rotation,
+            ));
+            if self.pending.len() > self.reorder_depth {
+                return Ok(self.pop_earliest());
+            }
         }
     }
 }
@@ -246,6 +284,8 @@ pub struct Mp4H265Reader {
     /// newer ones exist, then emitted in PTS order.
     pending: Vec<DecodedFrame>,
     reorder_depth: usize,
+    /// Display rotation (degrees CW) from the tkhd matrix.
+    rotation: u32,
 }
 
 impl Mp4H265Reader {
@@ -277,7 +317,7 @@ impl Mp4H265Reader {
             None => sps.bit_depth_luma == 10,
         };
         log::info!(
-            "h265 track {}: {}x{} coded, {}-bit{}, {} samples, timescale {}, fourcc {}",
+            "h265 track {}: {}x{} coded, {}-bit{}, {} samples, timescale {}, fourcc {}, rotation {}°",
             info.track_id,
             sps.width,
             sps.height,
@@ -286,6 +326,7 @@ impl Mp4H265Reader {
             sample_count,
             timescale,
             String::from_utf8_lossy(&info.fourcc),
+            info.rotation,
         );
 
         let decoder = crate::nvdec_h265::H265Decoder::new(&vps, &sps, &pps)?;
@@ -303,6 +344,7 @@ impl Mp4H265Reader {
             wide_gamut,
             pending: Vec::new(),
             reorder_depth,
+            rotation: info.rotation,
         })
     }
 
@@ -370,7 +412,7 @@ impl Mp4H265Reader {
                     sample: sample_id,
                     message: e.to_string(),
                 })?;
-            let decoded = self.to_display(frame, pts);
+            let decoded = apply_rotation(self.to_display(frame, pts), self.rotation);
             self.pending.push(decoded);
             if self.pending.len() > self.reorder_depth {
                 return Ok(self.pop_earliest());
@@ -461,4 +503,73 @@ fn le_u16(bytes: &[u8]) -> Vec<u16> {
         .chunks_exact(2)
         .map(|c| u16::from_le_bytes([c[0], c[1]]))
         .collect()
+}
+
+/// Display rotation in degrees clockwise from the tkhd matrix (16.16 fixed
+/// point; phones store sensor-landscape pixels + this matrix). Anything that
+/// isn't one of the four axis-aligned rotations maps to 0.
+pub(crate) fn rotation_from_matrix(a: i32, b: i32, c: i32, d: i32) -> u32 {
+    const ONE: i32 = 0x0001_0000;
+    match (a, b, c, d) {
+        (0, bb, cc, 0) if bb == ONE && cc == -ONE => 90,
+        (aa, 0, 0, dd) if aa == -ONE && dd == -ONE => 180,
+        (0, bb, cc, 0) if bb == -ONE && cc == ONE => 270,
+        _ => 0,
+    }
+}
+
+fn rotate_plane(src: &[u8], w: usize, h: usize, rot: u32) -> Vec<u8> {
+    let mut dst = vec![0u8; w * h];
+    match rot {
+        90 => {
+            // Clockwise: (x, y) → (h−1−y, x) in an h×w image.
+            for y in 0..h {
+                for x in 0..w {
+                    dst[x * h + (h - 1 - y)] = src[y * w + x];
+                }
+            }
+        }
+        180 => {
+            for (d, s) in dst.iter_mut().zip(src.iter().rev()) {
+                *d = *s;
+            }
+        }
+        270 => {
+            for y in 0..h {
+                for x in 0..w {
+                    dst[(w - 1 - x) * h + y] = src[y * w + x];
+                }
+            }
+        }
+        _ => dst.copy_from_slice(src),
+    }
+    dst
+}
+
+/// Bake the container's display rotation into the pixels so every consumer
+/// (player, VO, training) sees upright frames — otherwise the whole splat
+/// model reconstructs sideways (floor as a wall).
+/// `SPLATTAR_NO_ROTATION=1` disables the bake (debug isolation).
+fn apply_rotation(f: DecodedFrame, rot: u32) -> DecodedFrame {
+    if rot == 0 || std::env::var_os("SPLATTAR_NO_ROTATION").is_some_and(|v| v != "0") {
+        return f;
+    }
+    let (w, h) = (f.width as usize, f.height as usize);
+    let (cw, ch) = (w / 2, h / 2);
+    let y = rotate_plane(&f.y, w, h, rot);
+    let u = rotate_plane(&f.u, cw, ch, rot);
+    let v = rotate_plane(&f.v, cw, ch, rot);
+    let (nw, nh) = if rot == 180 {
+        (f.width, f.height)
+    } else {
+        (f.height, f.width)
+    };
+    DecodedFrame {
+        pts: f.pts,
+        width: nw,
+        height: nh,
+        y,
+        u,
+        v,
+    }
 }

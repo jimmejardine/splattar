@@ -391,6 +391,12 @@ pub struct H265Pps {
     pub transquant_bypass: bool,
     pub tiles_enabled: bool,
     pub entropy_coding_sync: bool,
+    pub num_tile_columns_minus1: u32,
+    pub num_tile_rows_minus1: u32,
+    pub uniform_spacing: bool,
+    /// Explicit column widths / row heights (empty when uniform).
+    pub tile_col_widths_minus1: Vec<u32>,
+    pub tile_row_heights_minus1: Vec<u32>,
     pub loop_filter_across_tiles: bool,
     pub loop_filter_across_slices: bool,
     pub deblocking_control_present: bool,
@@ -431,17 +437,29 @@ pub fn parse_pps(nal: &[u8]) -> Result<H265Pps, H265Error> {
     let transquant_bypass = r.flag()?;
     let tiles_enabled = r.flag()?;
     let entropy_coding_sync = r.flag()?;
+    let mut num_tile_columns_minus1 = 0;
+    let mut num_tile_rows_minus1 = 0;
+    let mut uniform_spacing = true;
+    let mut tile_col_widths_minus1 = Vec::new();
+    let mut tile_row_heights_minus1 = Vec::new();
     let mut loop_filter_across_tiles = true;
     if tiles_enabled {
-        // Tile geometry is parsed by the driver; walk past it here.
-        let cols = r.ue()?;
-        let rows = r.ue()?;
-        if cols > 0 || rows > 0 {
-            return Err(H265Error::Unsupported("tiled streams".into()));
+        // The driver decodes the tiles; the geometry is parsed here to keep
+        // the bit cursor honest and to fill the Std PPS (Android hardware
+        // encoders tile by default).
+        num_tile_columns_minus1 = r.ue()?;
+        num_tile_rows_minus1 = r.ue()?;
+        if num_tile_columns_minus1 > 18 || num_tile_rows_minus1 > 20 {
+            return Err(H265Error::Malformed("tile grid exceeds Std limits".into()));
         }
-        let uniform = r.flag()?;
-        if !uniform {
-            return Err(H265Error::Unsupported("non-uniform tiles".into()));
+        uniform_spacing = r.flag()?;
+        if !uniform_spacing {
+            for _ in 0..num_tile_columns_minus1 {
+                tile_col_widths_minus1.push(r.ue()?);
+            }
+            for _ in 0..num_tile_rows_minus1 {
+                tile_row_heights_minus1.push(r.ue()?);
+            }
         }
         loop_filter_across_tiles = r.flag()?;
     }
@@ -489,6 +507,11 @@ pub fn parse_pps(nal: &[u8]) -> Result<H265Pps, H265Error> {
         transquant_bypass,
         tiles_enabled,
         entropy_coding_sync,
+        num_tile_columns_minus1,
+        num_tile_rows_minus1,
+        uniform_spacing,
+        tile_col_widths_minus1,
+        tile_row_heights_minus1,
         loop_filter_across_tiles,
         loop_filter_across_slices,
         deblocking_control_present,

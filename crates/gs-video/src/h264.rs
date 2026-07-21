@@ -387,6 +387,22 @@ pub struct SliceHeader {
 
 /// Parse the slice-header prefix through dec_ref_pic_marking. Requires the
 /// active SPS/PPS. Errors on features outside the phone subset.
+fn skip_ref_list_modification(r: &mut BitReader) -> Result<(), H264Error> {
+    if r.flag()? {
+        loop {
+            let op = r.ue()?;
+            if op == 3 {
+                break;
+            }
+            if op > 3 {
+                return Err(H264Error::Malformed("bad ref list modification op".into()));
+            }
+            let _value = r.ue()?;
+        }
+    }
+    Ok(())
+}
+
 pub fn parse_slice_header(
     nal: &[u8],
     sps: &Sps,
@@ -402,11 +418,6 @@ pub fn parse_slice_header(
 
     let first_mb = r.ue()?;
     let slice_type = SliceType::from_value(r.ue()?)?;
-    if matches!(slice_type, SliceType::B) {
-        return Err(H264Error::Unsupported(
-            "B slices (add DPB support when a device produces them)".into(),
-        ));
-    }
     if matches!(slice_type, SliceType::Sp | SliceType::Si) {
         return Err(H264Error::Unsupported("SP/SI slices".into()));
     }
@@ -426,30 +437,33 @@ pub fn parse_slice_header(
     if pps.redundant_pic_cnt_present {
         let _ = r.ue()?;
     }
+    if matches!(slice_type, SliceType::B) {
+        let _direct_spatial_mv_pred = r.flag()?;
+    }
     let mut num_ref_idx_l0 = pps.num_ref_idx_l0_default;
-    if matches!(slice_type, SliceType::P) {
+    if matches!(slice_type, SliceType::P | SliceType::B) {
         if r.flag()? {
             num_ref_idx_l0 = r.ue()? + 1;
-        }
-        // ref_pic_list_modification for l0.
-        if r.flag()? {
-            loop {
-                let op = r.ue()?;
-                if op == 3 {
-                    break;
-                }
-                if op > 3 {
-                    return Err(H264Error::Malformed("bad ref list modification op".into()));
-                }
-                let _value = r.ue()?;
-                // Modifications are tolerated in parsing; the hardware gets
-                // our DPB in PicNum order, which matches the common case of
-                // no-op re-specification. Exotic reordering → decode garbage,
-                // caught by downstream sanity checks.
+            if matches!(slice_type, SliceType::B) {
+                let _num_ref_idx_l1 = r.ue()? + 1;
             }
         }
-        if pps.weighted_pred {
-            return Err(H264Error::Unsupported("weighted prediction".into()));
+        // ref_pic_list_modification (l0, and l1 for B). Modifications are
+        // tolerated in parsing; the hardware gets our DPB in PicNum order,
+        // which matches the common case of no-op re-specification. Exotic
+        // reordering → decode garbage, caught by downstream sanity checks.
+        skip_ref_list_modification(r)?;
+        if matches!(slice_type, SliceType::B) {
+            skip_ref_list_modification(r)?;
+        }
+        // Explicit weight tables would need parsing to keep the cursor
+        // honest — reject; phone encoders use none (P) or implicit (B).
+        if (matches!(slice_type, SliceType::P) && pps.weighted_pred)
+            || (matches!(slice_type, SliceType::B) && pps.weighted_bipred_idc == 1)
+        {
+            return Err(H264Error::Unsupported(
+                "explicit weighted prediction tables".into(),
+            ));
         }
     }
     if nal_ref_idc != 0 {

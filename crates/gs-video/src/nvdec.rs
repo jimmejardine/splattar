@@ -615,9 +615,9 @@ impl NvDecoder {
             .map(|(i, _)| i)
             .collect();
         ref_indices.sort_by_key(|&i| std::cmp::Reverse(self.slots[i].age));
-        if matches!(header.slice_type, SliceType::P) && ref_indices.is_empty() {
+        if matches!(header.slice_type, SliceType::P | SliceType::B) && ref_indices.is_empty() {
             return Err(NvDecError::Unsupported(
-                "P slice without any reference in the DPB".into(),
+                "P/B slice without any reference in the DPB".into(),
             ));
         }
 

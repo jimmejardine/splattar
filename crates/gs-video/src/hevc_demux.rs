@@ -22,6 +22,8 @@ pub struct HevcTrackInfo {
     pub pps: Vec<Vec<u8>>,
     /// nclx colour info when present: (primaries, transfer, matrix).
     pub colr: Option<(u16, u16, u16)>,
+    /// Display rotation in degrees clockwise (tkhd matrix).
+    pub rotation: u32,
 }
 
 fn be32(b: &[u8]) -> u32 {
@@ -156,12 +158,15 @@ pub fn find_hevc_track(path: &Path) -> Result<Option<HevcTrackInfo>, VideoError>
         }
         let Some(tkhd) = find_child(trak, b"tkhd") else { return };
         // tkhd: version(1) flags(3), then v0: ctime(4) mtime(4) id(4);
-        // v1: 8+8+4.
-        let track_id = match tkhd.first() {
-            Some(0) if tkhd.len() >= 16 => be32(&tkhd[12..]),
-            Some(1) if tkhd.len() >= 24 => be32(&tkhd[20..]),
+        // v1: 8+8+4. The display matrix sits after duration + reserved.
+        let (track_id, matrix_off) = match tkhd.first() {
+            Some(0) if tkhd.len() >= 76 => (be32(&tkhd[12..]), 40),
+            Some(1) if tkhd.len() >= 88 => (be32(&tkhd[20..]), 52),
             _ => return,
         };
+        let m = |i: usize| be32(&tkhd[matrix_off + 4 * i..]) as i32;
+        let rotation =
+            crate::mp4_reader::rotation_from_matrix(m(0), m(1), m(3), m(4));
         let stsd = find_child(trak, b"mdia")
             .and_then(|m| find_child(m, b"minf"))
             .and_then(|m| find_child(m, b"stbl"))
@@ -195,6 +200,7 @@ pub fn find_hevc_track(path: &Path) -> Result<Option<HevcTrackInfo>, VideoError>
                 sps,
                 pps,
                 colr,
+                rotation,
             });
         });
     });
