@@ -13,11 +13,15 @@ use crate::fivepoint::ransac_essential_5pt;
 use crate::image::{GrayImage, Pyramid};
 use crate::twoview::Match2;
 
-/// A verified correspondence, endpoints in FULL-RESOLUTION pixel coords.
+/// A verified correspondence, endpoints in FULL-RESOLUTION pixel coords,
+/// with each endpoint's descriptor (lets callers snap to landmark databases
+/// by appearance rather than distance alone).
 #[derive(Debug, Clone, Copy)]
 pub struct PairMatch {
     pub a_px: (f32, f32),
     pub b_px: (f32, f32),
+    pub a_desc: MultiDescriptor,
+    pub b_desc: MultiDescriptor,
 }
 
 pub struct PairwiseConfig {
@@ -80,22 +84,44 @@ fn features(img: &GrayImage) -> (Vec<(f32, f32)>, Vec<MultiDescriptor>) {
         3,
     );
     let pts: Vec<(f32, f32)> = corners.iter().map(|c| (c.x, c.y)).collect();
+    use rayon::prelude::*;
     let descs: Vec<MultiDescriptor> = pts
-        .iter()
+        .par_iter()
         .map(|&(x, y)| describe_multi(&pyr, x, y))
         .collect();
     (pts, descs)
+}
+
+/// Relative pose of camera B in camera A's frame recovered from the
+/// verified essential matrix: x_b = R·x_a + λ·t̂ with ‖t̂‖ = 1, λ unknown
+/// (monocular). glam at the boundary per CLAUDE.md.
+#[derive(Debug, Clone, Copy)]
+pub struct RelativePose {
+    pub rot: glam::DQuat,
+    pub tdir: glam::DVec3,
 }
 
 /// Match two keyframe images and epipolar-verify. Returns the verified
 /// correspondences (full-res pixel coords), or an empty vec when the pair
 /// doesn't support a fundamental relation (no real covisibility).
 pub fn match_image_pair(a: &GrayImage, b: &GrayImage, cfg: &PairwiseConfig) -> Vec<PairMatch> {
+    match_image_pair_with_pose(a, b, cfg).0
+}
+
+/// [`match_image_pair`] that also decomposes the verified essential matrix
+/// into the relative camera pose — the snap-free route to Sim(3): relative
+/// poses between known-gauge cameras constrain the transform directly,
+/// without ever trusting landmark 3D.
+pub fn match_image_pair_with_pose(
+    a: &GrayImage,
+    b: &GrayImage,
+    cfg: &PairwiseConfig,
+) -> (Vec<PairMatch>, Option<RelativePose>) {
     let (pa, da) = features(a);
     let (pb, db) = features(b);
     if pa.len() < 20 || pb.len() < 20 {
         log::debug!("pairwise: too few corners ({} / {})", pa.len(), pb.len());
-        return Vec::new();
+        return (Vec::new(), None);
     }
     let pairs = match_descriptors(&da, &db, cfg.max_dist, cfg.ratio);
     log::debug!(
@@ -105,7 +131,7 @@ pub fn match_image_pair(a: &GrayImage, b: &GrayImage, cfg: &PairwiseConfig) -> V
         pairs.len()
     );
     if pairs.len() < cfg.min_inliers {
-        return Vec::new();
+        return (Vec::new(), None);
     }
     // Normalized image coordinates from thumbnail pixels: full-res px =
     // thumb px / image_scale.
@@ -130,22 +156,39 @@ pub fn match_image_pair(a: &GrayImage, b: &GrayImage, cfg: &PairwiseConfig) -> V
         ransac_essential_5pt(&matches, cfg.ransac_iters, cfg.epi_px / cfg.focal, 0xEB1B01A)
     else {
         log::debug!("pairwise: essential RANSAC found no model");
-        return Vec::new();
+        return (Vec::new(), None);
     };
     log::debug!("pairwise: {} epipolar inliers", rr.inliers.len());
     if rr.inliers.len() < cfg.min_inliers {
-        return Vec::new();
+        return (Vec::new(), None);
     }
-    rr.inliers
+    let verified: Vec<PairMatch> = rr
+        .inliers
         .iter()
         .map(|&m| {
             let (i, j) = pairs[m];
             PairMatch {
                 a_px: (pa[i].0 / cfg.image_scale, pa[i].1 / cfg.image_scale),
                 b_px: (pb[j].0 / cfg.image_scale, pb[j].1 / cfg.image_scale),
+                a_desc: da[i],
+                b_desc: db[j],
             }
         })
-        .collect()
+        .collect();
+    // Decompose E into the cheirality-consistent relative pose.
+    let rel = crate::twoview::recover_pose_with(&rr.e, &matches, &rr.inliers, 0.6).map(|boot| {
+        let q = boot.pose_ba.r.quaternion();
+        RelativePose {
+            rot: glam::DQuat::from_xyzw(q.i, q.j, q.k, q.w),
+            tdir: glam::DVec3::new(
+                boot.pose_ba.t[0],
+                boot.pose_ba.t[1],
+                boot.pose_ba.t[2],
+            )
+            .normalize_or_zero(),
+        }
+    });
+    (verified, rel)
 }
 
 #[cfg(test)]

@@ -439,6 +439,56 @@ pub fn optimize(p: &mut BaProblem, cfg: &BaConfig) -> f64 {
     cost
 }
 
+/// glam-boundary refinement of a persisted submap (the focal re-BA): poses
+/// are (world→camera rotation, translation) pairs in the submap gauge,
+/// observations are (pose index, landmark index, normalized x, normalized y)
+/// — normalize with the CORRECTED focal before calling. Returns (initial,
+/// final) mean squared reprojection cost. Gauge fixed at the first pose.
+pub fn refine_submap_glam(
+    poses: &mut [(glam::DQuat, glam::DVec3)],
+    landmarks: &mut [glam::DVec3],
+    obs: &[(usize, usize, f64, f64)],
+    max_iters: usize,
+) -> (f64, f64) {
+    let mut p = BaProblem {
+        poses: poses
+            .iter()
+            .map(|(q, t)| {
+                Se3::new(
+                    nalgebra::UnitQuaternion::from_quaternion(nalgebra::Quaternion::new(
+                        q.w, q.x, q.y, q.z,
+                    )),
+                    Vector3::new(t.x, t.y, t.z),
+                )
+            })
+            .collect(),
+        landmarks: landmarks
+            .iter()
+            .map(|l| Vector3::new(l.x, l.y, l.z))
+            .collect(),
+        obs: obs
+            .iter()
+            .map(|&(cam, lm, x, y)| Obs { cam, lm, xy: (x, y) })
+            .collect(),
+    };
+    let cfg = BaConfig {
+        max_iters,
+        fixed_poses: 1,
+        ..Default::default()
+    };
+    let initial = total_cost(&p.poses, &p.landmarks, &p.obs, cfg.huber);
+    let final_cost = optimize(&mut p, &cfg);
+    for (dst, src) in poses.iter_mut().zip(&p.poses) {
+        let q = src.r.quaternion();
+        dst.0 = glam::DQuat::from_xyzw(q.i, q.j, q.k, q.w);
+        dst.1 = glam::DVec3::new(src.t[0], src.t[1], src.t[2]);
+    }
+    for (dst, src) in landmarks.iter_mut().zip(&p.landmarks) {
+        *dst = glam::DVec3::new(src[0], src[1], src[2]);
+    }
+    (initial, final_cost)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

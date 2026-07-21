@@ -186,6 +186,18 @@ pub struct Bootstrap {
 /// Decompose E into the four (R, t) candidates and pick the one with the most
 /// points in front of both cameras; triangulate the survivors.
 pub fn recover_pose(e: &Matrix3<f64>, matches: &[Match2], inliers: &[usize]) -> Option<Bootstrap> {
+    recover_pose_with(e, matches, inliers, 0.75)
+}
+
+/// [`recover_pose`] with a caller-chosen cheirality majority. VO bootstrap
+/// wants the strict 75%; cross-take registration pairs are noisier and the
+/// downstream rotation-clustering rejects bad decompositions anyway.
+pub fn recover_pose_with(
+    e: &Matrix3<f64>,
+    matches: &[Match2],
+    inliers: &[usize],
+    min_cheirality: f64,
+) -> Option<Bootstrap> {
     let svd = e.svd(true, true);
     let mut u = svd.u?;
     let mut vt = svd.v_t?;
@@ -232,7 +244,7 @@ pub fn recover_pose(e: &Matrix3<f64>, matches: &[Match2], inliers: &[usize]) -> 
     }
     let (good, boot) = best?;
     // Require a decisive cheirality vote — ambiguity means bad geometry.
-    (good * 4 >= inliers.len() * 3).then_some(boot)
+    (good as f64 >= inliers.len() as f64 * min_cheirality).then_some(boot)
 }
 
 #[cfg(test)]

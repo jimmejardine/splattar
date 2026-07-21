@@ -324,3 +324,26 @@ tighter than a few percent of depth. Next step (well-scoped): feed the
 trainer-refined focal back through a VO re-BA per submap, then the
 existing ladder should close; alternatively accept coarse registration
 and lean on PLAN's photometric Sim(3) polish.
+
+### Focal re-BA landed; registration bottleneck now quantified to match count (2026-07-21)
+
+`gs-cli refocal` rebuilds a submap's bundle problem from disk (poses.csv +
+landmark observation lists), re-normalizes with the trainer-measured focal
+(now persisted as `focal_refined` in meta after every training run), and
+rewrites the geometry in place. Measured: reprojection cost 20.9 → 0.40
+(submap-0) and 3.47 → 0.50 (submap-2); snap yields doubled. The lab loop
+was also parallelized with rayon (five-point RANSAC draws, brute-force
+matching, description) — a full registration attempt dropped from 300+ s
+to ~1.6 s.
+
+Registration itself remains open, now with a complete elimination chain:
+with warp-free geometry, (a) 3D-3D landmark pairs (~30% snap precision),
+(b) 2D-3D DLT bridges (6-point sampling at that precision), and (c) pure
+relative-pose Sim(3) from verified essential decompositions (new solver,
+GT-exact in tests; rotation clustering + lenient cheirality) all fail on
+the same underlying number: 10–16 verified matches per cross-take image
+pair — enough to confirm covisibility, too few for precise geometry.
+The next data lever is FULL-RESOLUTION pairwise matching (thumbnails are
+half-res; 4× pixels → sharper corners, more matches, tighter E), plus more
+thumb pairs per region. New durable tools regardless: scale-bounded Sim(3)
+RANSAC, appearance-guided snapping, `sim3_from_relative_pairs`.

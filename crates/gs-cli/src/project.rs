@@ -68,6 +68,10 @@ pub struct SubmapMeta {
     /// Solved keyframe index range of the source VO segment (inclusive) —
     /// lets same-video segments find their temporal neighbors.
     pub kf_range: Option<(u32, u32)>,
+    /// Focal measured by the trainer's photometric refinement (pixels).
+    /// When it differs from `focal`, the persisted geometry still carries
+    /// the guess-focal warp until `gs-cli refocal` re-bundles it.
+    pub focal_refined: Option<f64>,
     /// None = unregistered island.
     pub world_from_submap: Option<WorldFromSubmap>,
 }
@@ -118,6 +122,9 @@ pub fn write_meta(path: &Path, meta: &SubmapMeta) -> anyhow::Result<()> {
     if let Some((a, b)) = meta.kf_range {
         s.push_str(&format!("kf_range={a} {b}\n"));
     }
+    if let Some(f) = meta.focal_refined {
+        s.push_str(&format!("focal_refined={f}\n"));
+    }
     if let Some(w) = &meta.world_from_submap {
         s.push_str(&format!(
             "sim3={} {} {} {} {} {} {} {}\n",
@@ -143,6 +150,7 @@ pub fn read_meta(path: &Path) -> anyhow::Result<SubmapMeta> {
     let (mut width, mut height) = (0u32, 0u32);
     let mut sim3 = None;
     let mut kf_range = None;
+    let mut focal_refined = None;
     for line in text.lines() {
         let Some((k, v)) = line.split_once('=') else { continue };
         match k {
@@ -155,6 +163,7 @@ pub fn read_meta(path: &Path) -> anyhow::Result<SubmapMeta> {
                     kf_range = Some((a.trim().parse()?, b.trim().parse()?));
                 }
             }
+            "focal_refined" => focal_refined = v.parse().ok(),
             "sim3" => {
                 let nums: Vec<f64> = v
                     .split_whitespace()
@@ -181,6 +190,7 @@ pub fn read_meta(path: &Path) -> anyhow::Result<SubmapMeta> {
         width,
         height,
         kf_range,
+        focal_refined,
         world_from_submap: sim3,
     })
 }
@@ -316,6 +326,7 @@ mod tests {
             width: 478,
             height: 850,
             kf_range: Some((535, 1290)),
+            focal_refined: Some(769.4),
             world_from_submap: Some(WorldFromSubmap {
                 scale: 2.5,
                 quat: [0.9, 0.1, -0.2, 0.3],

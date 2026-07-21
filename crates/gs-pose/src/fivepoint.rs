@@ -338,27 +338,36 @@ pub fn ransac_essential_5pt(
         return None;
     }
     let t2 = thresh * thresh;
-    let mut rng = Rng64::new(seed);
-    let mut best: Option<(usize, Matrix3<f64>)> = None;
-    for _ in 0..iters {
-        let mut idx = [0usize; 5];
-        let mut k = 0;
-        while k < 5 {
-            let cand = rng.below(matches.len());
-            if !idx[..k].contains(&cand) {
-                idx[k] = cand;
-                k += 1;
+    // Iterations are independent — fan out across cores. Each draw seeds its
+    // own RNG from (seed, iteration index), so results are deterministic
+    // regardless of thread count or scheduling.
+    use rayon::prelude::*;
+    let best = (0..iters)
+        .into_par_iter()
+        .filter_map(|it| {
+            let mut rng = Rng64::new(seed ^ (0x9E37_79B9_7F4A_7C15u64.wrapping_mul(it as u64 + 1)));
+            let mut idx = [0usize; 5];
+            let mut k = 0;
+            while k < 5 {
+                let cand = rng.below(matches.len());
+                if !idx[..k].contains(&cand) {
+                    idx[k] = cand;
+                    k += 1;
+                }
             }
-        }
-        let sample: Vec<Match2> = idx.iter().map(|&i| matches[i]).collect();
-        for e in five_point(&sample) {
-            let count = matches.iter().filter(|m| sampson_sq(&e, m) < t2).count();
-            if best.is_none_or(|(bc, _)| count > bc) {
-                best = Some((count, e));
-            }
-        }
-    }
-    let (best_count, e0) = best?;
+            let sample: Vec<Match2> = idx.iter().map(|&i| matches[i]).collect();
+            five_point(&sample)
+                .into_iter()
+                .map(|e| {
+                    let count =
+                        matches.iter().filter(|m| sampson_sq(&e, m) < t2).count();
+                    (count, it, e)
+                })
+                .max_by_key(|(c, ..)| *c)
+        })
+        // Tie-break on the iteration index for determinism.
+        .max_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
+    let (best_count, _, e0) = best?;
     if best_count < 5 {
         return None;
     }

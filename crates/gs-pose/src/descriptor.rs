@@ -136,23 +136,28 @@ pub fn match_descriptors(
     max_dist: u32,
     ratio: f32,
 ) -> Vec<(usize, usize)> {
-    let mut fwd: Vec<(usize, usize, u32)> = Vec::new();
-    for (i, da) in a.iter().enumerate() {
-        let mut best = (u32::MAX, usize::MAX);
-        let mut second = u32::MAX;
-        for (j, db) in b.iter().enumerate() {
-            let d = hamming_multi(da, db);
-            if d < best.0 {
-                second = best.0;
-                best = (d, j);
-            } else if d < second {
-                second = d;
+    // Brute force over a×b is the registration hot loop — rows of `a` are
+    // independent, fan out across cores.
+    use rayon::prelude::*;
+    let fwd: Vec<(usize, usize, u32)> = a
+        .par_iter()
+        .enumerate()
+        .filter_map(|(i, da)| {
+            let mut best = (u32::MAX, usize::MAX);
+            let mut second = u32::MAX;
+            for (j, db) in b.iter().enumerate() {
+                let d = hamming_multi(da, db);
+                if d < best.0 {
+                    second = best.0;
+                    best = (d, j);
+                } else if d < second {
+                    second = d;
+                }
             }
-        }
-        if best.0 <= max_dist && (best.0 as f32) < ratio * second as f32 {
-            fwd.push((i, best.1, best.0));
-        }
-    }
+            (best.0 <= max_dist && (best.0 as f32) < ratio * second as f32)
+                .then_some((i, best.1, best.0))
+        })
+        .collect();
     let mut best_for_b: std::collections::HashMap<usize, (usize, u32)> =
         std::collections::HashMap::new();
     for &(i, j, d) in &fwd {

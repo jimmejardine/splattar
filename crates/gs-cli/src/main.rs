@@ -149,6 +149,17 @@ enum Command {
         #[arg(long, default_value_t = 1000)]
         sh_promote: u32,
     },
+    /// Re-bundle a submap's persisted geometry with the trainer-measured
+    /// focal (removes the guess-focal warp that blocks cross-submap Sim(3)
+    /// registration). Rewrites landmarks.bin / poses.csv / meta in place.
+    Refocal {
+        project: PathBuf,
+        #[arg(long)]
+        submap: usize,
+        /// Corrected focal in pixels (default: focal_refined from meta).
+        #[arg(long)]
+        focal: Option<f64>,
+    },
     /// Offline registration lab: re-attempt Sim(3) registration of one
     /// persisted submap against the rest of the project, with tunable
     /// matching parameters and diagnostics. Writes nothing unless --write.
@@ -288,6 +299,11 @@ fn main() -> anyhow::Result<()> {
                 sh_promote,
             },
         ),
+        Command::Refocal {
+            project,
+            submap,
+            focal,
+        } => run_refocal(&project, submap, focal),
         Command::Register {
             project,
             submap,
@@ -697,7 +713,7 @@ fn train_and_bake(
     budget: u32,
     pose_window: f32,
     out: &std::path::Path,
-) -> anyhow::Result<(f64, usize)> {
+) -> anyhow::Result<(f64, usize, f64)> {
     use gs_train::{TrainConfig, Trainer};
 
     let ctx = pollster::block_on(gs_wgpu::GpuContext::new(gs_wgpu::backends_from_str(None)?))?;
@@ -779,7 +795,7 @@ fn train_and_bake(
         &scene.opacities,
         &scene.sh,
     )?;
-    Ok((psnr, scene.num))
+    Ok((psnr, scene.num, trainer.focal_scale as f64))
 }
 
 fn write_trajectory_csv(
@@ -861,6 +877,7 @@ fn run_pipeline(
             width: vo.video_size.0,
             height: vo.video_size.1,
             kf_range: seg_kf_range(primary),
+            focal_refined: None,
             world_from_submap: Some(project::WorldFromSubmap::identity()),
         },
     )?;
@@ -870,7 +887,8 @@ fn run_pipeline(
     write_thumbs(&dir, &vo.thumbs, seg_kf_range(primary))?;
 
     let ply = dir.join("splat.ply");
-    let (psnr, num) = train_and_bake(prepared, iters, budget, pose_window, &ply)?;
+    let (psnr, num, fscale) = train_and_bake(prepared, iters, budget, pose_window, &ply)?;
+    update_refined_focal(&dir, fscale)?;
     if let Some(extra) = out {
         std::fs::copy(&ply, &extra)?;
     }
@@ -1024,6 +1042,7 @@ fn add_segment_submap(
             width: vo.video_size.0,
             height: vo.video_size.1,
             kf_range: seg_kf_range(seg),
+            focal_refined: None,
             world_from_submap,
         },
     )?;
@@ -1033,7 +1052,8 @@ fn add_segment_submap(
     write_thumbs(&dir, &vo.thumbs, seg_kf_range(seg))?;
 
     let ply = dir.join("splat.ply");
-    let (psnr, num) = train_and_bake(prepared, iters, budget, 1.0, &ply)?;
+    let (psnr, num, fscale) = train_and_bake(prepared, iters, budget, 1.0, &ply)?;
+    update_refined_focal(&dir, fscale)?;
     println!(
         "submap-{idx}: {num} surfels, held-out PSNR {psnr:.2} dB — {}",
         if registered {
@@ -1100,7 +1120,10 @@ fn attempt_sim3(
     min_inliers: usize,
     label: &str,
 ) -> Option<gs_pose::sim3::Sim3G> {
-    use gs_pose::sim3::register_point_sets;
+    // Same phone, comparable walking pace: cross-submap gauge scale beyond
+    // [0.2, 5] is physically implausible, and unconstrained search lets
+    // near-collapse models out-vote the truth on ambiguous pools.
+    use gs_pose::sim3::register_point_sets_bounded;
     if a.len() < min_inliers {
         return None;
     }
@@ -1108,7 +1131,8 @@ fn attempt_sim3(
     let mut d: Vec<f64> = b.iter().map(|p| (*p - centroid).length()).collect();
     d.sort_by(f64::total_cmp);
     let thresh = (thresh_frac * d[d.len() / 2]).max(1e-9);
-    let (sim3, inliers) = register_point_sets(a, b, 1000, thresh, 0x5133)?;
+    let (sim3, inliers) =
+        register_point_sets_bounded(a, b, 1000, thresh, 0x5133, (0.2, 5.0))?;
     let inl_b: Vec<glam::DVec3> = inliers.iter().map(|&i| b[i]).collect();
     let cen = inl_b.iter().copied().sum::<glam::DVec3>() / inl_b.len() as f64;
     let spread = (inl_b.iter().map(|p| (*p - cen).length_squared()).sum::<f64>()
@@ -1338,6 +1362,99 @@ fn try_global_registration(
     let a: Vec<glam::DVec3> = filtered.iter().map(|&(x, _)| new[x].pos).collect();
     let b: Vec<glam::DVec3> = filtered.iter().map(|&(_, y)| world[y].pos).collect();
     attempt_sim3(&a, &b, 0.05, 25, "covis")
+}
+
+/// Record the trainer-measured focal in the submap meta (geometry itself
+/// is corrected separately by `refocal`).
+fn update_refined_focal(dir: &std::path::Path, focal_scale: f64) -> anyhow::Result<()> {
+    let meta_path = dir.join("meta.txt");
+    let mut meta = project::read_meta(&meta_path)?;
+    meta.focal_refined = Some(meta.focal * focal_scale);
+    project::write_meta(&meta_path, &meta)
+}
+
+/// The focal re-BA: rebuild the submap's bundle problem from disk (poses +
+/// landmarks + full observation lists ARE the BA graph), re-normalize the
+/// observations with the corrected focal, re-optimize, and rewrite the
+/// geometry. Removes the guess-focal warp that makes independently built
+/// submaps non-Sim(3)-comparable (measured: no registration consensus at
+/// ~6% focal error; see RESULTS.md).
+fn run_refocal(
+    project_root: &std::path::Path,
+    submap: usize,
+    focal_override: Option<f64>,
+) -> anyhow::Result<()> {
+    let dir = project::Project::submap_dir(project_root, submap);
+    let mut meta = project::read_meta(&dir.join("meta.txt"))?;
+    let new_focal = focal_override
+        .or(meta.focal_refined)
+        .context("no refined focal in meta — pass --focal or retrain")?;
+    log::info!(
+        "refocal submap-{submap}: {:.1} -> {:.1} px",
+        meta.focal,
+        new_focal
+    );
+
+    let mut landmarks = project::read_landmarks(&dir.join("landmarks.bin"))?;
+    let pose_map = load_seg_poses(&dir.join("poses.csv"))?;
+    let mut kfs: Vec<u32> = pose_map.keys().copied().collect();
+    kfs.sort_unstable();
+    let cam_of_kf: std::collections::HashMap<u32, usize> =
+        kfs.iter().enumerate().map(|(i, &k)| (k, i)).collect();
+    let mut poses: Vec<(glam::DQuat, glam::DVec3)> =
+        kfs.iter().map(|k| pose_map[k]).collect();
+
+    let (cx, cy) = (meta.width as f64 / 2.0, meta.height as f64 / 2.0);
+    let mut lm_pos: Vec<glam::DVec3> = landmarks
+        .iter()
+        .map(|l| glam::DVec3::new(l.pos[0] as f64, l.pos[1] as f64, l.pos[2] as f64))
+        .collect();
+    let mut obs: Vec<(usize, usize, f64, f64)> = Vec::new();
+    for (li, l) in landmarks.iter().enumerate() {
+        for (kf, p) in &l.obs_all {
+            let Some(&cam) = cam_of_kf.get(kf) else { continue };
+            obs.push((
+                cam,
+                li,
+                (p[0] as f64 - cx) / new_focal,
+                (p[1] as f64 - cy) / new_focal,
+            ));
+        }
+    }
+    log::info!(
+        "re-BA: {} poses, {} landmarks, {} observations",
+        poses.len(),
+        lm_pos.len(),
+        obs.len()
+    );
+    let (before, after) =
+        gs_pose::ba::refine_submap_glam(&mut poses, &mut lm_pos, &obs, 30);
+    log::info!("re-BA cost: {before:.3e} -> {after:.3e}");
+
+    // Rewrite geometry: landmarks, poses, meta focal.
+    for (l, p) in landmarks.iter_mut().zip(&lm_pos) {
+        l.pos = [p.x as f32, p.y as f32, p.z as f32];
+    }
+    project::write_landmarks(&dir.join("landmarks.bin"), &landmarks)?;
+    let mut csv = String::from("kf,cx,cy,cz,qw,qx,qy,qz\n");
+    for (i, k) in kfs.iter().enumerate() {
+        let (r_wc, t_wc) = poses[i];
+        // Stored form: center + camera-to-world rotation.
+        let q_c2w = r_wc.conjugate();
+        let center = -(q_c2w * t_wc);
+        csv.push_str(&format!(
+            "{k},{:.6},{:.6},{:.6},{:.8},{:.8},{:.8},{:.8}\n",
+            center.x, center.y, center.z, q_c2w.w, q_c2w.x, q_c2w.y, q_c2w.z
+        ));
+    }
+    std::fs::write(dir.join("poses.csv"), csv)?;
+    meta.focal = new_focal;
+    meta.focal_refined = Some(new_focal);
+    project::write_meta(&dir.join("meta.txt"), &meta)?;
+    println!(
+        "submap-{submap} re-bundled at focal {new_focal:.1} px (cost {before:.2e} -> {after:.2e})"
+    );
+    Ok(())
 }
 
 /// Solved keyframe index range (inclusive) of a VO segment.
@@ -1572,7 +1689,7 @@ fn run_register(
     // stored landmark observations — precision comes from the geometry of
     // the specific pair, not from global descriptor uniqueness.
     if registration.is_none() && !top_regions.is_empty() {
-        use gs_pose::pairwise::{PairwiseConfig, match_image_pair};
+        use gs_pose::pairwise::PairwiseConfig;
         let sub_dir = |i: usize| project::Project::submap_dir(project_root, i);
         let new_thumbs = list_thumbs(&sub_dir(submap));
         let new_meta = &proj.submaps[submap];
@@ -1588,7 +1705,7 @@ fn run_register(
                            pose: &(glam::DQuat, glam::DVec3),
                            meta: &project::SubmapMeta,
                            to_world: Option<&gs_pose::sim3::Sim3G>|
-         -> Vec<(f32, f32, DVec3)> {
+         -> Vec<(f32, f32, DVec3, gs_pose::descriptor::MultiDescriptor)> {
             let (r, t) = pose;
             let mut out = Vec::new();
             for l in raw {
@@ -1604,23 +1721,31 @@ fn run_register(
                     continue;
                 }
                 let stored = to_world.map(|s| s.apply(p)).unwrap_or(p);
-                out.push((px, py, stored));
+                out.push((px, py, stored, l.desc));
             }
             out
         };
-        let snap = |list: &[(f32, f32, DVec3)], px: (f32, f32)| -> Option<DVec3> {
-            let (mut best, mut best_d2) = (None, 14.0f32 * 14.0);
-            for &(x, y, p) in list {
+        // Appearance-guided snap: among landmark projections within a
+        // generous radius, take the one whose stored descriptor matches the
+        // verified corner's — distance alone grabs the wrong landmark in
+        // repeated indoor texture (measured: 41 pooled snaps, 6 consistent).
+        let snap = |list: &[(f32, f32, DVec3, gs_pose::descriptor::MultiDescriptor)],
+                    px: (f32, f32),
+                    desc: &gs_pose::descriptor::MultiDescriptor|
+         -> Option<DVec3> {
+            let (mut best, mut best_d) = (None, 61u32);
+            for (x, y, p, ld) in list {
                 let d2 = (x - px.0).powi(2) + (y - px.1).powi(2);
-                if d2 < best_d2 {
-                    best_d2 = d2;
-                    best = Some(p);
+                if d2 > 18.0 * 18.0 {
+                    continue;
+                }
+                let hd = gs_pose::descriptor::hamming_multi(desc, ld);
+                if hd < best_d {
+                    best_d = hd;
+                    best = Some(*p);
                 }
             }
             best
-        };
-        let nearest = |kfs: &[u32], target: u32| -> Option<u32> {
-            kfs.iter().copied().min_by_key(|k| k.abs_diff(target))
         };
 
         // Verified+snapped pairs pooled across ALL regions (they share the
@@ -1629,14 +1754,26 @@ fn run_register(
         let mut pool_b: Vec<DVec3> = Vec::new();
         let mut pool_submap: Option<usize> = None;
 
+        let nearest_two = |kfs: &[u32], target: u32| -> Vec<u32> {
+            let mut v: Vec<u32> = kfs.to_vec();
+            v.sort_by_key(|k| k.abs_diff(target));
+            v.truncate(2);
+            v
+        };
+        // 2D bridge observations pooled per new-side keyframe across every
+        // region and thumb combo — one camera, exact 2D, robust-median scale.
+        let mut bridge_by_kn: std::collections::HashMap<u32, Vec<gs_pose::sim3::BridgeObs>> =
+            std::collections::HashMap::new();
+        // Relative camera poses from verified pairs — the snap-free Sim(3)
+        // route (one entry per verified image pair).
+        let mut rel_pairs: Vec<gs_pose::sim3::RelPair> = Vec::new();
+
         'regions: for &((nk, ws, wk), v) in &top_regions {
             let w_thumbs = list_thumbs(&sub_dir(ws));
-            let (Some(kn), Some(kw)) = (
-                nearest(&new_thumbs, nk * BUCKET + BUCKET / 2),
-                nearest(&w_thumbs, wk * BUCKET + BUCKET / 2),
-            ) else {
-                continue;
-            };
+            let kns = nearest_two(&new_thumbs, nk * BUCKET + BUCKET / 2);
+            let kws = nearest_two(&w_thumbs, wk * BUCKET + BUCKET / 2);
+            for &kn in &kns {
+            for &kw in &kws {
             let (Some(n_img), Some(w_img)) =
                 (load_thumb(&sub_dir(submap), kn), load_thumb(&sub_dir(ws), kw))
             else {
@@ -1649,7 +1786,8 @@ fn run_register(
                 cy: new_meta.height as f64 / 2.0,
                 ..Default::default()
             };
-            let verified = match_image_pair(&w_img, &n_img, &cfg2);
+            let (verified, rel) =
+                gs_pose::pairwise::match_image_pair_with_pose(&w_img, &n_img, &cfg2);
             println!(
                 "pairwise ({v} votes): world s{ws} kf {kw} <-> kf {kn}: {} verified",
                 verified.len()
@@ -1669,9 +1807,9 @@ fn run_register(
             let w_proj = project_set(w_raw, &w_pose, w_meta, Some(&world_sims[&ws]));
             let n_proj = project_set(&new_raw, &n_pose, new_meta, None);
             if log::log_enabled!(log::Level::Debug) {
-                let min_d = |list: &[(f32, f32, DVec3)], px: (f32, f32)| -> f32 {
+                let min_d = |list: &[(f32, f32, DVec3, gs_pose::descriptor::MultiDescriptor)], px: (f32, f32)| -> f32 {
                     list.iter()
-                        .map(|&(x, y, _)| ((x - px.0).powi(2) + (y - px.1).powi(2)).sqrt())
+                        .map(|&(x, y, _, _)| ((x - px.0).powi(2) + (y - px.1).powi(2)).sqrt())
                         .fold(f32::INFINITY, f32::min)
                 };
                 let dw: Vec<i32> =
@@ -1687,13 +1825,30 @@ fn run_register(
             if verified.len() < 10 {
                 continue;
             }
+            // Collect the relative-pose constraint (world camera = submap
+            // gauge pose pushed through its Sim(3) as an effective camera:
+            // R^w = R^g·R_sᵀ, t^w = σ·t^g − R^w·t_s).
+            if let Some(rp) = rel
+                && (pool_submap.is_none() || pool_submap == Some(ws))
+            {
+                let s = &world_sims[&ws];
+                let (rg, tg) = w_pose;
+                let rw = rg * s.rot.conjugate();
+                let tw = s.scale * tg - rw * s.trans;
+                rel_pairs.push(gs_pose::sim3::RelPair {
+                    cam_a_world: (rw, tw),
+                    cam_b_seg: n_pose,
+                    rel_rot: rp.rot,
+                    rel_tdir: rp.tdir,
+                });
+            }
             // Snap verified endpoints to landmark observations.
             let mut a3 = Vec::new(); // new/seg side
             let mut b3 = Vec::new(); // world side
             let mut bridge = Vec::new();
             for m in &verified {
-                let wsnap = snap(&w_proj, m.a_px);
-                let nsnap = snap(&n_proj, m.b_px);
+                let wsnap = snap(&w_proj, m.a_px, &m.a_desc);
+                let nsnap = snap(&n_proj, m.b_px, &m.b_desc);
                 if let (Some(wp), Some(np)) = (wsnap, nsnap) {
                     a3.push(np);
                     b3.push(wp);
@@ -1712,6 +1867,7 @@ fn run_register(
                 pool_submap = Some(ws);
                 pool_a.extend_from_slice(&a3);
                 pool_b.extend_from_slice(&b3);
+                bridge_by_kn.entry(kn).or_default().extend(bridge);
             }
             if a3.len() >= 8
                 && let Some(s) = attempt_sim3(&a3, &b3, 0.08, 8, "pairwise 3D")
@@ -1719,33 +1875,69 @@ fn run_register(
                 registration = Some(s);
                 break 'regions;
             }
-            if bridge.len() >= 8
-                && let Some((r_wc, t_wc)) = poses.get(&kn)
-                && let Some((s, inl)) = gs_pose::sim3::sim3_from_bridge(
-                    *r_wc,
-                    *t_wc,
-                    &bridge,
-                    8.0 / new_meta.focal,
-                    0x9a1f,
-                )
-            {
+            } // kw
+            } // kn
+        }
+
+        // Snap-free first: Sim(3) from relative camera poses alone.
+        if registration.is_none() && rel_pairs.len() >= 2 {
+            if let Some((s, rms)) = gs_pose::sim3::sim3_from_relative_pairs(&rel_pairs) {
                 println!(
-                    "  pairwise 2D: {inl}/{} inliers (scale {:.3})",
-                    bridge.len(),
+                    "relative-pose Sim(3): {} pairs, rms {rms:.3}, scale {:.3}",
+                    rel_pairs.len(),
                     s.scale
                 );
-                if inl >= 8 && (0.05..=20.0).contains(&s.scale) {
+                // Residual gate relative to the world scene scale.
+                let cen =
+                    pool_b.iter().copied().sum::<DVec3>() / pool_b.len().max(1) as f64;
+                let scene = pool_b
+                    .iter()
+                    .map(|p| (*p - cen).length())
+                    .fold(0.0f64, f64::max)
+                    .max(1.0);
+                if rms < 0.08 * scene && (0.2..=5.0).contains(&s.scale) {
                     registration = Some(s);
-                    break 'regions;
                 }
+            } else {
+                println!(
+                    "relative-pose Sim(3): {} pairs, rotations inconsistent",
+                    rel_pairs.len()
+                );
             }
         }
 
-        // Pooled attempt: every epipolar-verified, landmark-snapped pair
-        // across all vote regions, one Sim(3).
+        // Pooled attempts across all regions: 3D Umeyama first, then the 2D
+        // depth-ratio bridge per new-side keyframe with enough observations.
         if registration.is_none() && pool_a.len() >= 10 {
             println!("pooled pairwise: {} pairs across regions", pool_a.len());
             registration = attempt_sim3(&pool_a, &pool_b, 0.18, 8, "pairwise pooled");
+        }
+        if registration.is_none() {
+            let mut kns: Vec<_> = bridge_by_kn.iter().collect();
+            kns.sort_by_key(|(_, v)| std::cmp::Reverse(v.len()));
+            for (kn, bridge) in kns {
+                if bridge.len() < 8 {
+                    break;
+                }
+                let Some((r_wc, t_wc)) = poses.get(kn) else { continue };
+                if let Some((s, inl)) = gs_pose::sim3::sim3_from_bridge(
+                    *r_wc,
+                    *t_wc,
+                    bridge,
+                    8.0 / new_meta.focal,
+                    0x9a1f,
+                ) {
+                    println!(
+                        "pooled 2D bridge via kf {kn}: {inl}/{} inliers (scale {:.3})",
+                        bridge.len(),
+                        s.scale
+                    );
+                    if inl >= 8 && (0.2..=5.0).contains(&s.scale) {
+                        registration = Some(s);
+                        break;
+                    }
+                }
+            }
         }
     }
 

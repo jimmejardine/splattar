@@ -86,6 +86,21 @@ pub fn ransac_sim3(
     thresh: f64,
     seed: u64,
 ) -> Option<Sim3Ransac> {
+    ransac_sim3_bounded(a, b, iters, thresh, seed, (0.01, 100.0))
+}
+
+/// RANSAC Sim(3) with an explicit prior on admissible scale — candidate
+/// models outside the bounds never get to vote. Degenerate near-collapse
+/// transforms otherwise out-vote the true model on ambiguous match sets
+/// (measured repeatedly in cross-video registration).
+pub fn ransac_sim3_bounded(
+    a: &[Vector3<f64>],
+    b: &[Vector3<f64>],
+    iters: usize,
+    thresh: f64,
+    seed: u64,
+    scale_bounds: (f64, f64),
+) -> Option<Sim3Ransac> {
     let n = a.len();
     if n < 3 || n != b.len() {
         return None;
@@ -108,7 +123,7 @@ pub fn ransac_sim3(
         let Some(m) = umeyama(&sa, &sb) else { continue };
         // Degenerate-scale models (near-coincident samples) can "explain"
         // any concentrated cluster by collapsing it — never score them.
-        if !(0.01..=100.0).contains(&m.scale) {
+        if !(scale_bounds.0..=scale_bounds.1).contains(&m.scale) {
             continue;
         }
         let count = a
@@ -166,9 +181,21 @@ pub fn register_point_sets(
     thresh: f64,
     seed: u64,
 ) -> Option<(Sim3G, Vec<usize>)> {
+    register_point_sets_bounded(a, b, iters, thresh, seed, (0.01, 100.0))
+}
+
+/// [`register_point_sets`] with an admissible-scale prior.
+pub fn register_point_sets_bounded(
+    a: &[glam::DVec3],
+    b: &[glam::DVec3],
+    iters: usize,
+    thresh: f64,
+    seed: u64,
+    scale_bounds: (f64, f64),
+) -> Option<(Sim3G, Vec<usize>)> {
     let na: Vec<Vector3<f64>> = a.iter().map(|p| Vector3::new(p.x, p.y, p.z)).collect();
     let nb: Vec<Vector3<f64>> = b.iter().map(|p| Vector3::new(p.x, p.y, p.z)).collect();
-    let res = ransac_sim3(&na, &nb, iters, thresh, seed)?;
+    let res = ransac_sim3_bounded(&na, &nb, iters, thresh, seed, scale_bounds)?;
     let q = res.sim3.r.quaternion();
     Some((
         Sim3G {
@@ -177,6 +204,121 @@ pub fn register_point_sets(
             trans: glam::DVec3::new(res.sim3.t[0], res.sim3.t[1], res.sim3.t[2]),
         },
         res.inliers,
+    ))
+}
+
+/// One verified image pair with known camera poses in each gauge, plus the
+/// epipolar-recovered relative pose (camera B in camera A's frame, unit
+/// baseline). Input to [`sim3_from_relative_pairs`].
+pub struct RelPair {
+    /// Camera A: world→camera pose in the PROJECT-WORLD gauge.
+    pub cam_a_world: (glam::DQuat, glam::DVec3),
+    /// Camera B: world→camera pose in the SEGMENT gauge.
+    pub cam_b_seg: (glam::DQuat, glam::DVec3),
+    /// x_b = rel_rot · x_a + λ · rel_tdir  (λ unknown, ‖rel_tdir‖ = 1).
+    pub rel_rot: glam::DQuat,
+    pub rel_tdir: glam::DVec3,
+}
+
+/// Snap-free Sim(3): relative camera poses between known-gauge cameras
+/// constrain world_from_seg directly — no landmark 3D is ever trusted
+/// (correspondence snapping measured out at ~20-30% precision, starving
+/// every point-based lift; see RESULTS.md).
+///
+/// Per pair: R_s = (R_rel·R_A)ᵀ·R_B (rotation averaging), and the camera
+/// centers give σ·(R_s·C_b) + t_s + λᵢ·d̂ᵢ = C_a — linear in (σ, t_s, λᵢ)
+/// with one extra unknown per pair, so P ≥ 2 pairs solve it. Returns the
+/// transform and the RMS center residual (world units).
+pub fn sim3_from_relative_pairs(pairs: &[RelPair]) -> Option<(Sim3G, f64)> {
+    if pairs.len() < 2 {
+        return None;
+    }
+    let to_na = |q: &glam::DQuat| {
+        UnitQuaternion::from_quaternion(nalgebra::Quaternion::new(q.w, q.x, q.y, q.z))
+    };
+    // Per-pair rotation estimates, then keep the LARGEST mutually consistent
+    // cluster — a single junk E-decomposition must not poison the solve.
+    let rots: Vec<UnitQuaternion<f64>> = pairs
+        .iter()
+        .map(|pr| {
+            (to_na(&pr.rel_rot) * to_na(&pr.cam_a_world.0)).inverse() * to_na(&pr.cam_b_seg.0)
+        })
+        .collect();
+    let mut best_cluster: Vec<usize> = Vec::new();
+    for i in 0..rots.len() {
+        let cluster: Vec<usize> = (0..rots.len())
+            .filter(|&j| (rots[i].inverse() * rots[j]).angle() < 0.3)
+            .collect();
+        if cluster.len() > best_cluster.len() {
+            best_cluster = cluster;
+        }
+    }
+    if best_cluster.len() < 2 {
+        log::debug!(
+            "relative-pose Sim3: no rotation cluster among {} pairs",
+            pairs.len()
+        );
+        return None;
+    }
+    let pairs: Vec<&RelPair> = best_cluster.iter().map(|&i| &pairs[i]).collect();
+    let p = pairs.len();
+    log::debug!("relative-pose Sim3: rotation cluster {p}/{}", rots.len());
+    let mut acc = nalgebra::Vector4::zeros();
+    for &i in &best_cluster {
+        let q = rots[i].quaternion();
+        let mut v = nalgebra::Vector4::new(q.w, q.i, q.j, q.k);
+        if acc.dot(&v) < 0.0 {
+            v = -v;
+        }
+        acc += v;
+    }
+    if acc.norm() < 1e-12 {
+        return None;
+    }
+    acc /= acc.norm();
+    let r_s = UnitQuaternion::from_quaternion(nalgebra::Quaternion::new(
+        acc[0], acc[1], acc[2], acc[3],
+    ));
+
+    // Linear system in x = [σ, t_s(3), λ_1..λ_P]:
+    //   σ·(R_s·C_b_i) + t_s + λ_i·d_i = C_a_i     (3 rows per pair)
+    // where d_i = (R_rel·R_A)ᵀ·(−t̂_rel) is B's center direction from A.
+    let n_unk = 4 + p;
+    let mut m = nalgebra::DMatrix::<f64>::zeros(3 * p, n_unk);
+    let mut rhs = nalgebra::DVector::<f64>::zeros(3 * p);
+    for (i, pr) in pairs.iter().enumerate() {
+        let r_a = to_na(&pr.cam_a_world.0);
+        let t_a = Vector3::new(pr.cam_a_world.1.x, pr.cam_a_world.1.y, pr.cam_a_world.1.z);
+        let c_a = -(r_a.inverse() * t_a);
+        let r_b = to_na(&pr.cam_b_seg.0);
+        let t_b = Vector3::new(pr.cam_b_seg.1.x, pr.cam_b_seg.1.y, pr.cam_b_seg.1.z);
+        let c_b = -(r_b.inverse() * t_b);
+        let r_rel = to_na(&pr.rel_rot);
+        let u = Vector3::new(pr.rel_tdir.x, pr.rel_tdir.y, pr.rel_tdir.z);
+        let d = (r_rel * r_a).inverse() * (-u);
+        let rc = r_s * c_b;
+        for row in 0..3 {
+            m[(3 * i + row, 0)] = rc[row];
+            m[(3 * i + row, 1 + row)] = 1.0;
+            m[(3 * i + row, 4 + i)] = d[row];
+            rhs[3 * i + row] = c_a[row];
+        }
+    }
+    let svd = m.clone().svd(true, true);
+    let x = svd.solve(&rhs, 1e-12).ok()?;
+    let sigma = x[0];
+    if !(sigma.is_finite() && sigma > 1e-6) {
+        return None;
+    }
+    let resid = (&m * &x - &rhs).norm() / (3.0 * p as f64).sqrt();
+    let q = r_s.quaternion();
+    Some((
+        Sim3G {
+            scale: sigma,
+            rot: glam::DQuat::from_xyzw(q.i, q.j, q.k, q.w),
+            trans: glam::DVec3::new(x[1], x[2], x[3]),
+        },
+        resid,
     ))
 }
 
@@ -231,6 +373,7 @@ pub fn sim3_from_bridge(
         }
     }
     let (count, r_wc, t_wc) = best?;
+    log::debug!("bridge DLT: best reprojection consensus {count}/{}", obs.len());
     if count < 6 {
         return None;
     }
@@ -253,10 +396,12 @@ pub fn sim3_from_bridge(
         })
         .collect();
     if ratios.len() < 4 {
+        log::debug!("bridge DLT: only {} usable depth ratios", ratios.len());
         return None;
     }
     ratios.sort_by(f64::total_cmp);
     let sigma = ratios[ratios.len() / 2];
+    log::debug!("bridge DLT: median depth-ratio scale {sigma:.3}");
     if !(0.01..=100.0).contains(&sigma) {
         return None;
     }
@@ -440,6 +585,61 @@ mod tests {
             "rot err {}",
             (qe.inverse() * s_gt.r).angle()
         );
+    }
+
+    #[test]
+    fn relative_pairs_recover_sim3() {
+        let s_gt = gt();
+        let s_inv = s_gt.inverse();
+        let mut rng = Rng64::new(55);
+        let mut pairs = Vec::new();
+        for k in 0..4 {
+            let mut r = |s: f64| (rng.next_u64() as f64 / u64::MAX as f64 * 2.0 - 1.0) * s;
+            // Random world camera A and seg camera B (derived from a world
+            // camera near A so the baseline is sane).
+            let r_a = UnitQuaternion::from_euler_angles(r(0.3), r(0.3), r(0.3));
+            let c_a = Vector3::new(r(4.0), r(2.0), r(4.0));
+            let t_a = -(r_a * c_a);
+            let r_bw = UnitQuaternion::from_euler_angles(r(0.3), r(0.3), r(0.3) + 0.1 * k as f64);
+            let c_bw = c_a + Vector3::new(r(1.0) + 0.5, r(0.5), r(1.0));
+            // B's pose in the SEG gauge via the inverse Sim3 (effective-
+            // camera formula: R^g = R^w·R_s, t^g = (1/σ)(t^w + R^w·t_s)).
+            let r_bg = r_bw * s_gt.r;
+            let t_bw = -(r_bw * c_bw);
+            let t_bg = (t_bw + r_bw * s_gt.t) / s_gt.scale;
+            // Relative pose B-in-A (Euclidean, world frame).
+            let r_rel = r_bw * r_a.inverse();
+            let t_rel = t_bw - r_rel * t_a;
+            let lam = t_rel.norm();
+            assert!(lam > 1e-6);
+            let g = |q: UnitQuaternion<f64>| {
+                let c = q.quaternion();
+                glam::DQuat::from_xyzw(c.i, c.j, c.k, c.w)
+            };
+            pairs.push(RelPair {
+                cam_a_world: (g(r_a), glam::DVec3::new(t_a[0], t_a[1], t_a[2])),
+                cam_b_seg: (g(r_bg), glam::DVec3::new(t_bg[0], t_bg[1], t_bg[2])),
+                rel_rot: g(r_rel),
+                rel_tdir: glam::DVec3::new(t_rel[0], t_rel[1], t_rel[2]) / lam,
+            });
+        }
+        let (est, rms) = sim3_from_relative_pairs(&pairs).expect("solve");
+        assert!(rms < 1e-9, "rms {rms}");
+        assert!(
+            (est.scale - s_gt.scale).abs() / s_gt.scale < 1e-9,
+            "scale {} vs {}",
+            est.scale,
+            s_gt.scale
+        );
+        let qe = UnitQuaternion::from_quaternion(nalgebra::Quaternion::new(
+            est.rot.w, est.rot.x, est.rot.y, est.rot.z,
+        ));
+        assert!((qe.inverse() * s_gt.r).angle() < 1e-9);
+        let te = Vector3::new(est.trans.x, est.trans.y, est.trans.z);
+        assert!((te - s_gt.t).norm() < 1e-8, "t err {}", (te - s_gt.t).norm());
+        // sanity: verify the seg-gauge construction used the same effective-
+        // camera convention as the solver (s_inv unused otherwise).
+        let _ = s_inv;
     }
 
     #[test]
