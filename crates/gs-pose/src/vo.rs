@@ -144,7 +144,9 @@ impl KeyframePose {
             DVec3::new(-m[(2, 0)], -m[(2, 1)], -m[(2, 2)]),
         );
         let c = self.pose.center();
-        let mut out = DMat4::from_mat3(rc2w.transpose());
+        // `rc2w` IS camera→world already (Rᵀ·diag(1,−1,−1) — the same
+        // expression gs-io::colmap builds). Do NOT transpose it again.
+        let mut out = DMat4::from_mat3(rc2w);
         out.w_axis = glam::DVec4::new(c[0], c[1], c[2], 1.0);
         out
     }
