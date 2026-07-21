@@ -10,7 +10,7 @@ pub mod prefix_sum;
 pub mod profile;
 pub mod sort;
 
-pub use buffers::ReadbackRing;
+pub use buffers::{FramePacer, ReadbackRing};
 pub use context::{GpuContext, backends_from_str};
 pub use prefix_sum::PrefixSum;
 pub use profile::GpuTimer;

@@ -157,6 +157,12 @@ pub struct Trainer {
     pose_ring: gs_wgpu::ReadbackRing<PendingPose>,
     /// GPU MCMC relocation (host keeps the sampling, GPU moves the data).
     relocate: RelocateKernel,
+    /// Caps CPU run-ahead at 1 iteration: after submitting iteration k the
+    /// CPU waits for k-1, so the GPU always has one submission queued (full
+    /// overlap) while async fits/pose grads land with exactly the one-step
+    /// lag the appearance EMA was designed around. Unbounded run-ahead
+    /// starves the EMA — fits arrive epochs late or get dropped.
+    pacer: gs_wgpu::FramePacer,
     /// Per-kernel GPU timing, sampled on log iterations (None when the
     /// adapter lacks TIMESTAMP_QUERY).
     timer: Option<gs_wgpu::GpuTimer>,
@@ -471,6 +477,7 @@ impl Trainer {
             appearance,
             pose_ring: gs_wgpu::ReadbackRing::new(&ctx.device, "pose-grad", 16 * 4, 4),
             relocate,
+            pacer: gs_wgpu::FramePacer::new(1),
             timer: ctx
                 .device
                 .features()
@@ -666,11 +673,12 @@ impl Trainer {
         if let Some(t) = timer.as_ref() {
             t.resolve(&mut encoder);
         }
-        ctx.queue.submit([encoder.finish()]);
+        let submission = ctx.queue.submit([encoder.finish()]);
         if !split {
             self.appearance.map_pending();
         }
         self.pose_ring.map_pending();
+        self.pacer.submitted(&ctx.device, submission);
         let t_bwd = std::time::Instant::now();
         let t_pose = std::time::Instant::now();
 

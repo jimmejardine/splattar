@@ -50,6 +50,43 @@ pub fn readback(device: &wgpu::Device, queue: &wgpu::Queue, src: &wgpu::Buffer) 
     data
 }
 
+/// Bounds CPU run-ahead over the GPU queue. Without any per-iteration
+/// blocking call, the CPU can encode arbitrarily far ahead of the GPU —
+/// async readbacks then complete with unbounded staleness (which broke
+/// appearance-fit tracking) and queue memory grows. Feeding every frame's
+/// final submission index here blocks only when more than `depth`
+/// submissions are in flight, waiting on the OLDEST one — the pipeline keeps
+/// `depth` frames of overlap and never fully drains.
+pub struct FramePacer {
+    depth: usize,
+    pending: std::collections::VecDeque<wgpu::SubmissionIndex>,
+}
+
+impl FramePacer {
+    pub fn new(depth: usize) -> Self {
+        assert!(depth > 0);
+        Self {
+            depth,
+            pending: std::collections::VecDeque::new(),
+        }
+    }
+
+    /// Record a submission; blocks until the GPU is within `depth`
+    /// submissions of the CPU. Also pumps map_async callbacks.
+    pub fn submitted(&mut self, device: &wgpu::Device, index: wgpu::SubmissionIndex) {
+        self.pending.push_back(index);
+        while self.pending.len() > self.depth {
+            let oldest = self.pending.pop_front().unwrap();
+            device
+                .poll(wgpu::PollType::Wait {
+                    submission_index: Some(oldest),
+                    timeout: None,
+                })
+                .expect("device poll failed");
+        }
+    }
+}
+
 /// Persistent asynchronous readback ring: a fixed set of reusable MAP_READ
 /// staging buffers with tagged, FIFO-ordered completion. This is the hot-loop
 /// counterpart of [`readback`]: record a copy into a slot inside the frame's
