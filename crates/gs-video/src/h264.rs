@@ -58,6 +58,12 @@ impl<'a> BitReader<'a> {
         Ok(if k % 2 == 0 { -(k as i32) / 2 } else { (k as i32 + 1) / 2 })
     }
 
+    /// Current bit position (H.265 needs syntax-element bit counts —
+    /// `NumBitsForSTRefPicSetInSlice` is handed to the decoder).
+    pub fn bit_pos(&self) -> usize {
+        self.pos
+    }
+
     /// True if RBSP data remains beyond the trailing stop bit.
     pub fn has_more_rbsp_data(&self) -> bool {
         let total_bits = self.data.len() * 8;
