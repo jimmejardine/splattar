@@ -720,6 +720,9 @@ impl Trainer {
         for b in &mut ap[3..] {
             *b = b.clamp(-0.5, 0.5);
         }
+        // Soft anchor: pull the mean correction toward identity by 10% per
+        // update (time constant ~10 view visits). A hard per-step projection
+        // measurably fights the per-view fits (-1 dB on the exposure gate).
         let n = self.appear.len() as f32;
         let mut mean = [0.0f32; 6];
         for a in &self.appear {
@@ -729,8 +732,9 @@ impl Trainer {
         }
         for a in &mut self.appear {
             for k in 0..3 {
-                a[k] /= mean[k].max(0.25);
-                a[3 + k] -= mean[3 + k];
+                let corr = 1.0 + 0.1 * (mean[k].max(0.25) - 1.0);
+                a[k] /= corr;
+                a[3 + k] -= 0.1 * mean[3 + k];
             }
         }
     }

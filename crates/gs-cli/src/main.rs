@@ -63,6 +63,10 @@ enum Command {
         /// Cap on training views (sharpest-per-window selection).
         #[arg(long, default_value_t = 120)]
         max_views: u32,
+        /// Fraction of training during which pose refinement runs (1.0 =
+        /// full run; the LR decays on the position schedule either way).
+        #[arg(long, default_value_t = 1.0)]
+        pose_window: f32,
         /// Output path for the baked compat .ply.
         #[arg(long)]
         out: Option<PathBuf>,
@@ -208,9 +212,10 @@ fn main() -> anyhow::Result<()> {
             budget,
             downscale,
             max_views,
+            pose_window,
             out,
         } => run_pipeline(
-            &video, focal, max_frames, iters, budget, downscale, max_views, out,
+            &video, focal, max_frames, iters, budget, downscale, max_views, pose_window, out,
         ),
         Command::Pose {
             video,
@@ -556,6 +561,7 @@ fn train_and_bake(
     prepared: Prepared,
     iters: u32,
     budget: u32,
+    pose_window: f32,
     out: &std::path::Path,
 ) -> anyhow::Result<(f64, usize)> {
     use gs_train::{TrainConfig, Trainer};
@@ -586,9 +592,9 @@ fn train_and_bake(
         // perturbed poses).
         pose_refine_lr: 2e-3,
         pose_refine_start: 500,
-        // Stop refining at mid-training so the back half converges against
-        // settled cameras (otherwise held-out collapses while train fits).
-        pose_refine_end: iters / 2,
+        // Window over which pose refinement runs (LR decays on the position
+        // schedule regardless; the window matters on very long runs).
+        pose_refine_end: ((iters as f32 * pose_window.clamp(0.05, 1.0)) as u32).max(1),
         focal_refine: true,
         // Phone auto-exposure sweeps continuously — compensate per view.
         appearance_start: 300,
@@ -669,6 +675,7 @@ fn run_pipeline(
     budget: u32,
     downscale: u32,
     max_views: u32,
+    pose_window: f32,
     out: Option<PathBuf>,
 ) -> anyhow::Result<()> {
     let vo = run_vo(video, focal, max_frames)?;
@@ -692,7 +699,7 @@ fn run_pipeline(
     write_trajectory_csv(&dir.join("trajectory.csv"), &vo)?;
 
     let ply = dir.join("splat.ply");
-    let (psnr, num) = train_and_bake(prepared, iters, budget, &ply)?;
+    let (psnr, num) = train_and_bake(prepared, iters, budget, pose_window, &ply)?;
     if let Some(extra) = out {
         std::fs::copy(&ply, &extra)?;
     }
@@ -818,7 +825,7 @@ fn run_add(
     write_trajectory_csv(&dir.join("trajectory.csv"), &vo)?;
 
     let ply = dir.join("splat.ply");
-    let (psnr, num) = train_and_bake(prepared, iters, budget, &ply)?;
+    let (psnr, num) = train_and_bake(prepared, iters, budget, 1.0, &ply)?;
     println!(
         "submap-{idx}: {num} surfels, held-out PSNR {psnr:.2} dB — {}",
         if registered {
