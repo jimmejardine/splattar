@@ -347,3 +347,19 @@ The next data lever is FULL-RESOLUTION pairwise matching (thumbnails are
 half-res; 4× pixels → sharper corners, more matches, tighter E), plus more
 thumb pairs per region. New durable tools regardless: scale-bounded Sim(3)
 RANSAC, appearance-guided snapping, `sim3_from_relative_pairs`.
+
+### Display-rotation × bootstrap interaction: resolved (2026-07-21)
+
+Baking phone display rotation into decoded pixels (tkhd matrix → upright
+frames, gs-video 1607d5d) initially collapsed VO bootstrap on the rotated
+720×1280 iPhone clip: 97/538 essential inliers vs 466/538 unrotated on the
+same keyframe pair, despite every isolated layer proving
+rotation-equivalent (pixels visually exact, single-step KLT agreement
+0.004 px, RANSAC invariant on synthetic geometry). Root cause: the
+eight-point DLT bootstrap was numerically fragile on this clip's
+rotation-dominant ~1° parallax geometry — its Hartley-normalized
+conditioning sat on the failing side in the rotated coordinate frame. The
+Nistér–Stewénius five-point solver (631a5bb) is robust in that motion
+regime in both frames: the clip now solves 223/223 keyframes rotated AND
+unrotated. `SPLATTAR_NO_ROTATION=1` remains as a debug isolation flag; the
+rotation bake is unconditionally correct and on by default.
