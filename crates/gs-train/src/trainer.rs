@@ -781,51 +781,79 @@ impl Trainer {
         steps: u32,
     ) -> f64 {
         let mut refined: Vec<TrainView> = views.to_vec();
-        for view in &mut refined {
-            let mut m = [0.0f32; 6];
-            let mut v = [0.0f32; 6];
-            // Depth for LR scaling, from the probe cloud.
-            let inv = view.camera.quat.conjugate();
-            let mut depths: Vec<f32> = self
-                .probe_positions
-                .iter()
-                .map(|p| -(inv * (*p - view.camera.center)).z)
-                .filter(|d| *d > 0.05)
-                .collect();
-            let depth = if depths.is_empty() {
-                self.extent * 0.1
-            } else {
-                let mid = depths.len() / 2;
-                *depths.select_nth_unstable_by(mid, f32::total_cmp).1
-            };
+        if refined.is_empty() {
+            return f64::NAN;
+        }
+        let n_eval = refined.len();
+        // Per-view Adam state + depth for LR scaling, from the probe cloud.
+        let mut m = vec![[0.0f32; 6]; n_eval];
+        let mut v = vec![[0.0f32; 6]; n_eval];
+        let depths: Vec<f32> = refined
+            .iter()
+            .map(|view| {
+                let inv = view.camera.quat.conjugate();
+                let mut ds: Vec<f32> = self
+                    .probe_positions
+                    .iter()
+                    .map(|p| -(inv * (*p - view.camera.center)).z)
+                    .filter(|d| *d > 0.05)
+                    .collect();
+                if ds.is_empty() {
+                    self.extent * 0.1
+                } else {
+                    let mid = ds.len() / 2;
+                    *ds.select_nth_unstable_by(mid, f32::total_cmp).1
+                }
+            })
+            .collect();
+        // Eval targets live GPU-side for the duration; each view's slice is
+        // copied into the loss target in-encoder (no per-step uploads).
+        let view_bytes = (self.raster.width * self.raster.height) as u64 * 16;
+        let atlas = gs_wgpu::buffers::storage_empty(
+            &ctx.device,
+            "eval-atlas",
+            view_bytes * n_eval as u64,
+        );
+        for (i, view) in refined.iter().enumerate() {
             ctx.queue
-                .write_buffer(&self.loss.target, 0, bytemuck::cast_slice(&view.target));
-            for t in 1..=steps {
+                .write_buffer(&atlas, i as u64 * view_bytes, bytemuck::cast_slice(&view.target));
+        }
+        let mut ring: gs_wgpu::ReadbackRing<usize> =
+            gs_wgpu::ReadbackRing::new(&ctx.device, "eval-pose", 16 * 4, n_eval);
+        let lr = self.config.pose_refine_lr.max(1e-3);
+        // Round-robin: all views advance step t together, so every view's
+        // fwd+bwd overlaps the others' — one drain barrier per round instead
+        // of a blocking readback per (view, step). Each view's Adam sequence
+        // is exactly the sequential one (per-view state, updates applied only
+        // at the round barrier, before its next render).
+        for t in 1..=steps {
+            for (i, view) in refined.iter().enumerate() {
                 let mut encoder = ctx
                     .device
                     .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+                encoder.copy_buffer_to_buffer(
+                    &atlas,
+                    i as u64 * view_bytes,
+                    &self.loss.target,
+                    0,
+                    view_bytes,
+                );
                 self.raster
                     .forward(ctx, &mut encoder, &view.camera, self.num_surfels);
                 self.loss.encode(&mut encoder);
-                ctx.queue.submit([encoder.finish()]);
-                let mut encoder = ctx
-                    .device
-                    .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
                 self.raster.backward(&mut encoder, self.num_surfels);
+                let queued = ring.encode_copy(&mut encoder, &self.raster.grad_cam, 0, 16 * 4, i);
+                debug_assert!(queued, "eval ring sized to n_eval can never be full here");
                 ctx.queue.submit([encoder.finish()]);
-                let g = read_cam_grads(ctx, &self.raster.grad_cam);
-                let Some(grad) = camera_step_grad(&g, view.camera.quat) else {
-                    break;
+                ring.map_pending();
+            }
+            for (i, bytes) in ring.drain_blocking(&ctx.device) {
+                let g: &[f32] = bytemuck::cast_slice(&bytes);
+                let Some(grad) = camera_step_grad(g, refined[i].camera.quat) else {
+                    continue;
                 };
-                let step = adam6(
-                    &mut m,
-                    &mut v,
-                    t,
-                    &grad,
-                    self.config.pose_refine_lr.max(1e-3),
-                    self.config.pose_refine_lr.max(1e-3) * depth,
-                );
-                apply_camera_step(&mut view.camera, &step);
+                let step = adam6(&mut m[i], &mut v[i], t, &grad, lr, lr * depths[i]);
+                apply_camera_step(&mut refined[i].camera, &step);
             }
         }
         if self.config.appearance_start != u32::MAX {
@@ -1059,10 +1087,6 @@ pub struct ExportScene {
 
 // --- Pose-refinement helpers (host-side; grad_cam layout:
 // [dl/dR col-major 3x3 | dl/dcenter (3) | dl/dfocal | ...]) ---
-
-fn read_cam_grads(ctx: &GpuContext, buf: &wgpu::Buffer) -> Vec<f32> {
-    bytemuck::cast_slice(&gs_wgpu::buffers::readback(&ctx.device, &ctx.queue, buf)).to_vec()
-}
 
 /// [rot(3), center(3)] gradient. Rotation uses the right-perturbation
 /// R' = R·exp([δ]×): the Riemannian gradient is the antisymmetric part of
