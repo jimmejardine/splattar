@@ -127,7 +127,9 @@ struct PoseAligner {
 /// cold frozen-pose eval mostly reports accumulated gauge drift, which falls
 /// monotonically and would trip the detector for the wrong reason.
 struct Probe {
-    aligner: PoseAligner,
+    /// `None` only while detached for the duration of a probe — the aligner
+    /// and `&mut self` cannot be borrowed at once.
+    aligner: Option<PoseAligner>,
     /// Focal each probe view was built with, before the trainer's refinement.
     base_focal: Vec<f32>,
     best: f64,
@@ -1268,7 +1270,7 @@ impl Trainer {
             );
             Probe {
                 base_focal: subset.iter().map(|v| v.camera.focal).collect(),
-                aligner: self.new_aligner(ctx, &subset),
+                aligner: Some(self.new_aligner(ctx, &subset)),
                 best: f64::NEG_INFINITY,
                 stale: 0,
             }
@@ -1288,7 +1290,9 @@ impl Trainer {
                 && iter > 0
                 && iter.is_multiple_of(self.config.eval_every)
             {
-                let steps = if p.aligner.t == 0 {
+                // Detach so the aligner and `self` are not borrowed at once.
+                let mut a = p.aligner.take().expect("aligner is only None mid-probe");
+                let steps = if a.t == 0 {
                     PROBE_STEPS_COLD
                 } else {
                     PROBE_STEPS_WARM
@@ -1296,15 +1300,13 @@ impl Trainer {
                 // The shared focal is refined during training, so the probe's
                 // cameras have to track it or the measurement drifts down for
                 // a reason that has nothing to do with model quality.
-                for (view, base) in p.aligner.views.iter_mut().zip(&p.base_focal) {
+                for (view, base) in a.views.iter_mut().zip(&p.base_focal) {
                     view.camera.focal = base * self.focal_scale;
                 }
-                // Detach so the aligner and `self` are not borrowed at once.
-                let mut a = std::mem::replace(&mut p.aligner, self.new_aligner(ctx, &[]));
                 self.advance_aligner(ctx, &mut a, steps);
                 let psnr = self.score(ctx, &a.views);
                 let p = probe.as_mut().expect("probe present in this branch");
-                p.aligner = a;
+                p.aligner = Some(a);
                 if psnr > p.best + self.config.plateau_min_delta {
                     p.best = psnr;
                     p.stale = 0;

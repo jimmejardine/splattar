@@ -403,3 +403,86 @@ fn appearance_compensation_recovers_exposure_swings() {
     );
     assert!(with > 25.0, "compensated PSNR too low: {with:.2} dB");
 }
+
+/// Adaptive stopping must actually engage on the GPU path: probe the held-out
+/// set, plateau, anneal, and stop well short of the ceiling — without wrecking
+/// quality relative to a fixed-length run of the same nominal schedule.
+///
+/// This is a GPU test on purpose. The plateau logic's pure-math parts are unit
+/// tested in the crate, but the probe allocates buffers, runs fwd+bwd against
+/// a frozen model and drains a readback ring; a first cut of it shipped a
+/// zero-length ring that only a real run would have caught.
+#[test]
+fn adaptive_stop_engages_and_shortens_the_run() {
+    let Some(ctx) = context() else { return };
+
+    let gt = random_surfels(0xfeedbeef, N_GT, 1.2, true);
+    let gt_raster = Rasterizer::new(&ctx, N_GT as u32, SIZE, SIZE, (N_GT * 64) as u32);
+    gt_raster.upload_scene(
+        &ctx,
+        &SceneInput {
+            positions: &gt.positions,
+            scales: &gt.scales,
+            quats: &gt.quats,
+            opacities: &gt.opacities,
+            sh: &gt.sh,
+            sh_coeffs: 1,
+        },
+    );
+    let render_gt = |camera: &RasterCamera| -> Vec<[f32; 4]> {
+        let mut encoder = ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        gt_raster.forward(&ctx, &mut encoder, camera, N_GT as u32);
+        ctx.queue.submit([encoder.finish()]);
+        bytemuck::cast_slice(&gs_wgpu::buffers::readback(
+            &ctx.device,
+            &ctx.queue,
+            &gt_raster.out_color,
+        ))
+        .to_vec()
+    };
+
+    let mut train_views = Vec::new();
+    let mut eval_views = Vec::new();
+    for i in 0..35 {
+        let angle = i as f32 / 35.0 * std::f32::consts::TAU;
+        let camera = orbit_camera(angle, 1.0 + (i % 3) as f32 * 0.5, 4.0);
+        let view = TrainView {
+            target: render_gt(&camera),
+            camera,
+        };
+        if i % 7 == 3 {
+            eval_views.push(view);
+        } else {
+            train_views.push(view);
+        }
+    }
+
+    // A ceiling far past where this small scene converges, so the detector has
+    // to be what ends the run.
+    let ceiling = 20_000;
+    let config = TrainConfig {
+        iters: ceiling,
+        log_every: 2000,
+        eval_every: 250,
+        plateau_patience: 3,
+        plateau_min_delta: 0.05,
+        anneal_frac: 0.02,
+        ..Default::default()
+    };
+    let init = random_surfels(0x12345, N_TRAIN, 1.2, false);
+    let mut trainer = Trainer::new(&ctx, SIZE, SIZE, train_views, init, config);
+    let ran = trainer.train_probed(&ctx, &eval_views);
+    let psnr = trainer.eval_psnr(&ctx, &eval_views);
+    eprintln!("adaptive run: stopped at {ran}/{ceiling} iters, held-out {psnr:.2} dB");
+
+    assert!(ran < ceiling, "never stopped early: ran {ran}/{ceiling}");
+    assert!(ran >= 250, "stopped implausibly early: {ran}");
+    // Quality must survive the early stop — the anneal tail exists so the run
+    // still lands on a decayed LR rather than mid-schedule.
+    assert!(
+        psnr > 25.0,
+        "adaptive stop cost too much quality: {psnr:.2} dB after {ran} iters"
+    );
+}
