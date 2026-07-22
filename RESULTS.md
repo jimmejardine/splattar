@@ -803,3 +803,67 @@ dependency-chained dispatches (0.2-4 ms each) with barriers between them,
 and sampled kernel sums (~12-15 ms) vs the 22.7 ms iteration period put
 GPU-busy at ~60%. Closing that gap is kernel-graph work — merged passes,
 fewer barriers, larger dispatches — not submit plumbing.
+
+### Dense init from plane-sweep depth: +1.7 dB, half the iterations (2026-07-22)
+
+PLAN.md §Pipeline step 4, "designed, not yet built" until now. The init it
+replaces grows a sparse SfM cloud to the surfel budget by duplicating points
+with random jitter at low opacity, then spends thousands of iterations
+discovering geometry that is measurable up front.
+
+**A/B on 1.mp4 (900 frames), submap-0, identical `--iters 7000` and budget
+128,750 — the arms differ only in `--no-dense-init`:**
+
+| probe iter | dense | sparse | Δ |
+|---|---|---|---|
+| 500 | 18.53 | 18.48 | +0.05 |
+| 1500 | 21.47 | 20.30 | +1.17 |
+| 2500 | 22.73 | 21.16 | +1.57 |
+| 3500 | 23.45 | 22.60 | +0.85 |
+| 5000 | 23.82 | 22.52 | +1.30 |
+| 6500 | 24.40 | 23.16 | +1.24 |
+| **final** | **24.92** | **23.19** | **+1.73** |
+
+**Iterations-to-quality is the headline: dense init reaches 23.35 dB at
+iteration 3000; the sparse run needs 6000 to reach the same number. Half the
+iterations for equal quality, and +1.73 dB when both run to the ceiling.**
+
+Cost is negligible: **~730 ms for 103 views**, against a training run of
+minutes. Sweeping is essentially free relative to what it saves.
+
+Kernel: per reference view, neighbours ranked by usable PARALLAX (not frame
+proximity — a co-located rotation carries no depth information, the same trap
+that forced VO pair selection onto global-affine residual rather than raw
+flow); hypotheses uniform in inverse depth; patch NCC rather than zero-mean
+SSD, because phone auto-exposure moves gain AND offset and an SSD volume would
+largely measure exposure; winner-take-all with a subpixel parabola fit.
+Verified against ground truth (a textured plane at known depth) rather than a
+CPU port, which would reproduce a projection-convention error rather than catch
+it: 96% of interior pixels accepted, relative depth error median 0.25% / p90
+0.62%.
+
+**Two bugs worth recording, both design errors rather than typos:**
+
+1. Confidence was the margin over the GLOBAL runner-up. For any smooth cost
+   curve the runner-up is the hypothesis ADJACENT to the winner, scoring almost
+   identically — so a perfect match scored ~zero confidence and every pixel was
+   rejected. The margin must exclude a neighbourhood of the peak; that is what
+   distinguishes a unique match from a repetitive texture matching at several
+   depths.
+2. Normals were a finite-difference cross product needing two SPECIFIC accepted
+   neighbours, compounding per-pixel acceptance to ~p³ (measured 10% yield on
+   real footage). A least-squares plane fit over any 3 of the 3×3
+   neighbourhood, in inverse depth where a plane is exactly affine in pixel
+   coordinates, raised it to 17% (16,486 → 26,174 surfels).
+
+**Still under-delivering, and the number to watch:** at `downscale: 4` the
+sweep contributes only ~20% of the surfel budget; random jitter fills the rest.
+The remaining knob is nearly free (`downscale: 2` gives ~4× the candidates for
+~3 s instead of 0.7 s, enough to fill the budget from measured geometry), and
+was deliberately NOT turned before this A/B — tuning a parameter mid-experiment
+to improve the number is how you fool yourself. So +1.73 dB is what one fifth
+of the idea is worth.
+
+**Caveat:** on submap-1 (13 train views, a 2-view probe) sparse scored 31.79 vs
+dense 31.26. Sample far too small to read anything into, recorded rather than
+omitted.
