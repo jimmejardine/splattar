@@ -349,7 +349,7 @@ fn surfels_from_depth(
     map: &DepthMap,
     opts: &SweepOptions,
     out: &mut InitialSurfels,
-) {
+) -> (usize, usize) {
     let (fw, fh) = (full.0 as f32, full.1 as f32);
     let (cx, cy) = (fw * 0.5, fh * 0.5);
     let focal = view.camera.focal;
@@ -373,24 +373,57 @@ fn surfels_from_depth(
     };
 
     let stride = opts.spawn_stride.max(1) as usize;
+    let mut candidates = 0usize;
+    let mut spawned = 0usize;
     for gy in (1..map.height.saturating_sub(1)).step_by(stride) {
         for gx in (1..map.width.saturating_sub(1)).step_by(stride) {
+            candidates += 1;
             let Some(p) = cam_point(gx, gy) else { continue };
-            // Normal from the local depth surface. Both cross-product partners
-            // must be accepted pixels, or the "plane" is fitted across a
-            // depth discontinuity and the normal is meaningless.
-            let (Some(px1), Some(py1)) = (cam_point(gx + 1, gy), cam_point(gx, gy + 1)) else {
-                continue;
-            };
-            let du = px1 - p;
-            let dv = py1 - p;
-            // Reject if the neighbours are not on the same surface: a step far
-            // larger than the local pixel footprint is an occlusion edge.
             let foot = p.length() * sx / focal;
-            if du.length() > 8.0 * foot || dv.length() > 8.0 * foot {
+
+            // Normal from a least-squares plane over the accepted 3x3
+            // neighbourhood. Requiring two SPECIFIC neighbours (a finite-
+            // difference cross product) compounds the per-pixel acceptance
+            // rate to roughly p^3 and threw away most of a real interior
+            // sweep; needing any 3 of 9 both yields far more and fits a
+            // better normal.
+            //
+            // Fitted in INVERSE depth, which is exactly affine in pixel
+            // coordinates for a plane: 1/d = A(u-cx) + B(v-cy) + C, so the
+            // fit is linear and the normal falls out in closed form.
+            let mut ata = glam::Mat3::ZERO;
+            let mut atb = Vec3::ZERO;
+            let mut n_pts = 0u32;
+            for dy in -1i32..=1 {
+                for dx in -1i32..=1 {
+                    let (nx, ny) = (gx as i32 + dx, gy as i32 + dy);
+                    if nx < 0 || ny < 0 || nx as usize >= map.width || ny as usize >= map.height {
+                        continue;
+                    }
+                    let Some(q) = cam_point(nx as usize, ny as usize) else {
+                        continue;
+                    };
+                    // Same-surface gate: a step far larger than the local
+                    // pixel footprint is an occlusion edge, and fitting across
+                    // it produces a normal describing nothing.
+                    if (q.z - p.z).abs() > 8.0 * foot {
+                        continue;
+                    }
+                    let u = (nx as f32 + 0.5) * sx - cx;
+                    let v = (ny as f32 + 0.5) * sy - cy;
+                    let row = Vec3::new(u, v, 1.0);
+                    let inv_d = 1.0 / (-q.z).max(1e-6);
+                    ata += glam::Mat3::from_cols(row * row.x, row * row.y, row * row.z);
+                    atb += row * inv_d;
+                    n_pts += 1;
+                }
+            }
+            if n_pts < 3 || ata.determinant().abs() < 1e-18 {
                 continue;
             }
-            let n_cam = du.cross(dv);
+            let abc = ata.inverse() * atb;
+            // 1/d = A·u + B·v + C  =>  n ∝ (A·f, −B·f, −C).
+            let n_cam = Vec3::new(abc.x * focal, -abc.y * focal, -abc.z);
             if n_cam.length_squared() < 1e-20 {
                 continue;
             }
@@ -419,14 +452,15 @@ fn surfels_from_depth(
             out.scales.push([radius, radius]);
             out.quats.push(quat.to_array());
             out.opacities.push(0.6);
+            // DC only, matching `init_from_sfm_points` — the trainer unlocks
+            // higher SH bands progressively.
             out.sh.push((t[0] - 0.5) / SH_C0);
             out.sh.push((t[1] - 0.5) / SH_C0);
             out.sh.push((t[2] - 0.5) / SH_C0);
-            for _ in 3..out.sh_coeffs * 3 {
-                out.sh.push(0.0);
-            }
+            spawned += 1;
         }
     }
+    (candidates, spawned)
 }
 
 /// Dense init: plane-sweep every view and spawn surfels on what it found.
@@ -448,7 +482,7 @@ pub fn init_from_plane_sweep(
         quats: Vec::new(),
         opacities: Vec::new(),
         sh: Vec::new(),
-        sh_coeffs: 16,
+        sh_coeffs: 1,
     };
     if views.len() < 2 {
         return out;
@@ -456,22 +490,28 @@ pub fn init_from_plane_sweep(
     let scene_depth = median_depth(views, points);
     let sweep = PlaneSweep::new(ctx, width, height, views);
     let mut swept = 0usize;
+    let mut candidates = 0usize;
     for r in 0..views.len() {
         let nb = pick_neighbours(views, r, opts.neighbours as usize, scene_depth);
         if nb.is_empty() {
             continue;
         }
         let map = sweep.run(ctx, views, r, &nb, scene_depth, opts);
-        let before = out.positions.len();
-        surfels_from_depth(&views[r], (width, height), &map, opts, &mut out);
-        if out.positions.len() > before {
+        let (c, s) = surfels_from_depth(&views[r], (width, height), &map, opts, &mut out);
+        candidates += c;
+        if s > 0 {
             swept += 1;
         }
     }
+    // Yield is the number to watch: everything the sweep declines is filled in
+    // by random upsampling instead, so a low rate means dense init is barely
+    // contributing however good the depth it does produce is.
     log::info!(
-        "plane-sweep init: {} surfels from {swept}/{} views (median scene depth {scene_depth:.2})",
+        "plane-sweep init: {} surfels from {swept}/{} views, {:.0}% of {candidates} \
+         candidates accepted (median scene depth {scene_depth:.2})",
         out.positions.len(),
         views.len(),
+        100.0 * out.positions.len() as f64 / candidates.max(1) as f64,
     );
     out
 }

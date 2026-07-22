@@ -106,6 +106,11 @@ enum Command {
         /// full run; the LR decays on the position schedule either way).
         #[arg(long, default_value_t = 1.0)]
         pose_window: f32,
+        /// Skip plane-sweep dense init and seed only from the sparse SfM
+        /// cloud (the pre-M7 behaviour) — the A/B for measuring what dense
+        /// init is worth.
+        #[arg(long)]
+        no_dense_init: bool,
         /// Escape hatch: skip the intra-video segment merge and train one
         /// submap per raw VO segment (pre-merge behavior).
         #[arg(long)]
@@ -273,6 +278,7 @@ fn main() -> anyhow::Result<()> {
             max_views,
             view_spacing,
             pose_window,
+            no_dense_init,
             no_merge_segments,
         } => {
             // Default project dir lives next to the video, not in the cwd.
@@ -289,6 +295,7 @@ fn main() -> anyhow::Result<()> {
                 max_frames,
                 AddOpts {
                     iters,
+                    dense_init: !no_dense_init,
                     budget,
                     downscale,
                     max_views,
@@ -819,6 +826,21 @@ fn auto_budget(views: usize) -> u32 {
     (SURFELS_PER_VIEW.saturating_mul(views as u32)).clamp(BUDGET_RANGE.0, BUDGET_RANGE.1)
 }
 
+/// Append one `InitialSurfels` onto another. Both must carry the same SH
+/// degree — the trainer uploads a single padded block.
+fn merge_inits(into: &mut gs_train::InitialSurfels, from: gs_train::InitialSurfels) {
+    assert_eq!(
+        into.sh_coeffs, from.sh_coeffs,
+        "init SH degrees differ ({} vs {})",
+        into.sh_coeffs, from.sh_coeffs
+    );
+    into.positions.extend(from.positions);
+    into.scales.extend(from.scales);
+    into.quats.extend(from.quats);
+    into.opacities.extend(from.opacities);
+    into.sh.extend(from.sh);
+}
+
 /// Gradient visits per view behind the auto iteration ceiling. Only a CEILING
 /// and the LR schedule's length — the run stops when the held-out probe stops
 /// improving, so a generous value costs nothing except when the plateau never
@@ -1193,12 +1215,39 @@ fn train_and_bake(
     iters: u32,
     budget: u32,
     pose_window: f32,
+    dense_init: bool,
     out: &std::path::Path,
 ) -> anyhow::Result<TrainOutcome> {
     use gs_train::{TrainConfig, Trainer};
 
     let train_kfs = prepared.train_kfs.clone();
-    let mut init = gs_train::init_from_sfm_points(&prepared.points, 0x5eed);
+    // Dense init: surfels born on plane-swept surfaces with real normals,
+    // rather than a sparse cloud randomly jittered up to budget. The sweep
+    // only resolves textured, well-baselined regions and says so honestly, so
+    // the sparse SfM points still seed everything it declined and
+    // `upsample_to_budget` tops up the remainder.
+    let mut init = if dense_init {
+        let t = std::time::Instant::now();
+        let pts: Vec<glam::Vec3> = prepared
+            .points
+            .iter()
+            .map(|(p, _)| glam::Vec3::from_array(*p))
+            .collect();
+        let mut dense = gs_train::init_from_plane_sweep(
+            ctx,
+            prepared.tw,
+            prepared.th,
+            &prepared.train_views,
+            &pts,
+            &gs_train::SweepOptions::default(),
+        );
+        log::info!("plane-sweep init took {:.1?}", t.elapsed());
+        let sparse = gs_train::init_from_sfm_points(&prepared.points, 0x5eed);
+        merge_inits(&mut dense, sparse);
+        dense
+    } else {
+        gs_train::init_from_sfm_points(&prepared.points, 0x5eed)
+    };
     gs_train::upsample_to_budget(&mut init, budget as usize, 0xb00);
     let config = TrainConfig {
         iters,
@@ -1612,6 +1661,7 @@ fn load_seg_poses(
 /// same view count or model size.
 struct AddOpts {
     iters: u32,
+    dense_init: bool,
     budget: u32,
     downscale: u32,
     max_views: u32,
@@ -1899,6 +1949,7 @@ fn train_segment(
         iters,
         staged.budget,
         opts.pose_window,
+        opts.dense_init,
         &ply,
     )?;
     update_refined_focal(&staged.dir, out.focal_scale)?;
