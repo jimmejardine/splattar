@@ -960,6 +960,84 @@ fn segment_median_depth(seg: &gs_pose::VoResult) -> f64 {
     depths[depths.len() / 2]
 }
 
+/// Training targets for every keyframe any segment selected, decoded in ONE
+/// pass over the video.
+///
+/// Each segment used to open the file and decode until it had its own frames.
+/// Segments are contiguous keyframe ranges and the largest is trained first,
+/// so the clip was effectively read ~1.7x over (measured 50 s + 18 s + 7 s on
+/// the back-room clip) for data a single pass already had in hand.
+///
+/// Stored as u8 RGB rather than the f32 RGBA the trainer wants: 5x less
+/// resident memory (170 MB vs 900 MB for ~550 views at 239x425), and the
+/// source is 8-bit YUV, so the only loss is re-quantizing the box-downsample
+/// average. Conversion happens once per view when its `Prepared` is built.
+struct FrameStore {
+    frames: std::collections::HashMap<usize, Vec<u8>>,
+}
+
+impl FrameStore {
+    /// Decode `video` once, keeping only the requested frame indices.
+    fn decode(
+        video: &std::path::Path,
+        want: &std::collections::HashSet<usize>,
+        size: (usize, usize),
+        ds: usize,
+    ) -> anyhow::Result<Self> {
+        let (vw, vh) = size;
+        let (tw, th) = (vw / ds, vh / ds);
+        let t0 = std::time::Instant::now();
+        let mut frames = std::collections::HashMap::with_capacity(want.len());
+        let mut reader = gs_video::Mp4H264Reader::open(video).context("open video")?;
+        let mut idx = 0usize;
+        while let Some(frame) = reader.next_frame()? {
+            if want.contains(&idx) {
+                let full =
+                    gs_video::color::yuv420_to_rgba_f32(&frame.y, &frame.u, &frame.v, vw, vh);
+                let small = box_downsample(&full, vw, vh, ds);
+                let rgb: Vec<u8> = small
+                    .iter()
+                    .flat_map(|p| p[..3].iter().map(|v| (v * 255.0).clamp(0.0, 255.0) as u8))
+                    .collect();
+                frames.insert(idx, rgb);
+                if frames.len() == want.len() {
+                    break;
+                }
+            }
+            idx += 1;
+        }
+        anyhow::ensure!(
+            frames.len() == want.len(),
+            "decode pass missed {} of {} keyframes",
+            want.len() - frames.len(),
+            want.len()
+        );
+        log::info!(
+            "decode pass: {} target frames at {tw}x{th} in {:.1?} ({:.0} MB resident)",
+            frames.len(),
+            t0.elapsed(),
+            (frames.len() * tw * th * 3) as f64 / 1e6,
+        );
+        Ok(Self { frames })
+    }
+
+    fn rgba(&self, frame_idx: usize) -> Option<Vec<[f32; 4]>> {
+        let rgb = self.frames.get(&frame_idx)?;
+        Some(
+            rgb.chunks_exact(3)
+                .map(|c| {
+                    [
+                        c[0] as f32 / 255.0,
+                        c[1] as f32 / 255.0,
+                        c[2] as f32 / 255.0,
+                        1.0,
+                    ]
+                })
+                .collect(),
+        )
+    }
+}
+
 /// Everything the trainer needs from a video, plus the persistence payload.
 struct Prepared {
     train_views: Vec<gs_train::TrainView>,
@@ -978,23 +1056,18 @@ struct Prepared {
     th: u32,
 }
 
-/// View selection + second decode pass + landmark assembly, for one VO
-/// segment (poses and landmarks live in that segment's gauge).
-fn prepare_training(
-    video: &std::path::Path,
+/// Keyframes this segment will train on, in keyframe order.
+///
+/// Split out so the driver can plan ONE decode pass over the union of every
+/// segment's selection. Depends only on poses and sharpness, so it is cheap
+/// and deterministic — calling it to plan the decode and again to build the
+/// views yields the same answer.
+fn segment_view_selection(
     vo: &VoOutput,
     seg: &gs_pose::VoResult,
-    downscale: u32,
     max_views: u32,
     view_spacing: f32,
-) -> anyhow::Result<Prepared> {
-    use gs_kernels::RasterCamera;
-    use gs_train::TrainView;
-
-    let ds = downscale.max(1) as usize;
-    let (vw, vh) = (vo.video_size.0 as usize, vo.video_size.1 as usize);
-    let (tw, th) = (vw / ds, vh / ds);
-
+) -> anyhow::Result<Vec<usize>> {
     // View selection: sharpest keyframe per unit of VIEWPOINT change, not per
     // unit of time. Elapsed-time windows put supervision where the operator
     // lingered rather than where the scene is: a walkthrough that dwells in a
@@ -1039,35 +1112,39 @@ fn prepare_training(
     }
     anyhow::ensure!(chosen.len() >= 4, "too few usable views: {}", chosen.len());
     log::info!(
-        "selected {} training views at {view_spacing}° spacing (median scene depth \
-         {depth:.2}; downscale {ds} -> {tw}x{th})",
+        "selected {} training views at {view_spacing}° spacing (median scene depth {depth:.2})",
         chosen.len()
     );
 
-    // Second decode pass: collect RGBA for the chosen keyframes only.
-    let want: std::collections::HashMap<usize, usize> = chosen
-        .iter()
-        .enumerate()
-        .map(|(slot, &k)| (vo.keyframes[k].frame_idx, slot))
-        .collect();
-    let mut images: Vec<Option<Vec<[f32; 4]>>> = vec![None; chosen.len()];
-    {
-        let mut reader = gs_video::Mp4H264Reader::open(video)?;
-        let mut idx = 0usize;
-        let mut remaining = want.len();
-        while let Some(frame) = reader.next_frame()? {
-            if let Some(&slot) = want.get(&idx) {
-                let full =
-                    gs_video::color::yuv420_to_rgba_f32(&frame.y, &frame.u, &frame.v, vw, vh);
-                images[slot] = Some(box_downsample(&full, vw, vh, ds));
-                remaining -= 1;
-                if remaining == 0 {
-                    break;
-                }
-            }
-            idx += 1;
-        }
-        anyhow::ensure!(remaining == 0, "second decode pass missed {remaining} keyframes");
+    Ok(chosen)
+}
+
+/// Training views + landmark assembly for one VO
+/// segment (poses and landmarks live in that segment's gauge).
+fn prepare_training(
+    frames: &FrameStore,
+    vo: &VoOutput,
+    seg: &gs_pose::VoResult,
+    downscale: u32,
+    max_views: u32,
+    view_spacing: f32,
+) -> anyhow::Result<Prepared> {
+    use gs_kernels::RasterCamera;
+    use gs_train::TrainView;
+
+    let ds = downscale.max(1) as usize;
+    let (vw, vh) = (vo.video_size.0 as usize, vo.video_size.1 as usize);
+    let (tw, th) = (vw / ds, vh / ds);
+
+    let chosen = segment_view_selection(vo, seg, max_views, view_spacing)?;
+
+    // Targets come from the single shared decode pass — see `FrameStore`.
+    let mut images: Vec<Option<Vec<[f32; 4]>>> = Vec::with_capacity(chosen.len());
+    for &k in &chosen {
+        let fi = vo.keyframes[k].frame_idx;
+        images.push(Some(frames.rgba(fi).with_context(|| {
+            format!("frame {fi} missing from the decode pass")
+        })?));
     }
 
     // Landmark init points: robust distance filter, color sampled from the
@@ -1699,6 +1776,24 @@ fn run_add(
     // landed, its landmarks help the smaller ones register.
     let mut order: Vec<usize> = (0..vo.segments.len()).collect();
     order.sort_by_key(|&i| std::cmp::Reverse(solved_count(&vo.segments[i])));
+    // ONE decode pass over the union of every segment's selection. Selection
+    // needs only poses, so it can be planned before any pixels are read;
+    // previously each segment reopened the video and decoded until it had its
+    // own frames.
+    let want: std::collections::HashSet<usize> = order
+        .iter()
+        .filter_map(|&si| {
+            segment_view_selection(&vo, &vo.segments[si], opts.max_views, opts.view_spacing).ok()
+        })
+        .flatten()
+        .map(|k| vo.keyframes[k].frame_idx)
+        .collect();
+    let frames = FrameStore::decode(
+        video,
+        &want,
+        (vo.video_size.0 as usize, vo.video_size.1 as usize),
+        opts.downscale.max(1) as usize,
+    )?;
     // CPU/GPU pipeline: the CPU stages segment N+1 (second decode pass,
     // registration ladder, persistence) while the GPU trains segment N.
     // Staging only needs earlier segments' landmarks, which land on disk
@@ -1722,7 +1817,7 @@ fn run_add(
             Ok(())
         });
         for &si in &order {
-            match stage_segment(project_root, video, &vo, &vo.segments[si], &opts) {
+            match stage_segment(project_root, video, &frames, &vo, &vo.segments[si], &opts) {
                 Ok(staged) => {
                     if tx.send(staged).is_err() {
                         break; // consumer died; its join reports why
@@ -1816,6 +1911,7 @@ struct StagedSubmap<'a> {
 fn stage_segment<'a>(
     project_root: &std::path::Path,
     video: &std::path::Path,
+    frames: &FrameStore,
     vo: &VoOutput,
     seg: &'a gs_pose::VoResult,
     opts: &AddOpts,
@@ -1833,7 +1929,7 @@ fn stage_segment<'a>(
     log::info!("project DB: {} landmarks after dedup", db.len());
 
     let prepared = prepare_training(
-        video,
+        frames,
         vo,
         seg,
         opts.downscale,
