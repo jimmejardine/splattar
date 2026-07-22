@@ -970,3 +970,46 @@ append, Sim(3) correction of spawned geometry, and spawning. Remaining work is
 outside gs-train — the causal provisional-pose front-end in gs-pose, and the
 streaming driver in gs-cli where the redundant per-submap decode (~75 s) and
 the 15.4 min wall clock actually live.
+
+### End-to-end regression: adaptive stopping is under-tuned (2026-07-22)
+
+First full-clip run with dense init + view spacing + auto budget + adaptive
+stopping all enabled. Back-room clip (3.mp4, 4315 frames, 2 min 24 s of video).
+
+**17 min 31 s against the 15.4 min baseline — 13% SLOWER**, quality mixed:
+
+| submap | keyframes | baseline | now | Δ | iterations | train time |
+|---|---|---|---|---|---|---|
+| 0 | 1749 | 17.11 dB | 17.40 | +0.29 | 7,500 / 40,000 | 184 s |
+| 1 | 776 | 20.55 dB | 22.74 | **+2.19** | 19,160 / 21,600 | **609 s** |
+| 2 | 272 | 23.96 dB | **20.59** | **−3.37** | 4,505 / 10,050 | 24 s |
+
+**Two defects, both in work landed today.**
+
+1. `ITERS_PER_VIEW = 150` is too aggressive. submap-1 spent 19,160 iterations
+   (10 of the 17.5 minutes) buying 2.19 dB. That constant was calibrated from
+   ONE clip — 1.mp4's probe was still climbing at its 6,834 ceiling — and
+   generalising from a single data point is exactly what it looks like.
+2. The plateau detector stops too early on small submaps, AND the anneal can
+   end below the peak. submap-2 declared plateau at 3,500 iterations where the
+   old fixed 7,000-iteration run reached 23.96 dB; its own probe peaked at
+   21.24 pre-anneal and it finished at 20.59. **Nothing checks that the final
+   state beats the best state observed.** A stop-on-plateau mechanism that can
+   end worse than its own best is incomplete regardless of tuning.
+
+**Dense init's benefit is scene-dependent, which the earlier +2.44 dB did not
+show.** submap-0 gained only +0.29 dB and is pose-limited, not init-limited: a
+3.4 dB raw-vs-aligned gap (13.97 vs 17.40) and a plateau at iteration 3,500 out
+of a 40,000 ceiling — it stops improving long before running out of budget, so
+neither initialization nor iterations is the cap. Better-placed surfels cannot
+fix cameras that disagree with each other. The +2.44 dB on 1.mp4 stands, but it
+was measured on a well-conditioned 539-keyframe submap and does not generalise
+to the 1749-keyframe one.
+
+**Not yet attributed:** the anchor-out solve came in at 124.5 s against 198.5 s
+previously. That is not from any change recorded here.
+
+Fixes wanted before this configuration should be trusted: keep the best
+checkpoint rather than the annealed end state; scale plateau patience with
+probe size (submap-2's probe is ~10 views, where noise alone can fake a
+plateau); recalibrate the iteration ceiling against more than one clip.
