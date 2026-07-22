@@ -107,3 +107,56 @@ be fitted at the wrong scale and still look correct from the bootstrap view,
 which hides exactly the failure that matters. Wall colours are hash-based and
 locally distinct, asserted in a test — a repetitive pattern matches at many
 poses and would let a tracking test pass for the wrong reason.
+
+## M2 — Photometric tracking recovers a camera (2026-07-22)
+
+**The milestone the architecture rests on.** Everything after it assumes a frame
+can be located against the map by descending the photometric residual. It can.
+
+Ground truth, not a reimplementation: a known 3456-surfel room at 320×320, a
+known camera, a deliberately displaced start.
+
+| | start | recovered |
+|---|---|---|
+| position error | 0.1118 m | **0.0047 m** (24×) |
+| rotation error | 1.50° | **0.07°** (21×) |
+| residual | 0.01994 | **0.00065** (31×) |
+
+Two supporting properties, each its own test because each is a way the headline
+result could be true by accident:
+
+- **A correct pose is held.** Starting at the answer, drift is 0.00000 m /
+  0.000° and the descent stops after 11 iterations. A tracker that wandered off
+  a good pose would corrupt the map on every already-correct frame.
+- **The residual orders poses by correctness.** 0.00000 at the true pose,
+  0.01670 at 0.05 m, 0.07112 at 0.25 m. If it did not, there would be nothing to
+  descend and the recovery above could pass by luck.
+
+New: **`gs-track`** — the photometric loss kernel and the pose descent that
+consumes its camera gradient. The loss produces the residual and dL/d(render)
+in one pass on purpose: a diagnostic that disagreed with the quantity being
+optimized would lie about what the optimizer is doing. L1 rather than L2,
+because the outliers here are occlusions and specularities — real content the
+map does not explain — and L2 lets a handful of them dominate the update.
+
+**Three bugs found, all worth recording because none was a typo.**
+
+1. `target` is a reserved WGSL keyword (the same class of trap as `patch` in the
+   first attempt).
+2. **`final_residual()` described a pose the caller never receives.** The trace's
+   last entry is measured BEFORE the final step. Worse, returning the last Adam
+   iterate is arbitrary: Adam does not converge to a point, it orbits one at a
+   radius set by the learning rate, so the last iterate can be markedly worse
+   than one already visited. Measured: a clean descent to 0.00067 followed by a
+   final measurement of 0.043. The tracker now returns the BEST pose seen — the
+   same lesson the first attempt learned about adaptively-stopped training.
+3. **The early stop fired on a single non-improving step.** With Adam orbiting,
+   that is normal rather than a plateau: it quit at iteration 18 leaving 0.063 m
+   of error on the table, against 0.0047 m when allowed to run. Now requires
+   `patience` consecutive non-improving iterations.
+
+Cost: ~32 s for 60 iterations at 320×320 in a debug-profile test binary, i.e.
+~0.5 s per iteration under test settings. Not representative of release
+performance, but a reminder that tracking must be coarse-to-fine before it meets
+real video — full-resolution descent from a cold start is not affordable per
+frame.

@@ -11,6 +11,7 @@ members = [
     "crates/gs-video",
     "crates/gs-diag",
     "crates/gs-map",
+    "crates/gs-track",
     "crates/gs-cli",
 ]
 exclude = ["first_attempt"]
@@ -49,6 +50,7 @@ gs-wgpu = { path = "crates/gs-wgpu" }     # M1: device, buffers, sort — carrie
 gs-kernels = { path = "crates/gs-kernels" }   # M1: differentiable rasterizer — carried
 gs-cpu-ref = { path = "crates/gs-cpu-ref" }   # M1: gradient oracle — comes WITH the kernels
 gs-map = { path = "crates/gs-map" }       # M1: new — the surfel map
+gs-track = { path = "crates/gs-track" }   # M2: new — photometric tracking
 
 [profile.dev]
 opt-level = 1

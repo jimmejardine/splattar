@@ -850,6 +850,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "gs-track"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytemuck",
+ "glam",
+ "gs-core",
+ "gs-kernels",
+ "gs-map",
+ "gs-wgpu",
+ "log",
+ "pollster",
+ "wgpu",
+]
+
+[[package]]
 name = "gs-video"
 version = "0.1.0"
 dependencies = [

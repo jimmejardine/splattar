@@ -107,7 +107,7 @@ impl SurfelMap {
 /// edited, while this owns the rasterizer and its fixed-size buffers. Keeping
 /// them apart means the map can be constructed and tested with no GPU at all.
 pub struct GpuMap {
-    raster: Rasterizer,
+    pub raster: Rasterizer,
     width: u32,
     height: u32,
     live: u32,

@@ -1,0 +1,22 @@
+[package]
+name = "gs-track"
+description = "Photometric camera tracking: recover a pose by descending the difference between the rendered map and an incoming frame. The tracking half of the one shared loss."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+gs-core = { workspace = true }
+gs-wgpu = { workspace = true }
+gs-kernels = { workspace = true }
+gs-map = { workspace = true }
+glam = { workspace = true }
+bytemuck = { workspace = true }
+anyhow = { workspace = true }
+log = { workspace = true }
+wgpu = { workspace = true }
+
+[dev-dependencies]
+pollster = { workspace = true }
+glam = { workspace = true }

@@ -27,5 +27,5 @@ status-level = "all"
 gpu = { max-threads = 1 }
 
 [[profile.default.overrides]]
-filter = 'package(gs-kernels) or package(gs-map) or package(gs-wgpu)'
+filter = 'package(gs-kernels) or package(gs-map) or package(gs-wgpu) or package(gs-track)'
 test-group = 'gpu'
