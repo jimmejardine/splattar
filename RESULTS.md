@@ -766,3 +766,35 @@ at near-zero baseline and drove the median step to 0.0001.
 not ablated. 150 iters/view is now evidence-based but from one clip. The
 plateau detector makes a too-generous ceiling cheap, so the ceiling is the
 safest of the three to be wrong about.
+
+## `add` pipeline profiling + three speedups (2026-07-22)
+
+Profiled `add 3.mp4` end-to-end (serial baseline 910 s), then implemented the
+three biggest levers. Clean re-measure on a quiet machine: **629 s, −31%** —
+with the adaptive-stop feature (landed independently) changing total work, so
+the phase numbers below are the like-for-like evidence:
+
+| lever | baseline | after | note |
+|---|---|---|---|
+| pose-aligned final eval | ~157 s | seconds | was 100 GPU align-solves × every eval view, for a diagnostic; now an 8-view/40-step probe (logged "N-view probe") |
+| CPU/GPU pipeline | prep serialized | staging hidden | segments B+C fully staged while A still trained (log-order proof); staging reads only pre-training state, so semantics identical to serial; meta.txt writes are now atomic (tmp+rename) |
+| global-BA track thinning | 118.4 s | 66.2 s | ≤8 evenly-spread obs per track entering the GLOBAL polish (m obs → m² pose-pair fill after Schur); local windows untouched; vo_synthetic ATE/RPE gates unchanged |
+
+Also landed: checkpoint bakes (splat.ply every 2500 iters, tmp+rename — an
+interrupted add is now viewable) and align-before-strike for the plateau
+probe (a sagging probe is often the 8-step-warm aligner trailing the
+drifting gauge, not model decline; strikes now require a 32-step top-up to
+fail first).
+
+**Metric caveat:** shrinking the final eval to a probe makes small-submap
+scores fuzzier (5 views × 40 steps under-aligns vs the old 10 × 100 —
+segment C reads 20.05 dB where the old measurement said 23.77; part
+measurement, part its adaptive stop at 45% of ceiling). Cross-run PSNR
+comparisons on small submaps now carry ±1–2 dB of measurement noise.
+
+**Open finding for the async-trainer owner:** GPU utilization sits at
+50–60% because the GPU (~7 ms of kernels/iter) waits on host `bwd-submit`,
+which measures 11.6 → 28.9 ms/iter and GROWS monotonically within a run —
+a leak-shaped curve (pending-readback queue? timestamp bookkeeping?
+unbounded Vec?). Fixing the growth + amortizing submits is worth ~2–4× on
+iteration rate; it is the whole remaining gap to GPU saturation.
