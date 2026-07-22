@@ -5,11 +5,22 @@
 
 use gs_wgpu::GpuContext;
 
-/// Grayscale keyframe thumbnail (row 0 = top).
+/// A captured keyframe (row 0 = top). Colour marks a frame the trainer
+/// actually fit the model to; the grayscale ones are the VO snapshots that
+/// merely land near the pose being rendered — so the difference is visible at
+/// a glance while walking the path.
 pub struct ThumbImage {
     pub width: u32,
     pub height: u32,
-    pub gray: Vec<u8>,
+    /// 1 byte/px when grayscale, 4 (RGBA) when colour.
+    pub pixels: Vec<u8>,
+    pub color: bool,
+}
+
+impl ThumbImage {
+    fn bytes_per_pixel(&self) -> u32 {
+        if self.color { 4 } else { 1 }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -35,7 +46,7 @@ impl OverlayMode {
 const SHADER: &str = r#"
 struct Uni {
     rect: vec4<f32>,   // x0, y0, x1, y1 in clip space
-    params: vec4<f32>, // x = alpha
+    params: vec4<f32>, // x = alpha, y = 1 for colour (training frames)
 }
 @group(0) @binding(0) var<uniform> uni: Uni;
 @group(0) @binding(1) var tex: texture_2d<f32>;
@@ -64,8 +75,10 @@ fn vs(@builtin(vertex_index) vi: u32) -> VsOut {
 
 @fragment
 fn fs(in: VsOut) -> @location(0) vec4<f32> {
-    let g = textureSample(tex, samp, in.uv).r;
-    return vec4<f32>(g, g, g, uni.params.x);
+    let c = textureSample(tex, samp, in.uv);
+    // R8Unorm thumbs carry luma in .r only; RGBA ones are already colour.
+    let rgb = mix(vec3<f32>(c.r, c.r, c.r), c.rgb, uni.params.y);
+    return vec4<f32>(rgb, uni.params.x);
 }
 "#;
 
@@ -77,6 +90,8 @@ pub struct ThumbOverlay {
     bind: Option<wgpu::BindGroup>,
     tex_size: (u32, u32),
     aspect: f32,
+    /// Whether the uploaded image is RGBA (a training frame) or R8 luma.
+    color: bool,
     pub mode: OverlayMode,
     /// Whether the current image was captured at exactly the pose being
     /// rendered (set by the caller; controls blend strength).
@@ -171,6 +186,7 @@ impl ThumbOverlay {
             bind: None,
             tex_size: (0, 0),
             aspect: 1.0,
+            color: false,
             mode: OverlayMode::Pip,
             exact: false,
         }
@@ -179,6 +195,7 @@ impl ThumbOverlay {
     /// Upload the current thumbnail (bytes_per_row padded to wgpu's 256).
     pub fn set_image(&mut self, ctx: &GpuContext, img: &ThumbImage) {
         let device = &ctx.device;
+        let bpp = img.bytes_per_pixel();
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("thumb-overlay-tex"),
             size: wgpu::Extent3d {
@@ -189,15 +206,23 @@ impl ThumbOverlay {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::R8Unorm,
+            // Unorm, not Srgb: the render this blends over writes its colours
+            // to the surface untransformed, so the thumbnail's bytes must go
+            // through untransformed too.
+            format: if img.color {
+                wgpu::TextureFormat::Rgba8Unorm
+            } else {
+                wgpu::TextureFormat::R8Unorm
+            },
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
-        let padded = (img.width as usize).next_multiple_of(256);
+        let row = (img.width * bpp) as usize;
+        let padded = row.next_multiple_of(256);
         let mut rows = vec![0u8; padded * img.height as usize];
         for y in 0..img.height as usize {
-            let src = &img.gray[y * img.width as usize..(y + 1) * img.width as usize];
-            rows[y * padded..y * padded + img.width as usize].copy_from_slice(src);
+            rows[y * padded..y * padded + row]
+                .copy_from_slice(&img.pixels[y * row..(y + 1) * row]);
         }
         ctx.queue.write_texture(
             wgpu::TexelCopyTextureInfo {
@@ -239,6 +264,7 @@ impl ThumbOverlay {
         }));
         self.tex_size = (img.width, img.height);
         self.aspect = img.width as f32 / img.height.max(1) as f32;
+        self.color = img.color;
     }
 
     pub fn draw(
@@ -280,7 +306,7 @@ impl ThumbOverlay {
             to_clip_x(x1),
             to_clip_y(y1), // bottom
             alpha,
-            0.0,
+            f32::from(u8::from(self.color)),
             0.0,
             0.0,
         ];

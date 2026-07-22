@@ -519,6 +519,20 @@ impl Trainer {
         self.pose_depth[view_idx]
     }
 
+    /// Median scene depth across all views — the scale a camera displacement
+    /// has to be judged against (a shift of `d` at depth `D` moves the image
+    /// by about `d/D` radians). Only meaningful after training, when every
+    /// view's depth has been probed; unvisited views fall back to their probe
+    /// on demand.
+    pub fn median_view_depth(&mut self) -> f32 {
+        let mut d: Vec<f32> = (0..self.views.len()).map(|i| self.view_depth(i)).collect();
+        if d.is_empty() {
+            return 0.0;
+        }
+        let mid = d.len() / 2;
+        *d.select_nth_unstable_by(mid, f32::total_cmp).1
+    }
+
     fn next_view(&mut self) -> usize {
         let mut x = self.rng;
         x ^= x << 13;

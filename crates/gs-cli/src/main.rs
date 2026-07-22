@@ -640,12 +640,13 @@ fn write_thumbs(
     Ok(())
 }
 
-/// Persist a snapshot of every keyframe the trainer actually saw. Kept out of
-/// `thumbs/` so the pairwise registration stage's candidate set is unchanged;
-/// the viewer merges both directories for its ground-truth overlay.
+/// Persist a colour snapshot of every keyframe the trainer actually saw. Kept
+/// out of `thumbs/` so the pairwise registration stage's candidate set is
+/// unchanged; the viewer merges both directories for its ground-truth overlay
+/// and renders these in colour to mark them as the real training frames.
 fn write_view_thumbs(
     dir: &std::path::Path,
-    thumbs: &[(u32, image::GrayImage)],
+    thumbs: &[(u32, image::RgbImage)],
 ) -> anyhow::Result<()> {
     if thumbs.is_empty() {
         return Ok(());
@@ -669,14 +670,15 @@ fn load_thumb(dir: &std::path::Path, kf: u32) -> Option<gs_pose::GrayImage> {
     })
 }
 
-/// Every ground-truth snapshot available for a submap, keyframe → PNG path.
-/// `view-thumbs/` (one per trained view) wins over `thumbs/` (every 4th
-/// keyframe, the registration set) when both cover a keyframe.
-fn thumbnail_sources(dir: &std::path::Path) -> std::collections::BTreeMap<u32, PathBuf> {
+/// Every ground-truth snapshot available for a submap, keyframe → (PNG path,
+/// is it a training frame). `view-thumbs/` (one per selected view, colour)
+/// wins over `thumbs/` (every 4th keyframe, grayscale, the registration set)
+/// when both cover a keyframe.
+fn thumbnail_sources(dir: &std::path::Path) -> std::collections::BTreeMap<u32, (PathBuf, bool)> {
     let mut out = std::collections::BTreeMap::new();
-    for sub in ["thumbs", "view-thumbs"] {
+    for (sub, trained) in [("thumbs", false), ("view-thumbs", true)] {
         for kf in list_pngs(&dir.join(sub)) {
-            out.insert(kf, dir.join(sub).join(format!("{kf:05}.png")));
+            out.insert(kf, (dir.join(sub).join(format!("{kf:05}.png")), trained));
         }
     }
     out
@@ -784,9 +786,9 @@ struct Prepared {
     /// refines these views' poses in place, so this is what maps a refined
     /// camera back to the keyframe it came from.
     train_kfs: Vec<u32>,
-    /// Grayscale snapshot of every selected view's keyframe — the viewer's
+    /// Colour snapshot of every selected view's keyframe — the viewer's
     /// ground-truth overlay at exactly the poses the model is fit to.
-    view_thumbs: Vec<(u32, image::GrayImage)>,
+    view_thumbs: Vec<(u32, image::RgbImage)>,
     points: Vec<gs_io::SfmPoint>,
     /// Landmarks with descriptors for the project registration DB.
     landmarks: Vec<project::Landmark>,
@@ -982,24 +984,27 @@ fn prepare_training(
     })
 }
 
-/// Grayscale snapshot of a training target, sized to the same half-tracking
-/// resolution `gs_pose::vo::Thumb` uses (pyramid level 1) so the overlay
-/// treats VO thumbs and view thumbs identically. BT.709 luma, matching the
-/// decoder's YUV→RGB transfer, so these read like the VO snapshots.
+/// Snapshot of a training target, sized to the same half-tracking resolution
+/// `gs_pose::vo::Thumb` uses (pyramid level 1).
+///
+/// Kept in COLOUR, unlike the grayscale VO thumbs, so that walking the path
+/// shows at a glance which stops are frames the model was actually fit to and
+/// which are merely the nearest snapshot. It is the raw decoded frame — the
+/// per-view appearance affine is applied inside the trainer, so this stays
+/// ground truth.
 fn view_thumb(
     target: &[[f32; 4]],
     tw: usize,
     th: usize,
     track_size: (u32, u32),
-) -> image::GrayImage {
-    let gray: Vec<u8> = target
+) -> image::RgbImage {
+    let rgb: Vec<u8> = target
         .iter()
-        .map(|p| {
-            let y = 0.2126 * p[0] + 0.7152 * p[1] + 0.0722 * p[2];
-            (y * 255.0).clamp(0.0, 255.0) as u8
+        .flat_map(|p| {
+            [0, 1, 2].map(|c| (p[c] * 255.0).clamp(0.0, 255.0) as u8)
         })
         .collect();
-    let img = image::GrayImage::from_raw(tw as u32, th as u32, gray)
+    let img = image::RgbImage::from_raw(tw as u32, th as u32, rgb)
         .expect("target size matches tw*th");
     let (dw, dh) = ((track_size.0 / 2).max(1), (track_size.1 / 2).max(1));
     image::imageops::resize(&img, dw, dh, image::imageops::FilterType::Triangle)
@@ -1115,6 +1120,7 @@ fn train_and_bake(
         psnr,
         num_surfels: scene.num,
         focal_scale: trainer.focal_scale as f64,
+        scene_depth: trainer.median_view_depth() as f64,
         refined,
     })
 }
@@ -1131,6 +1137,9 @@ struct TrainOutcome {
     psnr: f64,
     num_surfels: usize,
     focal_scale: f64,
+    /// Median scene depth over the training views — the scale that turns a
+    /// camera displacement into an apparent image shift.
+    scene_depth: f64,
     refined: Vec<RefinedPose>,
 }
 
@@ -1278,10 +1287,11 @@ fn write_refined_poses(
     path: &std::path::Path,
     seg: &gs_pose::VoResult,
     anchors: &[RefinedPose],
+    scene_depth: f64,
 ) -> anyhow::Result<()> {
     let raw = seg_raw_poses(seg);
     let refined = refine_all_poses(&raw, anchors);
-    log_pose_drift(&raw, anchors);
+    log_pose_drift(&raw, anchors, scene_depth);
     let mut csv = String::from("kf,cx,cy,cz,qw,qx,qy,qz,trained\n");
     for (kf, c, q, trained) in &refined {
         csv.push_str(&format!(
@@ -1300,10 +1310,18 @@ fn write_refined_poses(
     Ok(())
 }
 
-/// How far training moved the cameras, in units of the median keyframe step —
-/// the quantity that decides whether the recorded path still frames what the
-/// model renders.
-fn log_pose_drift(raw: &[(u32, glam::DVec3, glam::DQuat)], anchors: &[RefinedPose]) {
+/// How far training moved the cameras, reported as the apparent image shift it
+/// causes — the quantity that decides whether the recorded path still frames
+/// what the model renders. A displacement `d` at scene depth `D` swings the
+/// view by about `d/D` radians, so that, plus the direct rotation change, is
+/// what the ground-truth overlay actually sees. Normalizing by keyframe
+/// spacing instead would be useless: flow-promoted keyframes during a pan sit
+/// at near-zero baseline, so the median step collapses toward zero.
+fn log_pose_drift(
+    raw: &[(u32, glam::DVec3, glam::DQuat)],
+    anchors: &[RefinedPose],
+    scene_depth: f64,
+) {
     let raw_of: std::collections::HashMap<u32, (glam::DVec3, glam::DQuat)> =
         raw.iter().map(|&(kf, c, q)| (kf, (c, q))).collect();
     let mut dpos: Vec<f64> = Vec::new();
@@ -1319,22 +1337,26 @@ fn log_pose_drift(raw: &[(u32, glam::DVec3, glam::DQuat)], anchors: &[RefinedPos
     if dpos.is_empty() {
         return;
     }
-    let mut steps: Vec<f64> = raw.windows(2).map(|w| (w[1].1 - w[0].1).length()).collect();
-    steps.sort_by(f64::total_cmp);
-    let step = steps.get(steps.len() / 2).copied().unwrap_or(0.0);
     let pct = |v: &mut Vec<f64>, p: f64| {
         v.sort_by(f64::total_cmp);
         v[((v.len() - 1) as f64 * p) as usize]
     };
     let (dp50, dp95) = (pct(&mut dpos, 0.5), pct(&mut dpos, 0.95));
     let (dr50, dr95) = (pct(&mut drot, 0.5), pct(&mut drot, 0.95));
+    let swing = |d: f64| {
+        if scene_depth > 0.0 {
+            (d / scene_depth).atan().to_degrees()
+        } else {
+            f64::NAN
+        }
+    };
     log::info!(
         "pose gauge drift over {} refined views: |Δpos| median {dp50:.4} / p95 {dp95:.4} \
-         ({:.1}× / {:.1}× the median keyframe step {step:.4}), Δrot median {dr50:.2}° / \
-         p95 {dr95:.2}°",
+         (≈{:.1}° / {:.1}° of view swing at the {scene_depth:.2} median scene depth), \
+         Δrot median {dr50:.2}° / p95 {dr95:.2}°",
         anchors.len(),
-        if step > 0.0 { dp50 / step } else { 0.0 },
-        if step > 0.0 { dp95 / step } else { 0.0 },
+        swing(dp50),
+        swing(dp95),
     );
 }
 
@@ -1566,7 +1588,12 @@ fn add_segment_submap(
     let out = train_and_bake(prepared, iters, budget, pose_window, &ply)?;
     let (psnr, num) = (out.psnr, out.num_surfels);
     update_refined_focal(&dir, out.focal_scale)?;
-    write_refined_poses(&dir.join("poses_refined.csv"), seg, &out.refined)?;
+    write_refined_poses(
+        &dir.join("poses_refined.csv"),
+        seg,
+        &out.refined,
+        out.scene_depth,
+    )?;
     println!(
         "submap-{idx}: {num} surfels, held-out PSNR {psnr:.2} dB — {}",
         match edge_to {
@@ -2799,11 +2826,21 @@ fn compose_project(
                         let idx = match thumb_idx.entry((i, t)) {
                             std::collections::hash_map::Entry::Occupied(e) => *e.get(),
                             std::collections::hash_map::Entry::Vacant(e) => {
-                                let img = image::open(&thumb_src[&t]).ok()?.to_luma8();
+                                let (path, trained) = &thumb_src[&t];
+                                let img = image::open(path).ok()?;
+                                // Colour marks a real training frame; the VO
+                                // snapshots stay grayscale (and a quarter the
+                                // memory) so the two are told apart on sight.
+                                let (w, h) = (img.width(), img.height());
                                 thumbs.push(gs_viewer::overlay::ThumbImage {
-                                    width: img.width(),
-                                    height: img.height(),
-                                    gray: img.into_raw(),
+                                    width: w,
+                                    height: h,
+                                    pixels: if *trained {
+                                        img.to_rgba8().into_raw()
+                                    } else {
+                                        img.to_luma8().into_raw()
+                                    },
+                                    color: *trained,
                                 });
                                 *e.insert(thumbs.len() - 1)
                             }
