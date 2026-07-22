@@ -792,9 +792,14 @@ segment C reads 20.05 dB where the old measurement said 23.77; part
 measurement, part its adaptive stop at 45% of ceiling). Cross-run PSNR
 comparisons on small submaps now carry ±1–2 dB of measurement noise.
 
-**Open finding for the async-trainer owner:** GPU utilization sits at
-50–60% because the GPU (~7 ms of kernels/iter) waits on host `bwd-submit`,
-which measures 11.6 → 28.9 ms/iter and GROWS monotonically within a run —
-a leak-shaped curve (pending-readback queue? timestamp bookkeeping?
-unbounded Vec?). Fixing the growth + amortizing submits is worth ~2–4× on
-iteration rate; it is the whole remaining gap to GPU saturation.
+**GPU-utilization finding (corrected after a clean re-measure):** the
+earlier "leak-shaped bwd-submit growth" was contention from a concurrent
+user-launched add — in the uncontended run bwd-submit is FLAT per segment
+(A ~10-15 ms, B 12→15.6 ms tracking splat spread, C ~4.3 ms). bwd-submit
+mostly measures the FramePacer waiting for the GPU, i.e. the host is
+already ahead; there is no host-side leak and no cheap host-side win.
+The real 50-60% utilization cause: each iteration is ~15 small
+dependency-chained dispatches (0.2-4 ms each) with barriers between them,
+and sampled kernel sums (~12-15 ms) vs the 22.7 ms iteration period put
+GPU-busy at ~60%. Closing that gap is kernel-graph work — merged passes,
+fewer barriers, larger dispatches — not submit plumbing.
