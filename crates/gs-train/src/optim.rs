@@ -140,6 +140,30 @@ impl Optimizer {
         });
     }
 
+    /// Copy every class's RAW parameters into `dst` (one buffer per class, in
+    /// `classes` order), or restore them from it. Used by the trainer to keep
+    /// the best-scoring state of an adaptively-stopped run — a plateau
+    /// detector that can only report the final state is free to end below its
+    /// own peak.
+    pub fn snapshot_layout(&self) -> Vec<(&'static str, u64)> {
+        self.classes
+            .iter()
+            .map(|c| (c.name, c.n as u64 * 4))
+            .collect()
+    }
+
+    pub fn encode_snapshot(&self, encoder: &mut wgpu::CommandEncoder, dst: &[wgpu::Buffer]) {
+        for (c, d) in self.classes.iter().zip(dst) {
+            encoder.copy_buffer_to_buffer(&c.raw, 0, d, 0, c.n as u64 * 4);
+        }
+    }
+
+    pub fn encode_restore(&self, encoder: &mut wgpu::CommandEncoder, src: &[wgpu::Buffer]) {
+        for (c, s) in self.classes.iter().zip(src) {
+            encoder.copy_buffer_to_buffer(s, 0, &c.raw, 0, c.n as u64 * 4);
+        }
+    }
+
     pub fn class(&self, name: &str) -> &ParamClass {
         self.classes.iter().find(|c| c.name == name).unwrap()
     }

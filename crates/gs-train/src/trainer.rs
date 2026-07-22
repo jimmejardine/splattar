@@ -375,6 +375,13 @@ impl TransformKernel {
 /// monotonically and would trip the detector for the wrong reason.
 struct Probe {
     aligner: PoseAligner,
+    /// Snapshot of the raw parameters at `best`. A stop-on-plateau run has no
+    /// guarantee its FINAL state is its best one — the anneal tail can lose
+    /// ground, and on a small probe the detector can fire on noise — so the
+    /// peak is kept and restored if the end is worse.
+    snapshot: Vec<wgpu::Buffer>,
+    /// True once `snapshot` holds something.
+    has_snapshot: bool,
     /// Focal each probe view was built with, before the trainer's refinement.
     base_focal: Vec<f32>,
     best: f64,
@@ -528,6 +535,10 @@ pub struct Trainer {
     /// extent (a long walkthrough's extent is ~30× the room depth).
     probe_positions: Vec<Vec3>,
     pose_depth: Vec<f32>,
+    /// Best held-out score the adaptive-stop probe saw, if it ran. The final
+    /// model is guaranteed to be at least this good — the peak is restored
+    /// when the run ends below it.
+    pub best_probe: Option<f64>,
     /// Sim(3) correction of a surfel range (two-tier pose updates).
     transform: TransformKernel,
     /// Writes new surfels into dead slots (incremental mapping).
@@ -861,6 +872,7 @@ impl Trainer {
             pose_t: vec![0; n_views],
             focal_state: (0.0, 0.0, 0),
             anneal: None,
+            best_probe: None,
             transform,
             spawn,
             focal_scale: 1.0,
@@ -1425,6 +1437,10 @@ impl Trainer {
     /// Fresh test-time pose-alignment state for a set of held-out views.
     fn new_aligner(&self, ctx: &GpuContext, views: &[TrainView]) -> PoseAligner {
         let n = views.len();
+        // Guarded here rather than deep in buffer allocation: a zero-length
+        // aligner builds a zero-depth ReadbackRing, and the assertion that
+        // fires there names a buffer, not the mistake.
+        assert!(n > 0, "a pose aligner needs at least one view");
         let depths: Vec<f32> = views
             .iter()
             .map(|view| {
@@ -1722,9 +1738,23 @@ impl Trainer {
                 self.config.plateau_min_delta,
                 self.config.iters,
             );
+            let snapshot = self
+                .optim
+                .snapshot_layout()
+                .into_iter()
+                .map(|(name, bytes)| {
+                    gs_wgpu::buffers::storage_empty(
+                        &ctx.device,
+                        &format!("probe-best-{name}"),
+                        bytes,
+                    )
+                })
+                .collect();
             Probe {
                 base_focal: subset.iter().map(|v| v.camera.focal).collect(),
                 aligner: self.new_aligner(ctx, &subset),
+                snapshot,
+                has_snapshot: false,
                 best: f64::NEG_INFINITY,
                 stale: 0,
             }
@@ -1765,10 +1795,25 @@ impl Trainer {
                     self.advance_aligner(ctx, &mut p.aligner, PROBE_STEPS_RETRY);
                     psnr = psnr.max(self.score(ctx, &p.aligner.views));
                 }
+                // Snapshot on ANY improvement, but only a `min_delta` gain
+                // resets patience: the two thresholds answer different
+                // questions (is this the best state we have seen? vs is the
+                // run still making progress worth paying for?).
+                if psnr > p.best {
+                    let mut enc = ctx
+                        .device
+                        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                            label: Some("probe-snapshot"),
+                        });
+                    self.optim.encode_snapshot(&mut enc, &p.snapshot);
+                    ctx.queue.submit([enc.finish()]);
+                    p.has_snapshot = true;
+                }
                 if psnr > p.best + self.config.plateau_min_delta {
                     p.best = psnr;
                     p.stale = 0;
                 } else {
+                    p.best = p.best.max(psnr);
                     p.stale += 1;
                 }
                 let (best, stale) = (p.best, p.stale);
@@ -1820,6 +1865,39 @@ impl Trainer {
             }
         }
         self.flush_async(ctx);
+        self.best_probe = probe.as_ref().map(|p| p.best).filter(|b| b.is_finite());
+
+        // Restore the peak if the run ended below it. The anneal tail and the
+        // last few probes are not guaranteed to improve, and on the back-room
+        // clip a submap finished 0.65 dB below its own best probe — a
+        // stop-on-plateau mechanism that can only hand back its final state is
+        // free to hand back a worse model than it already had (RESULTS.md
+        // 2026-07-22).
+        // Take the Probe OUT of its Option rather than borrowing it: the
+        // aligner and `&mut self` cannot be borrowed at once, and reaching for
+        // a throwaway `new_aligner(ctx, &[])` to break that is what built a
+        // zero-length readback ring and crashed every run once already.
+        if let Some(mut p) = probe.take()
+            && p.has_snapshot
+        {
+            self.advance_aligner(ctx, &mut p.aligner, PROBE_STEPS_WARM);
+            let final_psnr = self.score(ctx, &p.aligner.views);
+            if final_psnr < p.best - self.config.plateau_min_delta {
+                let mut enc = ctx
+                    .device
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("probe-restore"),
+                    });
+                self.optim.encode_restore(&mut enc, &p.snapshot);
+                // Raw parameters are not what the rasterizer reads.
+                self.optim.encode_activate(ctx, &mut enc);
+                ctx.queue.submit([enc.finish()]);
+                log::info!(
+                    "adaptive stop: final {final_psnr:.2} dB below the {:.2} dB peak                      — restored the best state",
+                    p.best
+                );
+            }
+        }
         ran
     }
 

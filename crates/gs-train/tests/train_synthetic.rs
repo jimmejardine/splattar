@@ -475,9 +475,19 @@ fn adaptive_stop_engages_and_shortens_the_run() {
     let mut trainer = Trainer::new(&ctx, SIZE, SIZE, train_views, init, config);
     let ran = trainer.train(&ctx, &eval_views);
     let psnr = trainer.eval_psnr(&ctx, &eval_views);
-    eprintln!("adaptive run: stopped at {ran}/{ceiling} iters, held-out {psnr:.2} dB");
+    let best_seen = trainer.best_probe.expect("the probe ran");
+    eprintln!(
+        "adaptive run: stopped at {ran}/{ceiling} iters, held-out {psnr:.2} dB          (probe peak {best_seen:.2})"
+    );
 
     assert!(ran < ceiling, "never stopped early: ran {ran}/{ceiling}");
+    // A stop-on-plateau run must never hand back a model worse than the best
+    // it observed. Measured on real footage before the best-state snapshot
+    // existed: a submap finished 0.65 dB below its own peak probe.
+    assert!(
+        psnr >= best_seen - 0.3,
+        "ended {psnr:.2} dB against a {best_seen:.2} dB peak — best state not restored"
+    );
     assert!(ran >= 250, "stopped implausibly early: {ran}");
     // Quality must survive the early stop — the anneal tail exists so the run
     // still lands on a decayed LR rather than mid-schedule.
