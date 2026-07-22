@@ -47,6 +47,17 @@ impl FlyCamera {
         Quat::from_rotation_y(self.yaw) * Quat::from_rotation_x(self.pitch)
     }
 
+    /// Snap to a recorded camera pose given in SCENE space (renderer
+    /// convention: looks −z). The fly camera lives in upright space, so the
+    /// pose is mapped through `scene_rot` first; roll is dropped (yaw/pitch
+    /// camera), which is what you want when replaying handheld footage.
+    pub fn snap_to(&mut self, position: Vec3, rotation: Quat, scene_rot: Quat) {
+        self.position = scene_rot * position;
+        let f = (scene_rot * rotation) * Vec3::NEG_Z;
+        self.yaw = (-f.x).atan2(-f.z);
+        self.pitch = f.y.clamp(-1.0, 1.0).asin();
+    }
+
     pub fn update(&mut self, dt: f32, input: &InputState) {
         self.yaw -= input.mouse_dx * self.mouse_sensitivity;
         self.pitch = (self.pitch - input.mouse_dy * self.mouse_sensitivity)
@@ -109,6 +120,25 @@ mod tests {
         };
         cam.update(1.0, &input);
         assert!(cam.position.z < -1.0, "moved down -z: {:?}", cam.position);
+    }
+
+    #[test]
+    fn snap_to_reproduces_pose() {
+        // A scene-space pose (renderer convention) must round-trip through
+        // snap_to → to_camera up to the dropped roll.
+        let mut cam = FlyCamera::default();
+        let scene_rot = Quat::from_rotation_z(std::f32::consts::PI); // default flip
+        let pos = Vec3::new(1.0, 2.0, -3.0);
+        let rot = Quat::from_euler(glam::EulerRot::YXZ, 0.7, -0.3, 0.0);
+        cam.snap_to(pos, rot, scene_rot);
+        let out = cam.to_camera(scene_rot);
+        assert!((out.position - pos).length() < 1e-5, "{:?}", out.position);
+        let fwd_in = rot * Vec3::NEG_Z;
+        let fwd_out = out.rotation * Vec3::NEG_Z;
+        assert!(
+            fwd_in.dot(fwd_out) > 0.9999,
+            "forward mismatch: {fwd_in:?} vs {fwd_out:?}"
+        );
     }
 
     #[test]

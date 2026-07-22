@@ -186,6 +186,7 @@ fn main() -> anyhow::Result<()> {
             no_flip,
             render_golden,
         } => {
+            let mut spawn_cameras = Vec::new();
             let cloud = if file.is_dir() {
                 // Project directory: compose submaps (registered ones in the
                 // shared world, islands offset side by side). A directory
@@ -198,7 +199,9 @@ fn main() -> anyhow::Result<()> {
                 } else {
                     file.clone()
                 };
-                compose_project(&root)?.0
+                let (cloud, _, cams) = compose_project(&root)?;
+                spawn_cameras = cams;
+                cloud
             } else {
                 let contents = gs_io::load_ply(&file)
                     .with_context(|| format!("loading {}", file.display()))?;
@@ -227,6 +230,7 @@ fn main() -> anyhow::Result<()> {
                     "splattar — {}",
                     file.file_name().unwrap_or_default().to_string_lossy()
                 ),
+                spawn_cameras,
             };
             gs_viewer::windowed::run(cloud, options).map_err(|e| anyhow::anyhow!(e))
         }
@@ -2194,7 +2198,7 @@ fn run_register(
 
 /// Bake the composed project into one compat .ply + a manifest sidecar.
 fn run_export(project_root: &std::path::Path, out: Option<PathBuf>) -> anyhow::Result<()> {
-    let (cloud, placements) = compose_project(project_root)?;
+    let (cloud, placements, _) = compose_project(project_root)?;
     let n = cloud.positions.len();
     let coeffs = if n > 0 { cloud.sh.len() / (n * 3) } else { 0 };
 
@@ -2267,7 +2271,14 @@ struct SubmapPlacement {
 /// never stored — per the two-tier data-model rule).
 fn compose_project(
     root: &std::path::Path,
-) -> anyhow::Result<(gs_core::SplatCloud, Vec<SubmapPlacement>)> {
+) -> anyhow::Result<(
+    gs_core::SplatCloud,
+    Vec<SubmapPlacement>,
+    // Keyframe cameras composed into the same presentation frame as the
+    // surfels (scene space, renderer convention) — the viewer's walkable
+    // camera path. Ordered largest submap first, kf-ascending within each.
+    Vec<(glam::Vec3, glam::Quat)>,
+)> {
     use glam::{Quat, Vec3};
 
     let proj = project::Project::load(root)?;
@@ -2341,6 +2352,11 @@ fn compose_project(
     // Pass 2: apply offsets, merge in submap order, record placements.
     let mut merged: Option<gs_core::SplatCloud> = None;
     let mut placements: Vec<SubmapPlacement> = Vec::new();
+    // Per-submap keyframe cameras, composed through the same placement +
+    // offset as the surfels. poses.csv rows are CV world→camera; convert to
+    // the renderer convention exactly like KeyframePose::c2w (camera basis
+    // y/z flip = 180° about x). Missing/old submaps just contribute none.
+    let mut submap_cams: Vec<Vec<(Vec3, Quat)>> = Vec::new();
     for (i, mut cloud) in clouds.into_iter().enumerate() {
         let comp = resolved[i].component;
         let dx = comp_offset[&comp];
@@ -2365,6 +2381,42 @@ fn compose_project(
             bbox,
         });
 
+        let mut cams: Vec<(Vec3, Quat)> = Vec::new();
+        if let Ok(poses) =
+            load_seg_poses(&project::Project::submap_dir(root, i).join("poses.csv"))
+        {
+            let w = &resolved[i].world;
+            let (ps, prot, pt) = (
+                w.scale as f32,
+                Quat::from_xyzw(
+                    w.rot.x as f32,
+                    w.rot.y as f32,
+                    w.rot.z as f32,
+                    w.rot.w as f32,
+                ),
+                Vec3::new(w.trans.x as f32, w.trans.y as f32, w.trans.z as f32),
+            );
+            let flip = glam::DQuat::from_rotation_x(std::f64::consts::PI);
+            let mut rows: Vec<_> = poses.into_iter().collect();
+            rows.sort_unstable_by_key(|(kf, _)| *kf);
+            for (_, (r_wc, t_wc)) in rows {
+                let center = -(r_wc.conjugate() * t_wc);
+                let q_render = r_wc.conjugate() * flip;
+                let pos = Vec3::new(center.x as f32, center.y as f32, center.z as f32);
+                let rot = Quat::from_xyzw(
+                    q_render.x as f32,
+                    q_render.y as f32,
+                    q_render.z as f32,
+                    q_render.w as f32,
+                )
+                .normalize();
+                let mut p = ps * (prot * pos) + pt;
+                p.x += dx;
+                cams.push((p, (prot * rot).normalize()));
+            }
+        }
+        submap_cams.push(cams);
+
         merged = Some(match merged {
             None => cloud,
             Some(mut m) => {
@@ -2381,7 +2433,11 @@ fn compose_project(
             }
         });
     }
-    Ok((merged.context("empty project")?, placements))
+    // Largest submap's path first: [ starts the walk where the most footage
+    // is, and empty lists vanish.
+    submap_cams.sort_by_key(|c| std::cmp::Reverse(c.len()));
+    let spawn: Vec<(Vec3, Quat)> = submap_cams.into_iter().flatten().collect();
+    Ok((merged.context("empty project")?, placements, spawn))
 }
 
 /// Integer box downsample for RGBA f32 images.

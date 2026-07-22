@@ -28,6 +28,11 @@ pub struct ViewOptions {
     /// down in a y-up viewer). On by default.
     pub flip_scene: bool,
     pub title: String,
+    /// Recorded camera path in SCENE space (renderer convention), e.g. the
+    /// training keyframe poses of a project. When non-empty the viewer spawns
+    /// at the first pose instead of framing the bbox (which floaters skew),
+    /// and `[` / `]` snap along the path — walk exactly what the video saw.
+    pub spawn_cameras: Vec<(glam::Vec3, Quat)>,
 }
 
 impl Default for ViewOptions {
@@ -41,6 +46,7 @@ impl Default for ViewOptions {
             splat_scale: 1.0,
             flip_scene: true,
             title: "splattar".to_string(),
+            spawn_cameras: Vec::new(),
         }
     }
 }
@@ -53,6 +59,7 @@ pub fn run(cloud: SplatCloud, options: ViewOptions) -> Result<(), String> {
         state: None,
         input: InputState::default(),
         locked: false,
+        spawn_idx: 0,
     };
     event_loop.run_app(&mut app).map_err(|e| e.to_string())
 }
@@ -78,6 +85,8 @@ struct App {
     state: Option<GfxState>,
     input: InputState,
     locked: bool,
+    /// Current index into `options.spawn_cameras` for `[` / `]` stepping.
+    spawn_idx: usize,
 }
 
 impl App {
@@ -150,7 +159,18 @@ impl App {
         let (lo, hi) = scene.bbox;
         let corners = [scene_rot * lo, scene_rot * hi];
         let bbox = (corners[0].min(corners[1]), corners[0].max(corners[1]));
-        let camera = FlyCamera::framing(bbox);
+        let mut camera = FlyCamera::framing(bbox);
+        // A recorded camera path beats bbox framing: floaters skew the bbox
+        // far off the content, while the path starts exactly where the video
+        // did. Movement speed drops to a walkable fraction of the scene.
+        if let Some(&(pos, rot)) = self.options.spawn_cameras.first() {
+            camera.snap_to(pos, rot, scene_rot);
+            camera.speed = (0.05 * (bbox.1 - bbox.0).length()).clamp(0.05, 10.0);
+            log::info!(
+                "spawned on the recorded camera path ({} poses; [ / ] to step along it)",
+                self.options.spawn_cameras.len()
+            );
+        }
 
         self.state = Some(GfxState {
             window,
@@ -277,6 +297,21 @@ impl App {
                         KeyCode::Digit2 => 2,
                         _ => 3,
                     };
+                }
+            }
+            // Step along the recorded camera path (replay the walkthrough).
+            KeyCode::BracketLeft | KeyCode::BracketRight
+                if pressed && !self.options.spawn_cameras.is_empty() =>
+            {
+                let n = self.options.spawn_cameras.len();
+                self.spawn_idx = match code {
+                    KeyCode::BracketRight => (self.spawn_idx + 1) % n,
+                    _ => (self.spawn_idx + n - 1) % n,
+                };
+                if let Some(state) = &mut self.state {
+                    let (pos, rot) = self.options.spawn_cameras[self.spawn_idx];
+                    state.camera.snap_to(pos, rot, state.scene_rot);
+                    log::info!("camera path pose {}/{n}", self.spawn_idx + 1);
                 }
             }
             _ => {}
