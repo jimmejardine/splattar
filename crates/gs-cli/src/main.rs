@@ -2307,11 +2307,12 @@ struct ComposedProject {
     cloud: gs_core::SplatCloud,
     placements: Vec<SubmapPlacement>,
     cameras: Vec<(glam::Vec3, glam::Quat, f32)>,
-    camera_thumbs: Vec<Option<usize>>,
+    camera_thumbs: Vec<Option<(usize, bool)>>,
     thumbs: Vec<gs_viewer::overlay::ThumbImage>,
 }
 
-type SubmapCam = ((glam::Vec3, glam::Quat, f32), Option<usize>);
+// ((pos, rot, fov), Some((thumb index, thumb kf == pose kf))).
+type SubmapCam = ((glam::Vec3, glam::Quat, f32), Option<(usize, bool)>);
 
 fn compose_project(
     root: &std::path::Path,
@@ -2463,21 +2464,27 @@ fn compose_project(
                     .iter()
                     .min_by_key(|&&t| t.abs_diff(kf32))
                     .filter(|&&t| t.abs_diff(kf32) <= 3)
-                    .and_then(|&t| match thumb_idx.entry((i, t)) {
-                        std::collections::hash_map::Entry::Occupied(e) => Some(*e.get()),
-                        std::collections::hash_map::Entry::Vacant(e) => {
-                            let img = image::open(
-                                submap_dir.join("thumbs").join(format!("{t:05}.png")),
-                            )
-                            .ok()?
-                            .to_luma8();
-                            thumbs.push(gs_viewer::overlay::ThumbImage {
-                                width: img.width(),
-                                height: img.height(),
-                                gray: img.into_raw(),
-                            });
-                            Some(*e.insert(thumbs.len() - 1))
-                        }
+                    .and_then(|&t| {
+                        let idx = match thumb_idx.entry((i, t)) {
+                            std::collections::hash_map::Entry::Occupied(e) => *e.get(),
+                            std::collections::hash_map::Entry::Vacant(e) => {
+                                let img = image::open(
+                                    submap_dir.join("thumbs").join(format!("{t:05}.png")),
+                                )
+                                .ok()?
+                                .to_luma8();
+                                thumbs.push(gs_viewer::overlay::ThumbImage {
+                                    width: img.width(),
+                                    height: img.height(),
+                                    gray: img.into_raw(),
+                                });
+                                *e.insert(thumbs.len() - 1)
+                            }
+                        };
+                        // Exact only when this pose IS the captured frame —
+                        // neighbours (thumbs land every 4th kf) are only
+                        // approximately aligned.
+                        Some((idx, t == kf32))
                     });
                 cams.push(((p, (prot * rot).normalize(), fov_y), ti));
             }
@@ -2504,7 +2511,7 @@ fn compose_project(
     // is, and empty lists vanish.
     submap_cams.sort_by_key(|c| std::cmp::Reverse(c.len()));
     let mut spawn: Vec<(Vec3, Quat, f32)> = Vec::new();
-    let mut spawn_thumbs: Vec<Option<usize>> = Vec::new();
+    let mut spawn_thumbs: Vec<Option<(usize, bool)>> = Vec::new();
     for (cam, ti) in submap_cams.into_iter().flatten() {
         spawn.push(cam);
         spawn_thumbs.push(ti);

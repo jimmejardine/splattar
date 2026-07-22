@@ -78,6 +78,9 @@ pub struct ThumbOverlay {
     tex_size: (u32, u32),
     aspect: f32,
     pub mode: OverlayMode,
+    /// Whether the current image was captured at exactly the pose being
+    /// rendered (set by the caller; controls blend strength).
+    pub exact: bool,
 }
 
 impl ThumbOverlay {
@@ -169,6 +172,7 @@ impl ThumbOverlay {
             tex_size: (0, 0),
             aspect: 1.0,
             mode: OverlayMode::Pip,
+            exact: false,
         }
     }
 
@@ -243,6 +247,7 @@ impl ThumbOverlay {
         encoder: &mut wgpu::CommandEncoder,
         target: &wgpu::TextureView,
         window: (f32, f32),
+        aligned: bool,
     ) {
         let Some(bind) = &self.bind else { return };
         if self.mode == OverlayMode::Off {
@@ -261,7 +266,9 @@ impl ThumbOverlay {
                 let h = wh;
                 let w = h * self.aspect;
                 let x = 0.5 * (ww - w);
-                (x, 0.0, x + w, h, 0.45)
+                // Faint when the view only approximates the thumbnail's
+                // frame; full strength when it IS that frame.
+                (x, 0.0, x + w, h, if aligned { 0.45 } else { 0.18 })
             }
             OverlayMode::Off => unreachable!(),
         };

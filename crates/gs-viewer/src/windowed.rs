@@ -37,8 +37,9 @@ pub struct ViewOptions {
     /// its refined focal) so a snapped view reprojects pixel-exactly.
     pub spawn_cameras: Vec<(glam::Vec3, Quat, f32)>,
     /// Per spawn pose: index into `thumbs` of the nearest keyframe thumbnail
-    /// (the frame the phone actually captured there), if one exists on disk.
-    pub spawn_thumbs: Vec<Option<usize>>,
+    /// (the frame the phone actually captured there) and whether that thumb
+    /// was captured at EXACTLY this pose's keyframe (thumbs land every 4th).
+    pub spawn_thumbs: Vec<Option<(usize, bool)>>,
     /// Deduplicated keyframe thumbnails referenced by `spawn_thumbs`. `T`
     /// cycles PIP → semi-transparent blend → off while walking the path.
     pub thumbs: Vec<ThumbImage>,
@@ -170,10 +171,11 @@ impl App {
         // Ground-truth thumbnail overlay for the recorded path (T toggles).
         let mut overlay = (!self.options.thumbs.is_empty())
             .then(|| ThumbOverlay::new(&ctx, format));
-        if let (Some(ov), Some(Some(ti))) =
+        if let (Some(ov), Some(Some((ti, exact)))) =
             (overlay.as_mut(), self.options.spawn_thumbs.first())
         {
             ov.set_image(&ctx, &self.options.thumbs[*ti]);
+            ov.exact = *exact;
         }
         let scene_rot = if self.options.flip_scene {
             Quat::from_rotation_z(std::f32::consts::PI)
@@ -301,11 +303,16 @@ impl App {
             &state.settings,
         );
         if let Some(ov) = &state.overlay {
+            // Full blend strength only when the render provably shows the
+            // thumbnail's own frame: pose lock held AND the thumb was
+            // captured at exactly this keyframe. Otherwise fade it.
+            let aligned = state.exact_pose.is_some() && ov.exact;
             ov.draw(
                 &state.ctx,
                 &mut encoder,
                 &view,
                 (state.config.width as f32, state.config.height as f32),
+                aligned,
             );
         }
         state.ctx.queue.submit([encoder.finish()]);
@@ -377,11 +384,12 @@ impl App {
                     let (pos, rot, fov) = self.options.spawn_cameras[self.spawn_idx];
                     state.camera.snap_to(pos, rot, state.scene_rot);
                     state.exact_pose = Some((pos, rot, fov));
-                    if let (Some(ov), Some(Some(ti))) = (
+                    if let (Some(ov), Some(Some((ti, exact)))) = (
                         state.overlay.as_mut(),
                         self.options.spawn_thumbs.get(self.spawn_idx),
                     ) {
                         ov.set_image(&state.ctx, &self.options.thumbs[*ti]);
+                        ov.exact = *exact;
                     }
                     log::info!("camera path pose {}/{n}", self.spawn_idx + 1);
                 }
