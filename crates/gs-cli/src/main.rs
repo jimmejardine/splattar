@@ -2306,12 +2306,12 @@ struct SubmapPlacement {
 struct ComposedProject {
     cloud: gs_core::SplatCloud,
     placements: Vec<SubmapPlacement>,
-    cameras: Vec<(glam::Vec3, glam::Quat)>,
+    cameras: Vec<(glam::Vec3, glam::Quat, f32)>,
     camera_thumbs: Vec<Option<usize>>,
     thumbs: Vec<gs_viewer::overlay::ThumbImage>,
 }
 
-type SubmapCam = ((glam::Vec3, glam::Quat), Option<usize>);
+type SubmapCam = ((glam::Vec3, glam::Quat, f32), Option<usize>);
 
 fn compose_project(
     root: &std::path::Path,
@@ -2424,6 +2424,11 @@ fn compose_project(
         let mut cams: Vec<SubmapCam> = Vec::new();
         let submap_dir = project::Project::submap_dir(root, i);
         let thumb_kfs = list_thumbs(&submap_dir);
+        // Capture camera's vertical FOV: the exact-pose lock renders with it
+        // so the ground-truth blend matches the render pixel-for-pixel.
+        let meta_i = &proj.submaps[i];
+        let focal_i = meta_i.focal_refined.unwrap_or(meta_i.focal);
+        let fov_y = 2.0 * ((meta_i.height as f64 / 2.0) / focal_i).atan() as f32;
         if let Ok(poses) = load_seg_poses(&submap_dir.join("poses.csv")) {
             let w = &resolved[i].world;
             let (ps, prot, pt) = (
@@ -2474,7 +2479,7 @@ fn compose_project(
                             Some(*e.insert(thumbs.len() - 1))
                         }
                     });
-                cams.push(((p, (prot * rot).normalize()), ti));
+                cams.push(((p, (prot * rot).normalize(), fov_y), ti));
             }
         }
         submap_cams.push(cams);
@@ -2498,7 +2503,7 @@ fn compose_project(
     // Largest submap's path first: [ starts the walk where the most footage
     // is, and empty lists vanish.
     submap_cams.sort_by_key(|c| std::cmp::Reverse(c.len()));
-    let mut spawn: Vec<(Vec3, Quat)> = Vec::new();
+    let mut spawn: Vec<(Vec3, Quat, f32)> = Vec::new();
     let mut spawn_thumbs: Vec<Option<usize>> = Vec::new();
     for (cam, ti) in submap_cams.into_iter().flatten() {
         spawn.push(cam);

@@ -33,7 +33,9 @@ pub struct ViewOptions {
     /// training keyframe poses of a project. When non-empty the viewer spawns
     /// at the first pose instead of framing the bbox (which floaters skew),
     /// and `[` / `]` snap along the path — walk exactly what the video saw.
-    pub spawn_cameras: Vec<(glam::Vec3, Quat)>,
+    /// Each pose carries the capture camera's vertical FOV (per submap, from
+    /// its refined focal) so a snapped view reprojects pixel-exactly.
+    pub spawn_cameras: Vec<(glam::Vec3, Quat, f32)>,
     /// Per spawn pose: index into `thumbs` of the nearest keyframe thumbnail
     /// (the frame the phone actually captured there), if one exists on disk.
     pub spawn_thumbs: Vec<Option<usize>>,
@@ -81,6 +83,11 @@ struct GfxState {
     config: wgpu::SurfaceConfiguration,
     renderer: SplatRenderer,
     camera: FlyCamera,
+    /// While Some, render EXACTLY this recorded pose (scene space) with the
+    /// capture FOV — the ground-truth blend then matches the render
+    /// pixel-for-pixel (roll included, which the yaw/pitch fly camera cannot
+    /// represent). Any movement input releases the lock back to free flight.
+    exact_pose: Option<(glam::Vec3, Quat, f32)>,
     scene_rot: Quat,
     settings: RenderSettings,
     num_splats: u32,
@@ -181,11 +188,13 @@ impl App {
         // A recorded camera path beats bbox framing: floaters skew the bbox
         // far off the content, while the path starts exactly where the video
         // did. Movement speed drops to a walkable fraction of the scene.
-        if let Some(&(pos, rot)) = self.options.spawn_cameras.first() {
+        let mut exact_pose = None;
+        if let Some(&(pos, rot, fov)) = self.options.spawn_cameras.first() {
             camera.snap_to(pos, rot, scene_rot);
             camera.speed = (0.05 * (bbox.1 - bbox.0).length()).clamp(0.05, 10.0);
+            exact_pose = Some((pos, rot, fov));
             log::info!(
-                "spawned on the recorded camera path ({} poses; [ / ] to step along it)",
+                "spawned on the recorded camera path ({} poses; [ / ] to step along it, T for ground truth)",
                 self.options.spawn_cameras.len()
             );
         }
@@ -198,6 +207,7 @@ impl App {
             config,
             renderer,
             camera,
+            exact_pose,
             scene_rot,
             settings: RenderSettings {
                 sh_degree: self.options.sh_degree,
@@ -235,6 +245,17 @@ impl App {
         let dt = state.last_frame.elapsed().as_secs_f32().min(0.1);
         state.last_frame = Instant::now();
 
+        let moving = self.input.forward
+            || self.input.back
+            || self.input.left
+            || self.input.right
+            || self.input.up
+            || self.input.down
+            || self.input.mouse_dx != 0.0
+            || self.input.mouse_dy != 0.0;
+        if self.locked && moving {
+            state.exact_pose = None; // hand control back to free flight
+        }
         if self.locked {
             state.camera.update(dt, &self.input);
         }
@@ -260,7 +281,17 @@ impl App {
             .ctx
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-        let camera = state.camera.to_camera(state.scene_rot);
+        // A locked recorded pose bypasses the fly camera entirely: exact
+        // position, exact rotation (roll included), capture FOV.
+        let camera = match state.exact_pose {
+            Some((pos, rot, fov)) => gs_core::Camera {
+                position: pos,
+                rotation: rot,
+                fov_y: fov,
+                ..Default::default()
+            },
+            None => state.camera.to_camera(state.scene_rot),
+        };
         state.renderer.render(
             &state.ctx,
             &mut encoder,
@@ -343,8 +374,9 @@ impl App {
                     _ => (self.spawn_idx + n - 1) % n,
                 };
                 if let Some(state) = &mut self.state {
-                    let (pos, rot) = self.options.spawn_cameras[self.spawn_idx];
+                    let (pos, rot, fov) = self.options.spawn_cameras[self.spawn_idx];
                     state.camera.snap_to(pos, rot, state.scene_rot);
+                    state.exact_pose = Some((pos, rot, fov));
                     if let (Some(ov), Some(Some(ti))) = (
                         state.overlay.as_mut(),
                         self.options.spawn_thumbs.get(self.spawn_idx),
