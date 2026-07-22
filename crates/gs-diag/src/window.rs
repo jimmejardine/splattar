@@ -39,6 +39,14 @@ pub enum Mode {
 pub struct DiagStream {
     inner: Mutex<StreamInner>,
     capacity: usize,
+    /// Records kept BEHIND the cursor, never evicted.
+    ///
+    /// Without this the producer eats the past: eviction bounded only by the
+    /// cursor walks `base` right up to it, so stepping back silently clamps to
+    /// where you already are and the back arrow appears to do nothing. It
+    /// presented as intermittent because it depended on how long you had been
+    /// paused. Half the buffer is reserved for history, half for lookahead.
+    back_reserve: usize,
 }
 
 struct StreamInner {
@@ -67,39 +75,54 @@ impl DiagStream {
                 closed: false,
             }),
             capacity: capacity.max(2),
+            back_reserve: (capacity / 2).max(1),
         })
     }
 
-    /// Push a record, blocking while the buffer is full of records the viewer
-    /// has not reached yet.
+    /// Try to push a record. Returns it back when there is no room.
     ///
-    /// Backpressure rather than eviction: silently dropping frames the user has
-    /// not seen defeats the purpose of a diagnostic viewer. When the pipeline is
-    /// the slow side — which it will be for SLAM — this never blocks.
+    /// Room means either spare capacity, or an oldest record that has fallen
+    /// outside the reserved history window. Never evicts a record inside that
+    /// window: the past is what the back arrow steps through.
+    pub fn try_push(&self, record: FrameRecord) -> Result<(), Box<FrameRecord>> {
+        let mut s = self.inner.lock().expect("diag stream poisoned");
+        if s.closed {
+            return Ok(()); // nothing is watching; drop it rather than block
+        }
+        let keep_from = s.cursor.saturating_sub(self.back_reserve);
+        let full = s.records.len() >= self.capacity;
+        if full && s.base >= keep_from {
+            // Boxed: a FrameRecord holds full image panels, and an unboxed
+            // Err would make every try_push return that large by value.
+            return Err(Box::new(record));
+        }
+        if full {
+            s.records.remove(0);
+            s.base += 1;
+        }
+        if s.records.is_empty() {
+            // First record: start the clock at its own timestamp so playback
+            // is not offset by the video's start pts.
+            s.clock = record.pts;
+            s.cursor = s.base;
+        }
+        s.records.push(record);
+        Ok(())
+    }
+
+    /// Push a record, waiting for room.
+    ///
+    /// Backpressure rather than eviction: silently dropping frames the user
+    /// has not seen defeats the purpose of a diagnostic viewer. When the
+    /// pipeline is the slow side — which it will be for SLAM — this never
+    /// waits.
     pub fn push(&self, record: FrameRecord) {
-        loop {
-            {
-                let mut s = self.inner.lock().expect("diag stream poisoned");
-                if s.closed {
-                    return;
-                }
-                let newest = s.base + s.records.len();
-                let unwatched = newest.saturating_sub(s.cursor);
-                if unwatched < self.capacity {
-                    if s.records.len() == self.capacity {
-                        s.records.remove(0);
-                        s.base += 1;
-                    }
-                    if s.records.is_empty() {
-                        // First record: start the clock at its own timestamp so
-                        // playback is not offset by the video's start pts.
-                        s.clock = record.pts;
-                        s.cursor = s.base;
-                    }
-                    s.records.push(record);
-                    return;
-                }
+        let mut pending = record;
+        while let Err(back) = self.try_push(pending) {
+            if self.is_closed() {
+                return;
             }
+            pending = *back;
             std::thread::sleep(std::time::Duration::from_millis(4));
         }
     }
@@ -690,6 +713,54 @@ mod tests {
 
     /// Backpressure, not eviction: dropping records the viewer has not reached
     /// would silently lose the frame you were about to look at.
+    /// Stepping back must keep working while the producer runs.
+    ///
+    /// The bug this pins: eviction was bounded only by the cursor, so while
+    /// the viewer sat on a frame the producer ate every record BEHIND it, and
+    /// the back arrow silently clamped to where you already were. It presented
+    /// as "sometimes back does nothing" because it depended on how long you
+    /// had been paused.
+    #[test]
+    fn history_behind_the_cursor_survives_a_running_producer() {
+        let s = DiagStream::new(16);
+        for i in 0..16 {
+            s.push(rec(i, i as f64 * 0.1));
+        }
+        // Watch a while, then stop to look at something.
+        s.advance(1.0);
+        let here = shown(&s);
+        assert!(here > 4, "should have advanced into the buffer, at {here}");
+        s.toggle_pause();
+
+        // The producer keeps running until the buffer refuses more. try_push
+        // rather than push so the test cannot deadlock on the backpressure it
+        // is verifying — before the fix this loop ran forever, eating every
+        // record behind the cursor and then blocking.
+        let mut i = 16;
+        while s.try_push(rec(i, i as f64 * 0.1)).is_ok() && i < 500 {
+            i += 1;
+        }
+        assert!(i < 500, "producer was never throttled");
+        assert_eq!(shown(&s), here, "pausing must hold the displayed frame");
+
+        // Stepping back has to actually move.
+        s.step(-1);
+        assert_eq!(shown(&s), here - 1, "back arrow did not step back");
+        s.step(-1);
+        assert_eq!(shown(&s), here - 2);
+
+        // And the reserve is real: stepping back repeatedly reaches frames
+        // well behind where the producer would otherwise have evicted to.
+        for _ in 0..16 {
+            s.step(-1);
+        }
+        assert!(
+            shown(&s) <= here - 6,
+            "history was evicted from under the cursor: stuck at {} from {here}",
+            shown(&s)
+        );
+    }
+
     #[test]
     fn push_blocks_rather_than_evicting_unwatched_records() {
         let s = DiagStream::new(4);

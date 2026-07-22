@@ -68,6 +68,22 @@ of the frame the model explains at all), the residual curve (when tracking
 degrades), pose-trail smoothness (drift shows as kinks), and window coherence.
 PSNR stays computable; it stops being the thing decisions are made on.
 
+## Commands
+
+```
+cargo nextest run --workspace       # the test command — per-test processes, ~10s
+cargo clippy --workspace --tests -- -D warnings
+cargo run --release -p gs-cli -- play <video.mp4>    # M0: decode + diagnostics
+cargo run --release -p gs-cli -- render              # M1: three-pane render check
+```
+
+`cargo nextest`, not `cargo test`: each test runs in its own process, which
+matters beyond speed here — the GPU tests each build a wgpu device, and process
+isolation stops one wedged device taking the suite with it. GPU-touching crates
+are serialised into a `gpu` test group in `.config/nextest.toml` because they
+share one physical device, and running them concurrently turns real failures
+into timeouts. Use `--release` for anything touching real video.
+
 ## Verification rules
 
 - **Any change to a WGSL kernel or its dispatch must pass the gradient checks**:
