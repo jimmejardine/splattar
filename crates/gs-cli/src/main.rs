@@ -77,9 +77,10 @@ fn play(video: PathBuf, max_frames: usize, headless: bool, history: usize) -> an
 
 /// Decode every frame into diagnostic records.
 ///
-/// Pull-based on purpose: the decoder does not race ahead of a paused window,
-/// because a viewer that cannot hold the pipeline still is useless for finding
-/// the frame where something went wrong.
+/// `push` applies the backpressure: it blocks while the buffer holds records
+/// the viewer has not reached. That keeps the decoder from racing ahead and
+/// evicting frames nobody has looked at, without this function needing to know
+/// anything about playback state.
 fn decode_into(video: &std::path::Path, max_frames: usize, stream: &DiagStream) -> anyhow::Result<()> {
     let mut reader = gs_video::VideoReader::open(video)
         .with_context(|| format!("opening {}", video.display()))?;
@@ -92,9 +93,6 @@ fn decode_into(video: &std::path::Path, max_frames: usize, stream: &DiagStream) 
     while let Some(frame) = reader.next_frame()? {
         if stream.is_closed() {
             break;
-        }
-        while stream.is_paused() && !stream.is_closed() {
-            std::thread::sleep(std::time::Duration::from_millis(16));
         }
         let panel = rgba_panel(&frame);
         stream.push(FrameRecord::captured(n, frame.pts, panel));

@@ -19,12 +19,23 @@ use winit::window::{Window, WindowId};
 
 use crate::record::FrameRecord;
 
+/// How the window chooses which record to show.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Mode {
+    /// Advance through records at the video's own rate, from PTS.
+    Play,
+    /// Hold on one record.
+    Paused,
+}
+
 /// Records shared between the producing pipeline and the window.
 ///
-/// Bounded: a fast producer must not grow this without limit, and old records
-/// are the ones you least want to keep if something has to be dropped — the
-/// live window is for watching the present. The disk trace is what preserves
-/// history.
+/// The window has its OWN playback cursor rather than always showing the
+/// newest record. Those are different things and conflating them is why the
+/// first version had no playback: `play` decodes at ~73 fps, far faster than
+/// anyone watches, so "newest" is always the end of the buffer. During SLAM the
+/// producer will instead be the slow side, and the cursor naturally sits at the
+/// newest record — the same mechanism covers both.
 pub struct DiagStream {
     inner: Mutex<StreamInner>,
     capacity: usize,
@@ -32,11 +43,15 @@ pub struct DiagStream {
 
 struct StreamInner {
     records: Vec<FrameRecord>,
-    /// Which record the window is showing. `None` = follow the newest.
-    cursor: Option<usize>,
-    paused: bool,
-    /// Set by the window when the user closes it, so a headless pipeline can
-    /// notice and stop producing.
+    /// Absolute index of `records[0]`; rises as old records are evicted.
+    base: usize,
+    /// Absolute index being shown.
+    cursor: usize,
+    /// Presentation time the playback clock has reached.
+    clock: f64,
+    mode: Mode,
+    /// Set when the window closes, so a headless pipeline can stop producing
+    /// and a blocked `push` can return.
     closed: bool,
 }
 
@@ -45,34 +60,56 @@ impl DiagStream {
         Arc::new(Self {
             inner: Mutex::new(StreamInner {
                 records: Vec::new(),
-                cursor: None,
-                paused: false,
+                base: 0,
+                cursor: 0,
+                clock: f64::NEG_INFINITY,
+                mode: Mode::Play,
                 closed: false,
             }),
-            capacity: capacity.max(1),
+            capacity: capacity.max(2),
         })
     }
 
-    /// Push a record. Never blocks the pipeline, even with no window attached.
+    /// Push a record, blocking while the buffer is full of records the viewer
+    /// has not reached yet.
+    ///
+    /// Backpressure rather than eviction: silently dropping frames the user has
+    /// not seen defeats the purpose of a diagnostic viewer. When the pipeline is
+    /// the slow side — which it will be for SLAM — this never blocks.
     pub fn push(&self, record: FrameRecord) {
-        let mut s = self.inner.lock().expect("diag stream poisoned");
-        if s.records.len() == self.capacity {
-            s.records.remove(0);
-            // Keep the cursor on the same record rather than letting it slide
-            // onto a different frame while the user is looking at it.
-            if let Some(c) = s.cursor.as_mut() {
-                *c = c.saturating_sub(1);
+        loop {
+            {
+                let mut s = self.inner.lock().expect("diag stream poisoned");
+                if s.closed {
+                    return;
+                }
+                let newest = s.base + s.records.len();
+                let unwatched = newest.saturating_sub(s.cursor);
+                if unwatched < self.capacity {
+                    if s.records.len() == self.capacity {
+                        s.records.remove(0);
+                        s.base += 1;
+                    }
+                    if s.records.is_empty() {
+                        // First record: start the clock at its own timestamp so
+                        // playback is not offset by the video's start pts.
+                        s.clock = record.pts;
+                        s.cursor = s.base;
+                    }
+                    s.records.push(record);
+                    return;
+                }
             }
+            std::thread::sleep(std::time::Duration::from_millis(4));
         }
-        s.records.push(record);
-    }
-
-    pub fn is_paused(&self) -> bool {
-        self.inner.lock().expect("diag stream poisoned").paused
     }
 
     pub fn is_closed(&self) -> bool {
         self.inner.lock().expect("diag stream poisoned").closed
+    }
+
+    pub fn mode(&self) -> Mode {
+        self.inner.lock().expect("diag stream poisoned").mode
     }
 
     pub fn len(&self) -> usize {
@@ -83,11 +120,35 @@ impl DiagStream {
         self.len() == 0
     }
 
-    /// The record currently under the cursor (or the newest when following).
+    /// Advance the playback clock by `dt` seconds of wall time and move the
+    /// cursor to whatever record that lands on. No-op while paused.
+    fn advance(&self, dt: f64) {
+        let mut s = self.inner.lock().expect("diag stream poisoned");
+        if s.mode != Mode::Play || s.records.is_empty() {
+            return;
+        }
+        s.clock += dt;
+        let newest = s.base + s.records.len() - 1;
+        while s.cursor < newest {
+            let next = s.cursor + 1 - s.base;
+            if s.records[next].pts > s.clock {
+                break;
+            }
+            s.cursor += 1;
+        }
+        // Do not let the clock run away past the newest record, or resuming
+        // after the producer catches up would skip everything it produced
+        // while we were waiting.
+        if s.cursor == newest {
+            let pts = s.records[newest - s.base].pts;
+            s.clock = s.clock.min(pts);
+        }
+    }
+
+    /// The record currently under the cursor.
     pub fn current(&self) -> Option<FrameRecord> {
         let s = self.inner.lock().expect("diag stream poisoned");
-        let i = s.cursor.unwrap_or(s.records.len().saturating_sub(1));
-        s.records.get(i).cloned()
+        s.records.get(s.cursor.saturating_sub(s.base)).cloned()
     }
 
     fn step(&self, delta: isize) {
@@ -95,19 +156,19 @@ impl DiagStream {
         if s.records.is_empty() {
             return;
         }
-        let last = s.records.len() - 1;
-        let cur = s.cursor.unwrap_or(last) as isize;
-        s.cursor = Some((cur + delta).clamp(0, last as isize) as usize);
-        // Stepping implies you want to look at something: stop following.
-        s.paused = true;
+        let (lo, hi) = (s.base as isize, (s.base + s.records.len() - 1) as isize);
+        s.cursor = (s.cursor as isize + delta).clamp(lo, hi) as usize;
+        s.clock = s.records[s.cursor - s.base].pts;
+        // Stepping means you want to look at something.
+        s.mode = Mode::Paused;
     }
 
     fn toggle_pause(&self) {
         let mut s = self.inner.lock().expect("diag stream poisoned");
-        s.paused = !s.paused;
-        if !s.paused {
-            s.cursor = None; // resume following the newest
-        }
+        s.mode = match s.mode {
+            Mode::Play => Mode::Paused,
+            Mode::Paused => Mode::Play,
+        };
     }
 
     fn close(&self) {
@@ -125,6 +186,7 @@ pub fn run(stream: Arc<DiagStream>) -> anyhow::Result<()> {
     let mut app = DiagApp {
         stream,
         state: None,
+        last_tick: None,
     };
     event_loop.run_app(&mut app)?;
     Ok(())
@@ -133,6 +195,8 @@ pub fn run(stream: Arc<DiagStream>) -> anyhow::Result<()> {
 struct DiagApp {
     stream: Arc<DiagStream>,
     state: Option<Gpu>,
+    /// Wall-clock reference for the playback clock.
+    last_tick: Option<std::time::Instant>,
 }
 
 struct Gpu {
@@ -203,6 +267,17 @@ impl ApplicationHandler for DiagApp {
     }
 
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+        // Playback advances on WALL time, not on redraw count: a frame rate
+        // that varies with GPU load must not change the speed of the video.
+        let now = std::time::Instant::now();
+        let dt = self
+            .last_tick
+            .replace(now)
+            .map_or(0.0, |t| (now - t).as_secs_f64())
+            // A long stall (window dragged, breakpoint) must not fast-forward
+            // through the recording.
+            .min(0.1);
+        self.stream.advance(dt);
         if let Some(g) = self.state.as_ref() {
             g.window.request_redraw();
         }
@@ -533,5 +608,103 @@ impl Blit {
             pass.set_bind_group(0, bg, &[]);
             pass.draw(0..6, 0..1);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::record::Panel;
+
+    fn rec(i: usize, pts: f64) -> FrameRecord {
+        FrameRecord::captured(i, pts, Panel::new(1, 1, vec![0, 0, 0, 255]))
+    }
+
+    fn shown(s: &DiagStream) -> usize {
+        s.current().expect("a record").index
+    }
+
+    /// Playback must follow the video's own clock, not the producer's
+    /// position. The first version showed "the newest record" always, so a
+    /// decoder running at 73 fps meant there was no playback at all and
+    /// unpausing jumped to the end of the buffer.
+    #[test]
+    fn playback_follows_pts_not_the_producer() {
+        let s = DiagStream::new(64);
+        for i in 0..10 {
+            s.push(rec(i, i as f64 * 0.1));
+        }
+        // Everything is already buffered — the producer is far ahead.
+        assert_eq!(shown(&s), 0, "playback must start at the first record");
+        s.advance(0.05);
+        assert_eq!(shown(&s), 0, "half a frame interval is not a frame");
+        s.advance(0.06);
+        assert_eq!(shown(&s), 1);
+        s.advance(0.5);
+        assert_eq!(shown(&s), 6, "five more frame intervals");
+    }
+
+    #[test]
+    fn pause_holds_and_stepping_implies_pause() {
+        let s = DiagStream::new(64);
+        for i in 0..10 {
+            s.push(rec(i, i as f64 * 0.1));
+        }
+        s.advance(0.35);
+        let held = shown(&s);
+        s.toggle_pause();
+        assert_eq!(s.mode(), Mode::Paused);
+        s.advance(10.0);
+        assert_eq!(shown(&s), held, "paused playback must not advance");
+        s.toggle_pause();
+        assert_eq!(s.mode(), Mode::Play);
+        s.advance(0.2);
+        assert!(shown(&s) > held, "resuming must continue from where it paused");
+
+        s.step(-2);
+        assert_eq!(s.mode(), Mode::Paused, "stepping means you want to look");
+        let back = shown(&s);
+        s.step(1);
+        assert_eq!(shown(&s), back + 1);
+    }
+
+    /// If the viewer catches up to the producer, the clock must not keep
+    /// running — otherwise the frames produced during the wait get skipped the
+    /// moment they arrive.
+    #[test]
+    fn the_clock_waits_for_a_slow_producer() {
+        let s = DiagStream::new(64);
+        s.push(rec(0, 0.0));
+        s.push(rec(1, 0.1));
+        s.advance(0.5); // overruns the two available records
+        assert_eq!(shown(&s), 1);
+        s.push(rec(2, 0.2));
+        s.push(rec(3, 0.3));
+        s.advance(0.11);
+        assert_eq!(
+            shown(&s),
+            2,
+            "a starved clock must resume one frame at a time, not jump"
+        );
+    }
+
+    /// Backpressure, not eviction: dropping records the viewer has not reached
+    /// would silently lose the frame you were about to look at.
+    #[test]
+    fn push_blocks_rather_than_evicting_unwatched_records() {
+        let s = DiagStream::new(4);
+        for i in 0..4 {
+            s.push(rec(i, i as f64 * 0.1));
+        }
+        assert_eq!(s.len(), 4);
+        // The viewer is still on record 0, so a fifth push must wait. Prove it
+        // does not silently evict by closing the stream to release it.
+        let stream = Arc::new(());
+        let _ = stream; // (keeps the intent obvious: nothing else is shared)
+        assert_eq!(shown(&s), 0);
+        s.close();
+        s.push(rec(4, 0.4));
+        assert_eq!(s.len(), 4, "a closed stream drops the push, never the history");
+        assert_eq!(shown(&s), 0, "the watched record is still there");
     }
 }

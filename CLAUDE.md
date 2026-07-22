@@ -108,3 +108,10 @@ PSNR stays computable; it stops being the thing decisions are made on.
 `samples/` (gitignored, shared with `first_attempt/`) holds the real phone
 walkthroughs: `samples/video/prinsengracht-494-*`. Never write derived outputs
 into `samples/` — pass an explicit output directory.
+
+**The running clip is
+`samples/video/prinsengracht-494-back-room-android-whatsapp/3.mp4`.** A single
+closed room: bounded, revisited from many angles, and with the fewest
+confounds — no corridor drift, no room-to-room transitions, no lens changes.
+Report progress against this clip by default so results stay comparable across
+milestones, and reach for the wider walkthroughs only once it works.
