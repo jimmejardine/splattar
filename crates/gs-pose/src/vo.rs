@@ -181,6 +181,10 @@ pub struct Thumb {
     pub data: Vec<u8>,
 }
 
+/// Max observations per track entering the GLOBAL BA polish — long tracks
+/// dominate the reduced system's fill (m obs -> m^2 pose-pair blocks).
+const GLOBAL_BA_MAX_TRACK_OBS: usize = 8;
+
 /// Why keyframes were promoted (diagnostic; logged with the causal summary).
 #[derive(Default, Debug, Clone, Copy)]
 pub struct PromotionStats {
@@ -867,7 +871,7 @@ impl VoFrontEnd {
         window.sort_by_key(|&k| k.abs_diff(center));
         window.truncate(self.cfg.ba_window);
         window.sort_unstable();
-        self.run_ba(poses, landmarks, &window, 2, 8);
+        self.run_ba(poses, landmarks, &window, 2, 8, usize::MAX);
     }
 
     fn global_ba(
@@ -881,9 +885,16 @@ impl VoFrontEnd {
         // downstream Sim(3) alignment), and pinning the bootstrap pair would
         // freeze its two-view error into the solution.
         window.sort_by_key(|&k| (k != anchor, k));
-        self.run_ba(poses, landmarks, &window, 1, 40);
+        // Thin long tracks for the global polish: a track observed from m
+        // cameras produces m^2 pose-pair fill blocks in the reduced system
+        // after Schur elimination, so whip-pan-length tracks dominate the
+        // factorization (profiled: 118 s of a 172 s solve was this pass).
+        // Eight evenly-spread observations, endpoints included, still bind
+        // the track's whole temporal span for drift control.
+        self.run_ba(poses, landmarks, &window, 1, 40, GLOBAL_BA_MAX_TRACK_OBS);
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn run_ba(
         &self,
         poses: &mut [Option<Se3>],
@@ -891,6 +902,7 @@ impl VoFrontEnd {
         window: &[usize],
         fixed: usize,
         iters: usize,
+        max_obs_per_track: usize,
     ) {
         // Compact indices: BA cam i ↔ keyframe window[i].
         let cam_of_kf: std::collections::HashMap<usize, usize> =
@@ -903,8 +915,23 @@ impl VoFrontEnd {
         };
         for tr in &self.tracks {
             let Some(l) = tr.landmark else { continue };
-            for (kf, p) in &tr.obs {
-                let Some(&cam) = cam_of_kf.get(kf) else { continue };
+            let in_window: Vec<&(usize, (f32, f32))> = tr
+                .obs
+                .iter()
+                .filter(|(kf, _)| cam_of_kf.contains_key(kf))
+                .collect();
+            let n = in_window.len();
+            let pick = |i: usize| in_window[i];
+            let selected: Vec<&(usize, (f32, f32))> = if n <= max_obs_per_track {
+                in_window.clone()
+            } else {
+                // Even stride including both endpoints.
+                (0..max_obs_per_track)
+                    .map(|j| pick(j * (n - 1) / (max_obs_per_track - 1)))
+                    .collect()
+            };
+            for (kf, p) in selected {
+                let cam = cam_of_kf[kf];
                 let lm = *lm_map.entry(l).or_insert_with(|| {
                     prob.landmarks.push(landmarks[l]);
                     prob.landmarks.len() - 1

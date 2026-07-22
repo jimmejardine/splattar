@@ -1265,9 +1265,20 @@ fn train_and_bake(
         // Training legitimately drifts the gauge away from raw VO poses, so
         // frozen eval cameras measure gauge drift, not model quality — align
         // each eval pose photometrically to the frozen model before scoring.
+        // Alignment costs ~100 GPU solves per view; the metric doesn't need
+        // every view (profiled: 117 s of a 604 s training phase went to this
+        // one diagnostic). Probe an evenly-strided subset instead.
         let raw = trainer.eval_psnr(ctx, &eval_views);
-        let refined = trainer.eval_psnr_refined(ctx, &eval_views, 100);
-        log::info!("held-out PSNR: {raw:.2} dB raw poses, {refined:.2} dB pose-aligned");
+        const EVAL_PROBE_VIEWS: usize = 8;
+        const EVAL_ALIGN_STEPS: u32 = 40;
+        let stride = eval_views.len().div_ceil(EVAL_PROBE_VIEWS).max(1);
+        let probe: Vec<gs_train::TrainView> =
+            eval_views.iter().step_by(stride).cloned().collect();
+        let refined = trainer.eval_psnr_refined(ctx, &probe, EVAL_ALIGN_STEPS);
+        log::info!(
+            "held-out PSNR: {raw:.2} dB raw poses, {refined:.2} dB pose-aligned              ({}-view probe)",
+            probe.len()
+        );
         refined
     };
     log::info!(
