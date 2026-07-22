@@ -3,7 +3,7 @@
 # here) and is reference only.
 [workspace]
 resolver = "2"
-members = []
+members = ["crates/gs-video", "crates/gs-diag", "crates/gs-cli"]
 exclude = ["first_attempt"]
 
 [workspace.package]
@@ -26,6 +26,14 @@ half = { version = "2", features = ["bytemuck"] }
 rayon = "1"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 winit = "0.30"
+mp4 = "0.14"
+ash = "0.38"
+thiserror = "2"
+
+# Workspace members carried from first_attempt/ are listed here with the
+# milestone that pulled them across, so the boundary stays auditable.
+gs-video = { path = "crates/gs-video" }   # M0: NVDEC decode, carried unchanged
+gs-diag = { path = "crates/gs-diag" }     # M0: new — the diagnostic stream
 
 [profile.dev]
 opt-level = 1

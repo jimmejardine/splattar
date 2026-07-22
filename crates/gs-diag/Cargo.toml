@@ -1,0 +1,16 @@
+[package]
+name = "gs-diag"
+description = "Diagnostic stream: the per-frame record the pipeline emits, a live window that renders it, and a trace on disk that can be replayed and compared. Steering signal for the whole project — see CLAUDE.md."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+glam = { workspace = true }
+anyhow = { workspace = true }
+log = { workspace = true }
+winit = { workspace = true }
+wgpu = { workspace = true }
+pollster = { workspace = true }
+bytemuck = { workspace = true }

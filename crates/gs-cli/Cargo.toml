@@ -1,0 +1,19 @@
+[package]
+name = "gs-cli"
+description = "Headless driver for the direct-SLAM pipeline. Every stage runs here before it gets a GUI."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "gs-cli"
+path = "src/main.rs"
+
+[dependencies]
+gs-video = { workspace = true }
+gs-diag = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+log = { workspace = true }
+env_logger = { workspace = true }
