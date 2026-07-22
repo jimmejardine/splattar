@@ -81,12 +81,135 @@ pub struct TrainConfig {
     /// submission — for heavy unconverged early iterations); from it on, one
     /// submission per iteration. u32::MAX = always split (escape hatch).
     pub merge_submits_after: u32,
+    // --- Adaptive stopping: `iters` is the schedule length and the ceiling,
+    // not a target. Quality on this footage rises to a peak and then decays
+    // (RESULTS.md: 22.17 dB at 15k, 21.25 at 30k), and where that peak lands
+    // moves with view count, scene size and clip — so probe for it. ---
+    /// Iterations between held-out probes. 0 = no adaptive stop (run to
+    /// `iters`, the historical behaviour).
+    pub eval_every: u32,
+    /// Consecutive probes without a `plateau_min_delta` gain that end the run.
+    pub plateau_patience: u32,
+    /// dB of held-out PSNR that counts as progress.
+    pub plateau_min_delta: f64,
+    /// Anneal tail, as a fraction of `iters`. On plateau the run does not stop
+    /// dead — the LR schedule is fast-forwarded to its end over this many
+    /// iterations so the model still gets its final low-LR polish, which a
+    /// hard stop at a half-decayed LR would skip.
+    pub anneal_frac: f32,
+}
+
+/// Cap on views in the plateau probe. The probe only has to detect a *trend*,
+/// and every view in it costs a fwd+bwd per alignment step.
+const PROBE_VIEWS: usize = 16;
+/// Alignment steps for the probe's first (cold) measurement, then per probe.
+/// The warm number is small because consecutive probes only have to track the
+/// gauge drift accumulated since the last one.
+const PROBE_STEPS_COLD: u32 = 40;
+const PROBE_STEPS_WARM: u32 = 8;
+
+/// Test-time pose alignment state for a set of held-out views: the aligned
+/// cameras plus their Adam state and GPU-resident targets.
+struct PoseAligner {
+    views: Vec<TrainView>,
+    m: Vec<[f32; 6]>,
+    v: Vec<[f32; 6]>,
+    t: u32,
+    depths: Vec<f32>,
+    atlas: wgpu::Buffer,
+    ring: gs_wgpu::ReadbackRing<usize>,
+    view_bytes: u64,
+}
+
+/// Plateau-detection state: a warm-kept pose aligner over a held-out subset,
+/// plus the best score seen and how many probes have passed without beating
+/// it. Keeping the alignment warm is what makes the measurement honest — a
+/// cold frozen-pose eval mostly reports accumulated gauge drift, which falls
+/// monotonically and would trip the detector for the wrong reason.
+struct Probe {
+    aligner: PoseAligner,
+    /// Focal each probe view was built with, before the trainer's refinement.
+    base_focal: Vec<f32>,
+    best: f64,
+    stale: u32,
+}
+
+/// The tail that runs once a plateau is detected: `t` (the LR schedule
+/// parameter) ramps from `t0` to 1.0 over `len` iterations starting at
+/// `start`, so the model still lands annealed rather than stopping at a
+/// half-decayed learning rate.
+#[derive(Clone, Copy)]
+struct Anneal {
+    start: u32,
+    len: u32,
+    t0: f32,
+}
+
+/// LR schedule position in [0, 1]. Linear in `iter` over the configured run;
+/// inside the anneal tail it ramps from wherever it had reached to exactly 1.0
+/// at the stop, so the decay stays continuous and monotonic and an
+/// adaptively-shortened run is still properly annealed rather than ending at a
+/// half-decayed learning rate.
+fn schedule_t(iter: u32, iters: u32, anneal: Option<Anneal>) -> f32 {
+    let nominal = iter as f32 / iters.max(1) as f32;
+    match anneal {
+        None => nominal,
+        Some(a) => {
+            let done = (iter.saturating_sub(a.start) as f32 / a.len.max(1) as f32).min(1.0);
+            a.t0 + (1.0 - a.t0) * done
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The anneal must hand off from the nominal schedule without a jump and
+    /// still reach 1.0 exactly at the stop — otherwise an adaptively-stopped
+    /// run either ends at a hot LR or takes a discontinuous drop.
+    #[test]
+    fn anneal_schedule_is_continuous_monotonic_and_completes() {
+        let iters = 20_000;
+        let start = 6_000;
+        let a = Anneal {
+            start,
+            len: 2_000,
+            t0: start as f32 / iters as f32,
+        };
+        // Continuous at the handoff.
+        let before = schedule_t(start, iters, None);
+        let after = schedule_t(start, iters, Some(a));
+        assert!((before - after).abs() < 1e-6, "{before} -> {after}");
+        // Monotonic across the tail, and 1.0 exactly at the stop.
+        let mut prev = f32::NEG_INFINITY;
+        for i in start..=start + a.len {
+            let t = schedule_t(i, iters, Some(a));
+            assert!(t >= prev - 1e-7, "not monotonic at {i}: {prev} -> {t}");
+            prev = t;
+        }
+        assert!((schedule_t(start + a.len, iters, Some(a)) - 1.0).abs() < 1e-6);
+        // Clamped past the stop (the loop breaks there, but never > 1).
+        assert!((schedule_t(start + a.len * 3, iters, Some(a)) - 1.0).abs() < 1e-6);
+    }
+
+    /// Without an anneal the schedule is exactly what it always was.
+    #[test]
+    fn nominal_schedule_is_unchanged() {
+        assert_eq!(schedule_t(0, 7000, None), 0.0);
+        assert!((schedule_t(3500, 7000, None) - 0.5).abs() < 1e-6);
+        assert!((schedule_t(7000, 7000, None) - 1.0).abs() < 1e-6);
+    }
 }
 
 impl Default for TrainConfig {
     fn default() -> Self {
         Self {
             iters: 7000,
+            eval_every: 0,
+            plateau_patience: 4,
+            plateau_min_delta: 0.05,
+            anneal_frac: 0.1,
             lambda: 0.2,
             lr_pos: 1.6e-4,
             pos_lr_final_factor: 0.01,
@@ -155,6 +278,9 @@ pub struct Trainer {
     /// extent (a long walkthrough's extent is ~30× the room depth).
     probe_positions: Vec<Vec3>,
     pose_depth: Vec<f32>,
+    /// Set once the held-out probe plateaus: the LR schedule's remaining decay
+    /// is compressed into a short tail and the run ends.
+    anneal: Option<Anneal>,
     /// Per-view appearance [gain rgb, bias rgb], EMA-updated from LS fits.
     appear: Vec<[f32; 6]>,
     /// GPU-resident targets + GPU affine-fit reduction (async readback).
@@ -477,6 +603,7 @@ impl Trainer {
             pose_v: vec![[0.0; 6]; n_views],
             pose_t: vec![0; n_views],
             focal_state: (0.0, 0.0, 0),
+            anneal: None,
             focal_scale: 1.0,
             probe_positions,
             pose_depth: vec![0.0; n_views],
@@ -492,6 +619,14 @@ impl Trainer {
                 .then(|| gs_wgpu::GpuTimer::new(ctx, 64)),
             phases: PhaseTimes::default(),
         }
+    }
+
+    /// LR schedule position in [0, 1]. Linear in `iter` over the configured
+    /// run; inside the anneal tail it ramps from wherever it had reached to
+    /// exactly 1.0 at the stop, so the decay is continuous and monotonic and
+    /// an adaptively-shortened run is still properly annealed.
+    fn schedule_t(&self, iter: u32) -> f32 {
+        schedule_t(iter, self.config.iters, self.anneal)
     }
 
     /// Median depth of the probe positions in front of this camera (cached).
@@ -549,8 +684,11 @@ impl Trainer {
         let profile = self.config.log_every > 0 && iter.is_multiple_of(self.config.log_every);
         let mut timer = if profile { self.timer.take() } else { None };
         let t0 = std::time::Instant::now();
-        // Exponential position LR decay.
-        let t = iter as f32 / self.config.iters.max(1) as f32;
+        // Exponential position LR decay. Normally `t` walks 0→1 across the
+        // full run; once the held-out probe plateaus it instead ramps from
+        // wherever it had reached to 1.0 over the anneal tail, so an early
+        // stop still lands on a fully decayed LR rather than a hot one.
+        let t = self.schedule_t(iter);
         let lr = self.config.lr_pos * self.extent * self.config.pos_lr_final_factor.powf(t);
         self.optim.set_lr("pos", lr);
 
@@ -679,9 +817,13 @@ impl Trainer {
         // readback instead of stalling on it. The host Adam step (rotation/
         // center + shared focal, LR decayed like positions) runs when the
         // readback lands, against the camera snapshot taken here.
+        // Frozen during the anneal tail: that stretch is the model's final
+        // polish, and letting the camera gauge keep moving through it is the
+        // documented way to make train loss look great while held-out sinks.
         if self.config.pose_refine_lr > 0.0
             && iter >= self.config.pose_refine_start
             && iter < self.config.pose_refine_end
+            && self.anneal.is_none()
         {
             let tag = PendingPose {
                 view_idx,
@@ -818,15 +960,26 @@ impl Trainer {
         views: &[TrainView],
         steps: u32,
     ) -> f64 {
-        let mut refined: Vec<TrainView> = views.to_vec();
-        if refined.is_empty() {
+        if views.is_empty() {
             return f64::NAN;
         }
-        let n_eval = refined.len();
-        // Per-view Adam state + depth for LR scaling, from the probe cloud.
-        let mut m = vec![[0.0f32; 6]; n_eval];
-        let mut v = vec![[0.0f32; 6]; n_eval];
-        let depths: Vec<f32> = refined
+        let mut aligner = self.new_aligner(ctx, views);
+        self.advance_aligner(ctx, &mut aligner, steps);
+        self.score(ctx, &aligner.views)
+    }
+
+    fn score(&self, ctx: &GpuContext, views: &[TrainView]) -> f64 {
+        if self.config.appearance_start != u32::MAX {
+            self.eval_psnr_affine(ctx, views)
+        } else {
+            self.eval_psnr(ctx, views)
+        }
+    }
+
+    /// Fresh test-time pose-alignment state for a set of held-out views.
+    fn new_aligner(&self, ctx: &GpuContext, views: &[TrainView]) -> PoseAligner {
+        let n = views.len();
+        let depths: Vec<f32> = views
             .iter()
             .map(|view| {
                 let inv = view.camera.quat.conjugate();
@@ -847,57 +1000,67 @@ impl Trainer {
         // Eval targets live GPU-side for the duration; each view's slice is
         // copied into the loss target in-encoder (no per-step uploads).
         let view_bytes = (self.raster.width * self.raster.height) as u64 * 16;
-        let atlas = gs_wgpu::buffers::storage_empty(
-            &ctx.device,
-            "eval-atlas",
-            view_bytes * n_eval as u64,
-        );
-        for (i, view) in refined.iter().enumerate() {
+        let atlas =
+            gs_wgpu::buffers::storage_empty(&ctx.device, "eval-atlas", view_bytes * n as u64);
+        for (i, view) in views.iter().enumerate() {
             ctx.queue
                 .write_buffer(&atlas, i as u64 * view_bytes, bytemuck::cast_slice(&view.target));
         }
-        let mut ring: gs_wgpu::ReadbackRing<usize> =
-            gs_wgpu::ReadbackRing::new(&ctx.device, "eval-pose", 16 * 4, n_eval);
+        PoseAligner {
+            views: views.to_vec(),
+            m: vec![[0.0f32; 6]; n],
+            v: vec![[0.0f32; 6]; n],
+            t: 0,
+            depths,
+            atlas,
+            ring: gs_wgpu::ReadbackRing::new(&ctx.device, "eval-pose", 16 * 4, n),
+            view_bytes,
+        }
+    }
+
+    /// Run `steps` of test-time pose alignment against the *frozen* model (the
+    /// optimizer step is simply not encoded, so the scene is never touched).
+    /// State persists in the aligner, so a caller probing repeatedly only pays
+    /// for tracking the drift since last time, not a cold re-alignment.
+    fn advance_aligner(&mut self, ctx: &GpuContext, a: &mut PoseAligner, steps: u32) {
         let lr = self.config.pose_refine_lr.max(1e-3);
         // Round-robin: all views advance step t together, so every view's
         // fwd+bwd overlaps the others' — one drain barrier per round instead
         // of a blocking readback per (view, step). Each view's Adam sequence
         // is exactly the sequential one (per-view state, updates applied only
         // at the round barrier, before its next render).
-        for t in 1..=steps {
-            for (i, view) in refined.iter().enumerate() {
+        for _ in 0..steps {
+            a.t += 1;
+            for (i, view) in a.views.iter().enumerate() {
                 let mut encoder = ctx
                     .device
                     .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
                 encoder.copy_buffer_to_buffer(
-                    &atlas,
-                    i as u64 * view_bytes,
+                    &a.atlas,
+                    i as u64 * a.view_bytes,
                     &self.loss.target,
                     0,
-                    view_bytes,
+                    a.view_bytes,
                 );
                 self.raster
                     .forward(ctx, &mut encoder, &view.camera, self.num_surfels);
                 self.loss.encode(&mut encoder);
                 self.raster.backward(&mut encoder, self.num_surfels);
-                let queued = ring.encode_copy(&mut encoder, &self.raster.grad_cam, 0, 16 * 4, i);
+                let queued = a
+                    .ring
+                    .encode_copy(&mut encoder, &self.raster.grad_cam, 0, 16 * 4, i);
                 debug_assert!(queued, "eval ring sized to n_eval can never be full here");
                 ctx.queue.submit([encoder.finish()]);
-                ring.map_pending();
+                a.ring.map_pending();
             }
-            for (i, bytes) in ring.drain_blocking(&ctx.device) {
+            for (i, bytes) in a.ring.drain_blocking(&ctx.device) {
                 let g: &[f32] = bytemuck::cast_slice(&bytes);
-                let Some(grad) = camera_step_grad(g, refined[i].camera.quat) else {
+                let Some(grad) = camera_step_grad(g, a.views[i].camera.quat) else {
                     continue;
                 };
-                let step = adam6(&mut m[i], &mut v[i], t, &grad, lr, lr * depths[i]);
-                apply_camera_step(&mut refined[i].camera, &step);
+                let step = adam6(&mut a.m[i], &mut a.v[i], a.t, &grad, lr, lr * a.depths[i]);
+                apply_camera_step(&mut a.views[i].camera, &step);
             }
-        }
-        if self.config.appearance_start != u32::MAX {
-            self.eval_psnr_affine(ctx, &refined)
-        } else {
-            self.eval_psnr(ctx, &refined)
         }
     }
 
@@ -1074,10 +1237,98 @@ impl Trainer {
         }
     }
 
-    pub fn train(&mut self, ctx: &GpuContext) {
+    /// Fixed-length run to `config.iters`. Returns iterations run.
+    pub fn train(&mut self, ctx: &GpuContext) -> u32 {
+        self.train_probed(ctx, &[])
+    }
+
+    /// Train to `config.iters`, or stop earlier when held-out quality stops
+    /// improving. Returns the number of iterations actually run.
+    ///
+    /// `eval` are held-out views for the plateau probe; pass `&[]` (or set
+    /// `eval_every` to 0) for a fixed-length run. A fixed count is the wrong
+    /// shape for this problem: quality peaks and then decays, and where the
+    /// peak sits moves with view count, scene size and clip, so the run has to
+    /// find it rather than be told it.
+    pub fn train_probed(&mut self, ctx: &GpuContext, eval: &[TrainView]) -> u32 {
         let start = std::time::Instant::now();
+        // Probe on a fixed, evenly-strided subset so the signal is consistent
+        // across probes and bounded in cost.
+        let mut probe = (self.config.eval_every > 0 && !eval.is_empty()).then(|| {
+            let stride = eval.len().div_ceil(PROBE_VIEWS).max(1);
+            let subset: Vec<TrainView> = eval.iter().step_by(stride).cloned().collect();
+            log::info!(
+                "adaptive stop: probing {} held-out view(s) every {} iters \
+                 (patience {}, min delta {:.2} dB, ceiling {})",
+                subset.len(),
+                self.config.eval_every,
+                self.config.plateau_patience,
+                self.config.plateau_min_delta,
+                self.config.iters,
+            );
+            Probe {
+                base_focal: subset.iter().map(|v| v.camera.focal).collect(),
+                aligner: self.new_aligner(ctx, &subset),
+                best: f64::NEG_INFINITY,
+                stale: 0,
+            }
+        });
+        let mut ran = self.config.iters;
         for iter in 0..self.config.iters {
             self.step(ctx, iter);
+            if let Some(stop) = self.anneal.map(|a| a.start + a.len)
+                && iter + 1 >= stop
+            {
+                ran = iter + 1;
+                log::info!("adaptive stop: annealed and finished at iteration {ran}");
+                break;
+            }
+            if let Some(p) = probe.as_mut()
+                && self.anneal.is_none()
+                && iter > 0
+                && iter.is_multiple_of(self.config.eval_every)
+            {
+                let steps = if p.aligner.t == 0 {
+                    PROBE_STEPS_COLD
+                } else {
+                    PROBE_STEPS_WARM
+                };
+                // The shared focal is refined during training, so the probe's
+                // cameras have to track it or the measurement drifts down for
+                // a reason that has nothing to do with model quality.
+                for (view, base) in p.aligner.views.iter_mut().zip(&p.base_focal) {
+                    view.camera.focal = base * self.focal_scale;
+                }
+                // Detach so the aligner and `self` are not borrowed at once.
+                let mut a = std::mem::replace(&mut p.aligner, self.new_aligner(ctx, &[]));
+                self.advance_aligner(ctx, &mut a, steps);
+                let psnr = self.score(ctx, &a.views);
+                let p = probe.as_mut().expect("probe present in this branch");
+                p.aligner = a;
+                if psnr > p.best + self.config.plateau_min_delta {
+                    p.best = psnr;
+                    p.stale = 0;
+                } else {
+                    p.stale += 1;
+                }
+                let (best, stale) = (p.best, p.stale);
+                log::info!(
+                    "  held-out probe: {psnr:.2} dB (best {best:.2}, {stale}/{} without gain)",
+                    self.config.plateau_patience
+                );
+                if stale >= self.config.plateau_patience {
+                    let len = ((self.config.iters as f32 * self.config.anneal_frac) as u32).max(1);
+                    self.anneal = Some(Anneal {
+                        start: iter,
+                        len,
+                        t0: iter as f32 / self.config.iters.max(1) as f32,
+                    });
+                    log::info!(
+                        "adaptive stop: held-out plateaued at {best:.2} dB after {iter} \
+                         iterations — annealing over {len} more and stopping"
+                    );
+                }
+            }
             if self.config.log_every > 0
                 && (iter % self.config.log_every == 0 || iter + 1 == self.config.iters)
             {
@@ -1109,6 +1360,7 @@ impl Trainer {
             }
         }
         self.flush_async(ctx);
+        ran
     }
 
     /// Render a view and return its rgb image (readback).
