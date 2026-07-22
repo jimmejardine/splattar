@@ -23,10 +23,33 @@ fn main() {
     let (lo, hi) = scene.bbox;
     let center = (lo + hi) * 0.5;
     let radius = 0.5 * (hi - lo).length();
+    // Optional: args 3,4,5 = camera position; else default far view. Camera
+    // always looks at the scene center. arg 6 = fov_y radians (default 1.0).
+    let mut rest = args;
+    let pos = match (rest.next(), rest.next(), rest.next()) {
+        (Some(x), Some(y), Some(z)) => Vec3::new(
+            x.parse().unwrap(),
+            y.parse().unwrap(),
+            z.parse().unwrap(),
+        ),
+        _ => center + Vec3::new(0.0, 0.0, 2.2 * radius),
+    };
+    let fov_y: f32 = rest.next().and_then(|s| s.parse().ok()).unwrap_or(1.0);
+    let target = match (rest.next(), rest.next(), rest.next()) {
+        (Some(x), Some(y), Some(z)) => {
+            Vec3::new(x.parse().unwrap(), y.parse().unwrap(), z.parse().unwrap())
+        }
+        _ => center,
+    };
+    let fwd = (target - pos).normalize();
+    let rotation = glam::Quat::from_rotation_arc(Vec3::new(0.0, 0.0, -1.0), fwd);
     let camera = Camera {
-        position: center + Vec3::new(0.0, 0.0, 2.2 * radius),
+        position: pos,
+        rotation,
+        fov_y,
         ..Default::default()
     };
+    eprintln!("cam pos {pos:?} -> center {center:?} (radius {radius:.1})");
 
     let (w, h) = (800u32, 600u32);
     let rgba = offscreen::render_to_rgba(&ctx, &renderer, &camera, w, h, &RenderSettings::default());

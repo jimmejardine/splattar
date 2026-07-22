@@ -117,6 +117,24 @@ fn preprocess(@builtin(global_invocation_id) gid: vec3<u32>) {
     let m = mat3x3<f32>(r[0] * s.x, r[1] * s.y, r[2] * s.z);
     let cov3d = m * transpose(m);
 
+    // 2D-surfel foreshortening. A fully-flattened disk (s.z ~ e^-10) seen
+    // edge-on has ~zero projected area: the trainer's ray-splat rasterizer
+    // renders it invisibly, but EWA of its 3D covariance smears the in-plane
+    // extent along the view-depth axis into a bright radial streak — which is
+    // why surfel exports rendered as blob/streak clouds. Fade grazing disks by
+    // |n·view| (the disk normal is R's 3rd column) and cull the near-edge-on
+    // ones, matching the trainer. `flatness` gates this to TRUE 2D surfels
+    // only (thickness < ~1/20 of the in-plane extent); moderately flat 3DGS
+    // (cactus ~2:1) stays at flatness 0 and is untouched — the golden guards it.
+    let view_dir = normalize(p_world - cam.cam_pos.xyz);
+    let facing = abs(dot(r[2], view_dir));
+    let flat_ratio = s.z / max(s.x, s.y);
+    let flatness = 1.0 - smoothstep(0.02, 0.1, flat_ratio);
+    let fade = mix(1.0, smoothstep(0.12, 0.35, facing), flatness);
+    if fade < 0.02 {
+        return;
+    }
+
     // EWA: project through the view rotation and the perspective Jacobian.
     let w3 = mat3x3<f32>(cam.view[0].xyz, cam.view[1].xyz, cam.view[2].xyz);
     // Clamp the tangent-plane position like gsplat to tame edge distortion.
@@ -173,7 +191,7 @@ fn preprocess(@builtin(global_invocation_id) gid: vec3<u32>) {
     splats_2d[slot] = Splat2D(
         vec4<f32>(ndc, axis1),
         vec4<f32>(axis2, 0.0, 0.0),
-        vec4<f32>(rgb, opacity),
+        vec4<f32>(rgb, opacity * fade),
     );
     // Ascending sort on the inverted depth bits ⇒ back-to-front instances.
     sort_keys[slot] = 0xffffffffu - bitcast<u32>(depth);
