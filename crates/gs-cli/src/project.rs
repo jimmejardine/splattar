@@ -244,7 +244,14 @@ pub fn write_meta(path: &Path, meta: &SubmapMeta) -> anyhow::Result<()> {
             e.trans[2]
         ));
     }
-    std::fs::write(path, s)?;
+    // Write-then-rename: the add pipeline trains submap N on the GPU thread
+    // (which rewrites meta with focal_refined) while the CPU thread stages
+    // segment N+1 and reads every submap's meta for its registration ladder.
+    // Rename is atomic-enough that readers see the old or new file, never a
+    // torn write.
+    let tmp = path.with_extension("txt.tmp");
+    std::fs::write(&tmp, s)?;
+    std::fs::rename(&tmp, path)?;
     Ok(())
 }
 

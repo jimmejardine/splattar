@@ -80,10 +80,10 @@ enum Command {
         focal: Option<f64>,
         #[arg(long, default_value_t = 0)]
         max_frames: u32,
-        // Quality rises monotonically to ~15k on real video now that the
-        // geo-loss weighting is fixed (RESULTS.md 2026-07-22); 4000 was tuned
-        // when more iterations made things worse. 7000 balances quality/time.
-        #[arg(long, default_value_t = 7000)]
+        /// Iteration CEILING and LR schedule length — not a target. The run
+        /// stops when held-out quality plateaus, so this only has to be
+        /// generous. 0 = scale it with the view count.
+        #[arg(long, default_value_t = 0)]
         iters: u32,
         /// Surfel budget. 0 = scale with the submap's view count (a
         /// walkthrough and a 30-keyframe fragment should not get the same
@@ -819,6 +819,17 @@ fn auto_budget(views: usize) -> u32 {
     (SURFELS_PER_VIEW.saturating_mul(views as u32)).clamp(BUDGET_RANGE.0, BUDGET_RANGE.1)
 }
 
+/// Gradient visits per view behind the auto iteration ceiling, calibrated so
+/// the historical 105 train views still yields ~7000. This is only a CEILING
+/// and the LR schedule's length — the run stops when the held-out probe stops
+/// improving, so setting it generously costs nothing but leaves headroom.
+const ITERS_PER_VIEW: u32 = 67;
+const ITERS_RANGE: (u32, u32) = (3_000, 40_000);
+
+fn auto_iters(views: usize) -> u32 {
+    (ITERS_PER_VIEW.saturating_mul(views as u32)).clamp(ITERS_RANGE.0, ITERS_RANGE.1)
+}
+
 /// Camera center + camera-to-world rotation of a solved keyframe, in glam.
 fn kf_pose(kp: &gs_pose::vo::KeyframePose) -> (glam::DVec3, glam::DQuat) {
     let c = kp.pose.center();
@@ -1172,6 +1183,7 @@ fn view_thumb(
 /// score, the surfel count, the refined focal scale, and the refined cameras —
 /// the gauge the baked surfels are actually in.
 fn train_and_bake(
+    ctx: &gs_wgpu::GpuContext,
     prepared: Prepared,
     iters: u32,
     budget: u32,
@@ -1181,7 +1193,6 @@ fn train_and_bake(
     use gs_train::{TrainConfig, Trainer};
 
     let train_kfs = prepared.train_kfs.clone();
-    let ctx = pollster::block_on(gs_wgpu::GpuContext::new(gs_wgpu::backends_from_str(None)?))?;
     let mut init = gs_train::init_from_sfm_points(&prepared.points, 0x5eed);
     gs_train::upsample_to_budget(&mut init, budget as usize, 0xb00);
     let config = TrainConfig {
@@ -1214,11 +1225,16 @@ fn train_and_bake(
         focal_refine: true,
         // Phone auto-exposure sweeps continuously — compensate per view.
         appearance_start: 300,
+        // `iters` above is the ceiling and the LR schedule length; the run
+        // stops when the held-out probe stops improving. Quality on this
+        // footage peaks and then decays, and the peak moves with view count
+        // and scene — a fixed count either stops short or runs past it.
+        eval_every: 500,
         ..Default::default()
     };
     let mut eval_views = prepared.eval_views;
     let mut trainer = Trainer::new(
-        &ctx,
+        ctx,
         prepared.tw,
         prepared.th,
         prepared.train_views,
@@ -1226,7 +1242,10 @@ fn train_and_bake(
         config,
     );
     let start = std::time::Instant::now();
-    trainer.train(&ctx);
+    // The held-out views double as the plateau probe. They stay held out —
+    // the probe only renders and aligns cameras against a frozen model, it
+    // never touches the scene, so they are not training signal.
+    let ran = trainer.train_probed(ctx, &eval_views);
     let elapsed = start.elapsed();
     let psnr = if eval_views.is_empty() {
         f64::NAN
@@ -1241,17 +1260,17 @@ fn train_and_bake(
         // Training legitimately drifts the gauge away from raw VO poses, so
         // frozen eval cameras measure gauge drift, not model quality — align
         // each eval pose photometrically to the frozen model before scoring.
-        let raw = trainer.eval_psnr(&ctx, &eval_views);
-        let refined = trainer.eval_psnr_refined(&ctx, &eval_views, 100);
+        let raw = trainer.eval_psnr(ctx, &eval_views);
+        let refined = trainer.eval_psnr_refined(ctx, &eval_views, 100);
         log::info!("held-out PSNR: {raw:.2} dB raw poses, {refined:.2} dB pose-aligned");
         refined
     };
     log::info!(
-        "trained {iters} iters in {elapsed:.0?} ({:.1} it/s); held-out PSNR {psnr:.2} dB",
-        iters as f64 / elapsed.as_secs_f64()
+        "trained {ran}/{iters} iters in {elapsed:.0?} ({:.1} it/s); held-out PSNR {psnr:.2} dB",
+        ran as f64 / elapsed.as_secs_f64()
     );
 
-    let scene = trainer.read_scene(&ctx);
+    let scene = trainer.read_scene(ctx);
     gs_io::write_3dgs_ply(
         out,
         scene.num,
@@ -1587,11 +1606,43 @@ fn run_add(
     // landed, its landmarks help the smaller ones register.
     let mut order: Vec<usize> = (0..vo.segments.len()).collect();
     order.sort_by_key(|&i| std::cmp::Reverse(solved_count(&vo.segments[i])));
-    for &si in &order {
-        if let Err(e) = add_segment_submap(project_root, video, &vo, &vo.segments[si], &opts) {
-            log::warn!("segment {si}: skipped ({e:#})");
+    // CPU/GPU pipeline: the CPU stages segment N+1 (second decode pass,
+    // registration ladder, persistence) while the GPU trains segment N.
+    // Staging only needs earlier segments' landmarks, which land on disk
+    // BEFORE training, so the producer never waits on the GPU. Training
+    // stays strictly serial on one consumer thread — one wgpu queue per
+    // device (see CLAUDE.md); more GPUs would mean more consumer threads.
+    // Channel bound 1 caps peak memory at ~two staged target sets.
+    std::thread::scope(|scope| -> anyhow::Result<()> {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<StagedSubmap>(1);
+        let opts_ref = &opts;
+        let consumer = scope.spawn(move || -> anyhow::Result<()> {
+            let ctx = pollster::block_on(gs_wgpu::GpuContext::new(
+                gs_wgpu::backends_from_str(None)?,
+            ))?;
+            while let Ok(job) = rx.recv() {
+                let idx = job.idx;
+                if let Err(e) = train_segment(&ctx, job, opts_ref) {
+                    log::warn!("submap-{idx}: training failed ({e:#})");
+                }
+            }
+            Ok(())
+        });
+        for &si in &order {
+            match stage_segment(project_root, video, &vo, &vo.segments[si], &opts) {
+                Ok(staged) => {
+                    if tx.send(staged).is_err() {
+                        break; // consumer died; its join reports why
+                    }
+                }
+                Err(e) => log::warn!("segment {si}: skipped ({e:#})"),
+            }
         }
-    }
+        drop(tx);
+        consumer
+            .join()
+            .map_err(|_| anyhow::anyhow!("GPU training thread panicked"))?
+    })?;
     let proj = project::Project::load_or_empty(project_root)?;
     let placements = project::resolve_placements(&proj);
     let components = placements.iter().map(|p| p.component).max().map_or(0, |c| c + 1);
@@ -1651,18 +1702,31 @@ fn build_component_db(
     db
 }
 
-/// Register one VO segment against the project and persist it as a new
-/// trained submap — with a pairwise Sim(3) edge to an existing submap when
-/// registration succeeds, as an island otherwise. Reloads the project each
-/// call so segments landed earlier are bridge targets for later ones. The
-/// first submap of a fresh project is trivially an island.
-fn add_segment_submap(
+/// Everything the GPU stage needs to train and finish one staged submap.
+/// Produced by the CPU stage (`stage_segment`), consumed serially by the
+/// GPU thread (`train_segment`).
+struct StagedSubmap<'a> {
+    idx: usize,
+    dir: std::path::PathBuf,
+    prepared: Prepared,
+    budget: u32,
+    edge_to: Option<u32>,
+    seg: &'a gs_pose::VoResult,
+}
+
+/// CPU stage: register one VO segment against the project and persist it as
+/// a new submap (meta + landmarks + poses + thumbs) — with a pairwise Sim(3)
+/// edge when registration succeeds, as an island otherwise. Reloads the
+/// project each call so segments staged earlier are bridge targets for later
+/// ones (their landmarks are on disk BEFORE training, so staging never waits
+/// on the GPU). Returns the training job for the GPU stage.
+fn stage_segment<'a>(
     project_root: &std::path::Path,
     video: &std::path::Path,
     vo: &VoOutput,
-    seg: &gs_pose::VoResult,
+    seg: &'a gs_pose::VoResult,
     opts: &AddOpts,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<StagedSubmap<'a>> {
     use glam::DVec3;
 
     let proj = project::Project::load_or_empty(project_root)?;
@@ -1741,7 +1805,6 @@ fn add_segment_submap(
     // and adding entries to it would change which pairs registration tries.
     write_view_thumbs(&dir, &prepared.view_thumbs)?;
 
-    let ply = dir.join("splat.ply");
     // Model size follows the submap: a fixed budget either starves a whole
     // walkthrough or squanders itself on a 30-keyframe fragment.
     let budget = if opts.budget > 0 {
@@ -1754,18 +1817,60 @@ fn add_segment_submap(
         );
         b
     };
-    let out = train_and_bake(prepared, opts.iters, budget, opts.pose_window, &ply)?;
-    let (psnr, num) = (out.psnr, out.num_surfels);
-    update_refined_focal(&dir, out.focal_scale)?;
-    write_refined_poses(
-        &dir.join("poses_refined.csv"),
+    Ok(StagedSubmap {
+        idx,
+        dir,
+        prepared,
+        budget,
+        edge_to,
         seg,
+    })
+}
+
+/// GPU stage: train the staged submap, bake its splat, and finish the
+/// on-disk record (refined focal + poses). Runs on the single GPU consumer
+/// thread — one wgpu queue per device, so training jobs stay strictly
+/// serial while the CPU stages the next segment.
+fn train_segment(
+    ctx: &gs_wgpu::GpuContext,
+    staged: StagedSubmap<'_>,
+    opts: &AddOpts,
+) -> anyhow::Result<()> {
+    let ply = staged.dir.join("splat.ply");
+    // The ceiling and the LR schedule length, not a target: the run stops
+    // when the held-out probe stops improving.
+    let iters = if opts.iters > 0 {
+        opts.iters
+    } else {
+        let n = staged.prepared.train_views.len();
+        let i = auto_iters(n);
+        log::info!(
+            "iteration ceiling {i} (auto: {n} train views × {ITERS_PER_VIEW}); the held-out \
+             probe ends the run earlier if quality plateaus"
+        );
+        i
+    };
+    let out = train_and_bake(
+        ctx,
+        staged.prepared,
+        iters,
+        staged.budget,
+        opts.pose_window,
+        &ply,
+    )?;
+    update_refined_focal(&staged.dir, out.focal_scale)?;
+    write_refined_poses(
+        &staged.dir.join("poses_refined.csv"),
+        staged.seg,
         &out.refined,
         out.scene_depth,
     )?;
     println!(
-        "submap-{idx}: {num} surfels, held-out PSNR {psnr:.2} dB — {}",
-        match edge_to {
+        "submap-{}: {} surfels, held-out PSNR {:.2} dB — {}",
+        staged.idx,
+        out.num_surfels,
+        out.psnr,
+        match staged.edge_to {
             Some(t) => format!("EDGE to submap-{t} (overlap found)"),
             None => "no overlap found: ISLAND (film a bridge clip to connect it)".into(),
         }
