@@ -1,0 +1,82 @@
+﻿# Splattar workspace. See PLAN.md for architecture and CLAUDE.md for conventions.
+[workspace]
+resolver = "2"
+members = [
+    "crates/gs-core",
+    "crates/gs-io",
+    "crates/gs-wgpu",
+    "crates/gs-kernels",
+    "crates/gs-cpu-ref",
+    "crates/gs-train",
+    "crates/gs-video",
+    "crates/gs-pose",
+    "crates/gs-render",
+    "crates/gs-viewer",
+    "crates/gs-cli",
+    "crates/app-desktop",
+    "crates/app-vr",
+]
+# app-web builds only for wasm32-unknown-unknown (via trunk/wasm-pack) and has its
+# own [workspace] table; excluding it keeps native workspace commands green.
+exclude = ["crates/app-web"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+rust-version = "1.95"
+
+[workspace.dependencies]
+# internal crates
+gs-core = { path = "crates/gs-core" }
+gs-io = { path = "crates/gs-io" }
+gs-wgpu = { path = "crates/gs-wgpu" }
+gs-kernels = { path = "crates/gs-kernels" }
+gs-cpu-ref = { path = "crates/gs-cpu-ref" }
+gs-train = { path = "crates/gs-train" }
+gs-video = { path = "crates/gs-video" }
+gs-pose = { path = "crates/gs-pose" }
+gs-render = { path = "crates/gs-render" }
+gs-viewer = { path = "crates/gs-viewer" }
+
+# external â€” pure Rust only; no crate that compiles or links C/C++ (see CLAUDE.md)
+wgpu = "30"
+winit = "0.30"
+# CPU pixel blit for the debug video player (pure Rust).
+softbuffer = "0.4"
+glam = { version = "0.33", features = ["bytemuck"] }
+bytemuck = { version = "1", features = ["derive"] }
+half = { version = "2", features = ["bytemuck"] }
+clap = { version = "4", features = ["derive"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+pollster = "0.4"
+mp4 = "0.14"
+# H.264 decode is HARDWARE (NVDEC via Vulkan Video through ash — pure Rust
+# bindings; the driver is a system runtime). Software bake-off outcome:
+# rusty_h264 is CAVLC-only (phones emit CABAC); NihAV decodes but is AGPL.
+ash = "0.38"
+thiserror = "2"
+anyhow = "1"
+# nalgebra is QUARANTINED inside gs-pose (see CLAUDE.md) — glam elsewhere.
+nalgebra = "0.35"
+# Pure-Rust SIMD+rayon dense linear algebra — gs-pose's BA camera solve only.
+faer = { version = "0.24", default-features = false, features = ["std", "rayon"] }
+# CPU fan-out for the VO front-end (pure Rust).
+rayon = "1"
+log = "0.4"
+env_logger = "0.11"
+rand = "0.9"
+
+# Loading a 435 MB ply in unoptimized dev builds is painful; keep deps optimized.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
+
+# Hot inner loops (KLT tracking) are unusable at opt-level 1.
+[profile.dev.package.gs-pose]
+opt-level = 3
+
+[profile.release]
+debug = true

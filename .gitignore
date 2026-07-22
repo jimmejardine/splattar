@@ -5,3 +5,4 @@ golden-diff*/
 /datasets
 /third_party
 *.log
+/first_attempt/target
