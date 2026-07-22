@@ -470,23 +470,18 @@ impl VoFrontEnd {
         (med, alive_since_kf as f32 / seen_at_kf as f32)
     }
 
-    /// Shared-track matches between two keyframes (normalized coords), with
-    /// the track indices that produced them.
-    fn kf_matches(&self, ka: usize, kb: usize) -> (Vec<Match2>, Vec<usize>) {
-        let mut matches = Vec::new();
-        let mut track_ids = Vec::new();
+    /// Per-keyframe observation index: bucket k lists (track, pixel) for
+    /// every track observing keyframe k, in track order. Built once per
+    /// solve — turns the per-keyframe O(all-tracks × obs) scans into
+    /// O(observations-at-k) lookups.
+    fn build_obs_index(&self) -> Vec<Vec<(u32, (f32, f32))>> {
+        let mut index: Vec<Vec<(u32, (f32, f32))>> = vec![Vec::new(); self.keyframes.len()];
         for (ti, tr) in self.tracks.iter().enumerate() {
-            let pa = tr.obs.iter().find(|o| o.0 == ka).map(|o| o.1);
-            let pb = tr.obs.iter().find(|o| o.0 == kb).map(|o| o.1);
-            if let (Some(pa), Some(pb)) = (pa, pb) {
-                matches.push(Match2 {
-                    a: self.cfg.intrinsics.norm(pa),
-                    b: self.cfg.intrinsics.norm(pb),
-                });
-                track_ids.push(ti);
+            for &(kf, p) in &tr.obs {
+                index[kf].push((ti as u32, p));
             }
         }
-        (matches, track_ids)
+        index
     }
 
     /// Anchor-out solve over the whole clip, returning the segment with the
@@ -570,6 +565,35 @@ impl VoFrontEnd {
             tr.landmark = None;
         }
         let thresh = self.cfg.ransac_px / self.cfg.intrinsics.focal;
+        let obs_index = self.build_obs_index();
+        // Shared-track matches between two keyframes via bucket intersection
+        // (both buckets are track-ordered; a track observes a keyframe at
+        // most once, so this equals the old all-tracks scan, same order).
+        // Captures only the index + Copy intrinsics so `self.tracks` stays
+        // mutable in the loops below.
+        let intr = self.cfg.intrinsics;
+        let kf_matches = |ka: usize, kb: usize| -> (Vec<Match2>, Vec<usize>) {
+            let (a, b) = (&obs_index[ka], &obs_index[kb]);
+            let mut matches = Vec::new();
+            let mut track_ids = Vec::new();
+            let (mut i, mut j) = (0usize, 0usize);
+            while i < a.len() && j < b.len() {
+                match a[i].0.cmp(&b[j].0) {
+                    std::cmp::Ordering::Less => i += 1,
+                    std::cmp::Ordering::Greater => j += 1,
+                    std::cmp::Ordering::Equal => {
+                        matches.push(Match2 {
+                            a: intr.norm(a[i].1),
+                            b: intr.norm(b[j].1),
+                        });
+                        track_ids.push(a[i].0 as usize);
+                        i += 1;
+                        j += 1;
+                    }
+                }
+            }
+            (matches, track_ids)
+        };
 
         // Candidate anchor pairs: from each start keyframe, extend forward
         // until the shared tracks carry enough flow for a well-conditioned
@@ -590,7 +614,7 @@ impl VoFrontEnd {
             .filter_map(|&ka| {
                 let mut chosen: Option<(usize, usize, f64)> = None;
                 for kb in ka + 1..range_hi {
-                    let (m, _) = self.kf_matches(ka, kb);
+                    let (m, _) = kf_matches(ka, kb);
                     if m.len() < self.cfg.boot_min_inliers {
                         break;
                     }
@@ -617,7 +641,7 @@ impl VoFrontEnd {
         let mut landmarks: Vec<Vector3<f64>> = Vec::new();
         let mut anchor = usize::MAX;
         for &(score, ka, kb) in candidates.iter().take(12) {
-            let (matches, track_ids) = self.kf_matches(ka, kb);
+            let (matches, track_ids) = kf_matches(ka, kb);
             if matches.len() < self.cfg.boot_min_inliers {
                 log::debug!("boot ({ka},{kb}) score {score:.0}: too few matches {}", matches.len());
                 continue;
@@ -685,6 +709,7 @@ impl VoFrontEnd {
 
         let total_pending = order.len();
         let mut solved_count = 2usize; // the bootstrap pair
+        let (mut t_gather, mut t_pnp, mut t_tri, mut t_ba) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
         for (processed, k) in order.into_iter().enumerate() {
             if processed > 0 && processed % 100 == 0 {
                 log::info!(
@@ -692,21 +717,19 @@ impl VoFrontEnd {
                     landmarks.len()
                 );
             }
-            // PnP from tracks with landmarks observed at keyframe k. The scan
-            // over all tracks is per-track independent; order-preserving
-            // parallel collect keeps PnP inputs identical to the serial scan.
-            let gathered: Vec<(Vector3<f64>, (f64, f64))> = self
-                .tracks
-                .par_iter()
-                .filter_map(|tr| {
-                    let l = tr.landmark?;
-                    tr.obs
-                        .iter()
-                        .find(|o| o.0 == k)
-                        .map(|&(_, p)| (landmarks[l], self.cfg.intrinsics.norm(p)))
-                })
-                .collect();
-            let (pts3, obs2): (Vec<_>, Vec<_>) = gathered.into_iter().unzip();
+            // PnP from tracks with landmarks observed at keyframe k — the
+            // obs index makes this O(observations at k); bucket order =
+            // track order, so inputs are identical to the old full scan.
+            let t0 = std::time::Instant::now();
+            let mut pts3: Vec<Vector3<f64>> = Vec::new();
+            let mut obs2: Vec<(f64, f64)> = Vec::new();
+            for &(ti, p) in &obs_index[k] {
+                if let Some(l) = self.tracks[ti as usize].landmark {
+                    pts3.push(landmarks[l]);
+                    obs2.push(intr.norm(p));
+                }
+            }
+            t_gather += t0.elapsed().as_secs_f64();
             // PnP needs real support: a pose glued on from a handful of
             // (possibly spurious) surviving tracks poisons the gauge across
             // genuine continuity breaks — leave it unsolved instead (the
@@ -716,8 +739,11 @@ impl VoFrontEnd {
                 continue;
             }
             // Prior: nearest solved pose.
+            let t0 = std::time::Instant::now();
             let prior = nearest_pose(&poses, k)?;
-            let Some(res) = solve_pnp(&pts3, &obs2, &prior, &PnpConfig::default()) else {
+            let pnp = solve_pnp(&pts3, &obs2, &prior, &PnpConfig::default());
+            t_pnp += t0.elapsed().as_secs_f64();
+            let Some(res) = pnp else {
                 // Track loss / occlusion gap: leave unsolved (spline covers it).
                 continue;
             };
@@ -727,6 +753,7 @@ impl VoFrontEnd {
             // Triangulate tracks that now have ≥2 solved observations —
             // candidates found in parallel, committed serially in track order
             // so landmark numbering stays deterministic.
+            let t0 = std::time::Instant::now();
             let new_points: Vec<(usize, Vector3<f64>)> = self
                 .tracks
                 .par_iter()
@@ -756,17 +783,21 @@ impl VoFrontEnd {
                 self.tracks[ti].landmark = Some(landmarks.len());
                 landmarks.push(p);
             }
+            t_tri += t0.elapsed().as_secs_f64();
 
             // Sliding-window BA around k (every other keyframe — the window
             // overlaps heavily and the final global pass polishes the rest).
             if k % 2 == 0 {
+                let t0 = std::time::Instant::now();
                 self.local_ba(&mut poses, &mut landmarks, k);
+                t_ba += t0.elapsed().as_secs_f64();
             }
         }
 
         // Final polish: full BA with the anchor pair fixed (cheap at VO scale).
         log::info!(
-            "anchor-out mapping done: {solved_count}/{range_n} solved in [{range_lo},{range_hi}), {} landmarks; global BA...",
+            "anchor-out mapping done: {solved_count}/{range_n} solved in [{range_lo},{range_hi}), {} landmarks \
+             [gather {t_gather:.1}s, pnp {t_pnp:.1}s, tri {t_tri:.1}s, local-ba {t_ba:.1}s]; global BA...",
             landmarks.len()
         );
         let t_ba = std::time::Instant::now();

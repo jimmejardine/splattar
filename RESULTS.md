@@ -643,3 +643,20 @@ earns its place.
    on by default on the `add` path (both are ~neutral-to-negative for
    held-out PSNR now; geo losses stay relevant for M9 meshing).
 3. `add` default iters raised 4000 → 7000 (quality now rises with length).
+
+### Anchor-out mapping: obs index kills the scans; BA is ~95% of the solve (2026-07-22)
+
+The mapping loop's per-keyframe `par_iter` scans over ALL tracks (~90k
+on the back-room clip: PnP gather + triangulation candidates) are
+replaced by a per-keyframe observation index built once per solve
+(`build_obs_index`), with `kf_matches` becoming a track-ordered bucket
+intersection — bit-identical results (verified: 2,901 kf, same 4
+segments, same solved counts and landmark totals). New mapping-phase
+timers tell the real story: gather 0.0 s, pnp 0.5 s, tri ~8 s,
+local-BA ~42 s, and global BA 96 s across segments — bundle adjustment
+is now ~95% of the anchor-out solve. The originally-planned
+triangulation dirty-set was DROPPED as not worth it (measured 8 s, was
+assumed dominant). Next lever, if the solve needs to be faster still:
+BA itself — iteration counts/tolerances, Schur assembly parallelism,
+and local-BA cadence (currently every 2nd keyframe) — not more scan
+optimization.
