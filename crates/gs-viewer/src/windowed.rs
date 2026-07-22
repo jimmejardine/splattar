@@ -95,6 +95,12 @@ struct GfxState {
     /// with the distance to the nearest anchor.
     nav_anchors: Vec<glam::Vec3>,
     nav_floor: f32,
+    /// Every recorded pose position in upright space — free flight tracks the
+    /// nearest one so the PIP thumbnail follows you and the next [ / ] snaps
+    /// close to where you are.
+    spawn_upright: Vec<glam::Vec3>,
+    /// Thumb index currently uploaded to the overlay (avoid re-uploads).
+    cur_thumb: Option<usize>,
     scene_rot: Quat,
     settings: RenderSettings,
     num_splats: u32,
@@ -218,6 +224,17 @@ impl App {
                 .collect()
         };
         let nav_floor = (0.01 * (bbox.1 - bbox.0).length()).clamp(0.02, 2.0);
+        let spawn_upright: Vec<glam::Vec3> = self
+            .options
+            .spawn_cameras
+            .iter()
+            .map(|&(p, _, _)| scene_rot * p)
+            .collect();
+        let cur_thumb = self
+            .options
+            .spawn_thumbs
+            .first()
+            .and_then(|t| t.map(|(ti, _)| ti));
 
         self.state = Some(GfxState {
             window,
@@ -230,6 +247,8 @@ impl App {
             exact_pose,
             nav_anchors,
             nav_floor,
+            spawn_upright,
+            cur_thumb,
             scene_rot,
             settings: RenderSettings {
                 sh_degree: self.options.sh_degree,
@@ -291,6 +310,30 @@ impl App {
             state.camera.update(dt, &self.input);
         }
         self.input.end_frame();
+
+        // Free flight tracks the nearest recorded pose: the PIP thumbnail
+        // follows you through the scene, and the next [ / ] snaps close to
+        // where you are instead of wherever you last snapped.
+        if state.exact_pose.is_none() && !state.spawn_upright.is_empty() {
+            let pos = state.camera.position;
+            let mut best = (f32::INFINITY, 0usize);
+            for (i, p) in state.spawn_upright.iter().enumerate() {
+                let d = (pos - *p).length_squared();
+                if d < best.0 {
+                    best = (d, i);
+                }
+            }
+            self.spawn_idx = best.1;
+            if let (Some(ov), Some(&Some((ti, _)))) = (
+                state.overlay.as_mut(),
+                self.options.spawn_thumbs.get(self.spawn_idx),
+            ) && state.cur_thumb != Some(ti)
+            {
+                ov.set_image(&state.ctx, &self.options.thumbs[ti]);
+                ov.exact = false;
+                state.cur_thumb = Some(ti);
+            }
+        }
 
         use wgpu::CurrentSurfaceTexture as Cst;
         let frame = match state.surface.get_current_texture() {
@@ -417,7 +460,10 @@ impl App {
                         state.overlay.as_mut(),
                         self.options.spawn_thumbs.get(self.spawn_idx),
                     ) {
-                        ov.set_image(&state.ctx, &self.options.thumbs[*ti]);
+                        if state.cur_thumb != Some(*ti) {
+                            ov.set_image(&state.ctx, &self.options.thumbs[*ti]);
+                            state.cur_thumb = Some(*ti);
+                        }
                         ov.exact = *exact;
                     }
                     log::info!("camera path pose {}/{n}", self.spawn_idx + 1);
