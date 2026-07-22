@@ -16,6 +16,7 @@ use winit::window::{CursorGrabMode, Window, WindowId};
 
 use crate::camera::FlyCamera;
 use crate::input::InputState;
+use crate::overlay::{ThumbImage, ThumbOverlay};
 
 pub struct ViewOptions {
     pub backends: wgpu::Backends,
@@ -33,6 +34,12 @@ pub struct ViewOptions {
     /// at the first pose instead of framing the bbox (which floaters skew),
     /// and `[` / `]` snap along the path — walk exactly what the video saw.
     pub spawn_cameras: Vec<(glam::Vec3, Quat)>,
+    /// Per spawn pose: index into `thumbs` of the nearest keyframe thumbnail
+    /// (the frame the phone actually captured there), if one exists on disk.
+    pub spawn_thumbs: Vec<Option<usize>>,
+    /// Deduplicated keyframe thumbnails referenced by `spawn_thumbs`. `T`
+    /// cycles PIP → semi-transparent blend → off while walking the path.
+    pub thumbs: Vec<ThumbImage>,
 }
 
 impl Default for ViewOptions {
@@ -47,6 +54,8 @@ impl Default for ViewOptions {
             flip_scene: true,
             title: "splattar".to_string(),
             spawn_cameras: Vec::new(),
+            spawn_thumbs: Vec::new(),
+            thumbs: Vec::new(),
         }
     }
 }
@@ -67,6 +76,7 @@ pub fn run(cloud: SplatCloud, options: ViewOptions) -> Result<(), String> {
 struct GfxState {
     window: Arc<Window>,
     ctx: GpuContext,
+    overlay: Option<ThumbOverlay>,
     surface: wgpu::Surface<'static>,
     config: wgpu::SurfaceConfiguration,
     renderer: SplatRenderer,
@@ -150,6 +160,14 @@ impl App {
 
         let scene = GpuScene::upload(&ctx, &cloud);
         let renderer = SplatRenderer::new(&ctx, &scene, format);
+        // Ground-truth thumbnail overlay for the recorded path (T toggles).
+        let mut overlay = (!self.options.thumbs.is_empty())
+            .then(|| ThumbOverlay::new(&ctx, format));
+        if let (Some(ov), Some(Some(ti))) =
+            (overlay.as_mut(), self.options.spawn_thumbs.first())
+        {
+            ov.set_image(&ctx, &self.options.thumbs[*ti]);
+        }
         let scene_rot = if self.options.flip_scene {
             Quat::from_rotation_z(std::f32::consts::PI)
         } else {
@@ -175,6 +193,7 @@ impl App {
         self.state = Some(GfxState {
             window,
             ctx,
+            overlay,
             surface,
             config,
             renderer,
@@ -250,6 +269,14 @@ impl App {
             Vec2::new(state.config.width as f32, state.config.height as f32),
             &state.settings,
         );
+        if let Some(ov) = &state.overlay {
+            ov.draw(
+                &state.ctx,
+                &mut encoder,
+                &view,
+                (state.config.width as f32, state.config.height as f32),
+            );
+        }
         state.ctx.queue.submit([encoder.finish()]);
         state.window.pre_present_notify();
         state.ctx.queue.present(frame);
@@ -299,6 +326,13 @@ impl App {
                     };
                 }
             }
+            // Toggle the ground-truth thumbnail: PIP -> blend -> off.
+            KeyCode::KeyT if pressed => {
+                if let Some(ov) = self.state.as_mut().and_then(|s| s.overlay.as_mut()) {
+                    ov.mode = ov.mode.next();
+                    log::info!("thumbnail overlay: {:?}", ov.mode);
+                }
+            }
             // Step along the recorded camera path (replay the walkthrough).
             KeyCode::BracketLeft | KeyCode::BracketRight
                 if pressed && !self.options.spawn_cameras.is_empty() =>
@@ -311,6 +345,12 @@ impl App {
                 if let Some(state) = &mut self.state {
                     let (pos, rot) = self.options.spawn_cameras[self.spawn_idx];
                     state.camera.snap_to(pos, rot, state.scene_rot);
+                    if let (Some(ov), Some(Some(ti))) = (
+                        state.overlay.as_mut(),
+                        self.options.spawn_thumbs.get(self.spawn_idx),
+                    ) {
+                        ov.set_image(&state.ctx, &self.options.thumbs[*ti]);
+                    }
                     log::info!("camera path pose {}/{n}", self.spawn_idx + 1);
                 }
             }

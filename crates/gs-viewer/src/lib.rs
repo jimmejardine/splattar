@@ -4,6 +4,7 @@
 
 pub mod camera;
 pub mod input;
+pub mod overlay;
 #[cfg(feature = "winit")]
 pub mod windowed;
 #[cfg(feature = "winit")]

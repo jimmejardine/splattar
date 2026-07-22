@@ -95,6 +95,10 @@ enum Command {
         /// full run; the LR decays on the position schedule either way).
         #[arg(long, default_value_t = 1.0)]
         pose_window: f32,
+        /// Escape hatch: skip the intra-video segment merge and train one
+        /// submap per raw VO segment (pre-merge behavior).
+        #[arg(long)]
+        no_merge_segments: bool,
     },
     /// Validation harness: train on a posed COLMAP-format dataset.
     Train {
@@ -187,6 +191,8 @@ fn main() -> anyhow::Result<()> {
             render_golden,
         } => {
             let mut spawn_cameras = Vec::new();
+            let mut spawn_thumbs = Vec::new();
+            let mut thumbs = Vec::new();
             let cloud = if file.is_dir() {
                 // Project directory: compose submaps (registered ones in the
                 // shared world, islands offset side by side). A directory
@@ -199,9 +205,11 @@ fn main() -> anyhow::Result<()> {
                 } else {
                     file.clone()
                 };
-                let (cloud, _, cams) = compose_project(&root)?;
-                spawn_cameras = cams;
-                cloud
+                let composed = compose_project(&root)?;
+                spawn_cameras = composed.cameras;
+                spawn_thumbs = composed.camera_thumbs;
+                thumbs = composed.thumbs;
+                composed.cloud
             } else {
                 let contents = gs_io::load_ply(&file)
                     .with_context(|| format!("loading {}", file.display()))?;
@@ -231,6 +239,8 @@ fn main() -> anyhow::Result<()> {
                     file.file_name().unwrap_or_default().to_string_lossy()
                 ),
                 spawn_cameras,
+                spawn_thumbs,
+                thumbs,
             };
             gs_viewer::windowed::run(cloud, options).map_err(|e| anyhow::anyhow!(e))
         }
@@ -251,6 +261,7 @@ fn main() -> anyhow::Result<()> {
             downscale,
             max_views,
             pose_window,
+            no_merge_segments,
         } => {
             // Default project dir lives next to the video, not in the cwd.
             let project = project.unwrap_or_else(|| {
@@ -261,7 +272,7 @@ fn main() -> anyhow::Result<()> {
             });
             run_add(
                 &video, &project, focal, max_frames, iters, budget, downscale, max_views,
-                pose_window,
+                pose_window, no_merge_segments,
             )
         }
         Command::Train {
@@ -1041,8 +1052,26 @@ fn run_add(
     downscale: u32,
     max_views: u32,
     pose_window: f32,
+    merge_off: bool,
 ) -> anyhow::Result<()> {
-    let vo = run_vo(video, focal, max_frames)?;
+    let mut vo = run_vo(video, focal, max_frames)?;
+    // Intra-video segment merge: tracking breaks split a clip into segments,
+    // but a walkthrough constantly revisits its own ground — those segments
+    // usually film the SAME scene and belong in ONE gauge/submap, where the
+    // revisit observations constrain a single reconstruction. Submaps are
+    // for multi-video ingestion, not intra-clip tracking hiccups.
+    if !merge_off && vo.segments.len() > 1 {
+        let n = vo.segments.len();
+        let segs = std::mem::take(&mut vo.segments);
+        let (merged, n_merges) =
+            gs_pose::merge::merge_segments(segs, &vo.intrinsics, &Default::default());
+        log::info!(
+            "segment merge: {n} segment(s) -> {} ({} merge(s))",
+            merged.len(),
+            n_merges
+        );
+        vo.segments = merged;
+    }
     // Largest segment first: it has the best registration odds and, once
     // landed, its landmarks help the smaller ones register.
     let mut order: Vec<usize> = (0..vo.segments.len()).collect();
@@ -2198,7 +2227,8 @@ fn run_register(
 
 /// Bake the composed project into one compat .ply + a manifest sidecar.
 fn run_export(project_root: &std::path::Path, out: Option<PathBuf>) -> anyhow::Result<()> {
-    let (cloud, placements, _) = compose_project(project_root)?;
+    let composed = compose_project(project_root)?;
+    let (cloud, placements) = (composed.cloud, composed.placements);
     let n = cloud.positions.len();
     let coeffs = if n > 0 { cloud.sh.len() / (n * 3) } else { 0 };
 
@@ -2269,16 +2299,23 @@ struct SubmapPlacement {
 /// its resolved placement into its component-root frame; connected
 /// components are then laid side by side along +x (presentation-only offset,
 /// never stored — per the two-tier data-model rule).
+/// Everything `view` needs from a project: the merged cloud, per-submap
+/// placement records, and the recorded camera path (scene space, renderer
+/// convention; largest submap first, kf-ascending within each) with its
+/// nearest-keyframe thumbnails for the ground-truth overlay.
+struct ComposedProject {
+    cloud: gs_core::SplatCloud,
+    placements: Vec<SubmapPlacement>,
+    cameras: Vec<(glam::Vec3, glam::Quat)>,
+    camera_thumbs: Vec<Option<usize>>,
+    thumbs: Vec<gs_viewer::overlay::ThumbImage>,
+}
+
+type SubmapCam = ((glam::Vec3, glam::Quat), Option<usize>);
+
 fn compose_project(
     root: &std::path::Path,
-) -> anyhow::Result<(
-    gs_core::SplatCloud,
-    Vec<SubmapPlacement>,
-    // Keyframe cameras composed into the same presentation frame as the
-    // surfels (scene space, renderer convention) — the viewer's walkable
-    // camera path. Ordered largest submap first, kf-ascending within each.
-    Vec<(glam::Vec3, glam::Quat)>,
-)> {
+) -> anyhow::Result<ComposedProject> {
     use glam::{Quat, Vec3};
 
     let proj = project::Project::load(root)?;
@@ -2356,7 +2393,10 @@ fn compose_project(
     // offset as the surfels. poses.csv rows are CV world→camera; convert to
     // the renderer convention exactly like KeyframePose::c2w (camera basis
     // y/z flip = 180° about x). Missing/old submaps just contribute none.
-    let mut submap_cams: Vec<Vec<(Vec3, Quat)>> = Vec::new();
+    let mut submap_cams: Vec<Vec<SubmapCam>> = Vec::new();
+    let mut thumbs: Vec<gs_viewer::overlay::ThumbImage> = Vec::new();
+    let mut thumb_idx: std::collections::HashMap<(usize, u32), usize> =
+        std::collections::HashMap::new();
     for (i, mut cloud) in clouds.into_iter().enumerate() {
         let comp = resolved[i].component;
         let dx = comp_offset[&comp];
@@ -2381,10 +2421,10 @@ fn compose_project(
             bbox,
         });
 
-        let mut cams: Vec<(Vec3, Quat)> = Vec::new();
-        if let Ok(poses) =
-            load_seg_poses(&project::Project::submap_dir(root, i).join("poses.csv"))
-        {
+        let mut cams: Vec<SubmapCam> = Vec::new();
+        let submap_dir = project::Project::submap_dir(root, i);
+        let thumb_kfs = list_thumbs(&submap_dir);
+        if let Ok(poses) = load_seg_poses(&submap_dir.join("poses.csv")) {
             let w = &resolved[i].world;
             let (ps, prot, pt) = (
                 w.scale as f32,
@@ -2399,7 +2439,7 @@ fn compose_project(
             let flip = glam::DQuat::from_rotation_x(std::f64::consts::PI);
             let mut rows: Vec<_> = poses.into_iter().collect();
             rows.sort_unstable_by_key(|(kf, _)| *kf);
-            for (_, (r_wc, t_wc)) in rows {
+            for (kf, (r_wc, t_wc)) in rows {
                 let center = -(r_wc.conjugate() * t_wc);
                 let q_render = r_wc.conjugate() * flip;
                 let pos = Vec3::new(center.x as f32, center.y as f32, center.z as f32);
@@ -2412,7 +2452,29 @@ fn compose_project(
                 .normalize();
                 let mut p = ps * (prot * pos) + pt;
                 p.x += dx;
-                cams.push((p, (prot * rot).normalize()));
+                // Nearest captured thumbnail (thumbs land every 4th kf).
+                let kf32 = kf;
+                let ti = thumb_kfs
+                    .iter()
+                    .min_by_key(|&&t| t.abs_diff(kf32))
+                    .filter(|&&t| t.abs_diff(kf32) <= 3)
+                    .and_then(|&t| match thumb_idx.entry((i, t)) {
+                        std::collections::hash_map::Entry::Occupied(e) => Some(*e.get()),
+                        std::collections::hash_map::Entry::Vacant(e) => {
+                            let img = image::open(
+                                submap_dir.join("thumbs").join(format!("{t:05}.png")),
+                            )
+                            .ok()?
+                            .to_luma8();
+                            thumbs.push(gs_viewer::overlay::ThumbImage {
+                                width: img.width(),
+                                height: img.height(),
+                                gray: img.into_raw(),
+                            });
+                            Some(*e.insert(thumbs.len() - 1))
+                        }
+                    });
+                cams.push(((p, (prot * rot).normalize()), ti));
             }
         }
         submap_cams.push(cams);
@@ -2436,8 +2498,19 @@ fn compose_project(
     // Largest submap's path first: [ starts the walk where the most footage
     // is, and empty lists vanish.
     submap_cams.sort_by_key(|c| std::cmp::Reverse(c.len()));
-    let spawn: Vec<(Vec3, Quat)> = submap_cams.into_iter().flatten().collect();
-    Ok((merged.context("empty project")?, placements, spawn))
+    let mut spawn: Vec<(Vec3, Quat)> = Vec::new();
+    let mut spawn_thumbs: Vec<Option<usize>> = Vec::new();
+    for (cam, ti) in submap_cams.into_iter().flatten() {
+        spawn.push(cam);
+        spawn_thumbs.push(ti);
+    }
+    Ok(ComposedProject {
+        cloud: merged.context("empty project")?,
+        placements,
+        cameras: spawn,
+        camera_thumbs: spawn_thumbs,
+        thumbs,
+    })
 }
 
 /// Integer box downsample for RGBA f32 images.

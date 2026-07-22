@@ -1320,6 +1320,7 @@ dependencies = [
 name = "gs-viewer"
 version = "0.1.0"
 dependencies = [
+ "bytemuck",
  "glam 0.33.2",
  "gs-core",
  "gs-render",

@@ -15,6 +15,7 @@ winit = ["dep:winit", "dep:softbuffer"]
 gs-core = { workspace = true }
 gs-render = { workspace = true }
 gs-wgpu = { workspace = true }
+bytemuck = { workspace = true }
 glam = { workspace = true }
 log = { workspace = true }
 wgpu = { workspace = true }
