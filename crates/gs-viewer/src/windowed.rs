@@ -89,6 +89,12 @@ struct GfxState {
     /// pixel-for-pixel (roll included, which the yaw/pitch fly camera cannot
     /// represent). Any movement input releases the lock back to free flight.
     exact_pose: Option<(glam::Vec3, Quat, f32)>,
+    /// Upright-space anchor points for zoom-proportional movement: the
+    /// recorded camera path when there is one (it traces the actual content;
+    /// the bbox is floater-skewed), else the bbox center. WASD speed scales
+    /// with the distance to the nearest anchor.
+    nav_anchors: Vec<glam::Vec3>,
+    nav_floor: f32,
     scene_rot: Quat,
     settings: RenderSettings,
     num_splats: u32,
@@ -193,13 +199,25 @@ impl App {
         let mut exact_pose = None;
         if let Some(&(pos, rot, fov)) = self.options.spawn_cameras.first() {
             camera.snap_to(pos, rot, scene_rot);
-            camera.speed = (0.05 * (bbox.1 - bbox.0).length()).clamp(0.05, 10.0);
             exact_pose = Some((pos, rot, fov));
             log::info!(
                 "spawned on the recorded camera path ({} poses; [ / ] to step along it, T for ground truth)",
                 self.options.spawn_cameras.len()
             );
         }
+
+        // Zoom-proportional movement anchors (subsampled path, upright space).
+        let nav_anchors: Vec<glam::Vec3> = if self.options.spawn_cameras.is_empty() {
+            vec![(bbox.0 + bbox.1) * 0.5]
+        } else {
+            self.options
+                .spawn_cameras
+                .iter()
+                .step_by(4)
+                .map(|&(p, _, _)| scene_rot * p)
+                .collect()
+        };
+        let nav_floor = (0.01 * (bbox.1 - bbox.0).length()).clamp(0.02, 2.0);
 
         self.state = Some(GfxState {
             window,
@@ -210,6 +228,8 @@ impl App {
             renderer,
             camera,
             exact_pose,
+            nav_anchors,
+            nav_floor,
             scene_rot,
             settings: RenderSettings {
                 sh_degree: self.options.sh_degree,
@@ -259,6 +279,15 @@ impl App {
             state.exact_pose = None; // hand control back to free flight
         }
         if self.locked {
+            // Zoom-proportional speed: a WASD tap far from the content
+            // ("zoomed out") covers much more ground than one up close.
+            let pos = state.camera.position;
+            let d = state
+                .nav_anchors
+                .iter()
+                .map(|a| (pos - *a).length())
+                .fold(f32::INFINITY, f32::min);
+            state.camera.speed = (d.max(state.nav_floor)).min(1e4);
             state.camera.update(dt, &self.input);
         }
         self.input.end_frame();

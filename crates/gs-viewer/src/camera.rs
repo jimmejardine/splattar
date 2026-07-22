@@ -13,7 +13,12 @@ pub struct FlyCamera {
     pub yaw: f32,
     /// Radians, clamped to ±89°.
     pub pitch: f32,
+    /// Auto base speed, set per frame by the caller from the distance to the
+    /// scene content — far away ("zoomed out") moves much faster than up
+    /// close. Units/second.
     pub speed: f32,
+    /// User multiplier on top of the auto speed (mouse scroll).
+    pub speed_mult: f32,
     pub fov_y: f32,
     pub mouse_sensitivity: f32,
 }
@@ -25,6 +30,7 @@ impl Default for FlyCamera {
             yaw: 0.0,
             pitch: 0.0,
             speed: 2.0,
+            speed_mult: 1.0,
             fov_y: 60f32.to_radians(),
             mouse_sensitivity: 0.0025,
         }
@@ -63,7 +69,8 @@ impl FlyCamera {
         self.pitch = (self.pitch - input.mouse_dy * self.mouse_sensitivity)
             .clamp(-89f32.to_radians(), 89f32.to_radians());
         if input.scroll != 0.0 {
-            self.speed = (self.speed * 1.15f32.powf(input.scroll)).clamp(0.01, 100.0);
+            self.speed_mult =
+                (self.speed_mult * 1.15f32.powf(input.scroll)).clamp(0.05, 20.0);
         }
 
         let rot = self.rotation();
@@ -90,7 +97,7 @@ impl FlyCamera {
         }
         if wish != Vec3::ZERO {
             let sprint = if input.sprint { 4.0 } else { 1.0 };
-            self.position += wish.normalize() * self.speed * sprint * dt;
+            self.position += wish.normalize() * self.speed * self.speed_mult * sprint * dt;
         }
     }
 
