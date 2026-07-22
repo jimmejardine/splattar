@@ -92,6 +92,17 @@ pub struct TrainConfig {
     pub plateau_patience: u32,
     /// dB of held-out PSNR that counts as progress.
     pub plateau_min_delta: f64,
+    /// Views the target atlas reserves room for beyond those passed to
+    /// [`Trainer::new`], so incremental mapping can append with
+    /// [`Trainer::add_view`]. The atlas is uploaded once and stays
+    /// GPU-resident (CLAUDE.md), so growth is reservation, not reallocation.
+    pub extra_view_capacity: usize,
+    /// Fraction of iterations that sample from the most recently added views
+    /// rather than uniformly (0 = uniform, the batch behaviour). Incremental
+    /// mapping needs new keyframes to converge without abandoning old ones.
+    pub recency_bias: f32,
+    /// Views counted as "recent" for `recency_bias`.
+    pub recent_window: usize,
     /// Anneal tail, as a fraction of `iters`. On plateau the run does not stop
     /// dead — the LR schedule is fast-forwarded to its end over this many
     /// iterations so the model still gets its final low-LR polish, which a
@@ -216,6 +227,9 @@ impl Default for TrainConfig {
             plateau_patience: 4,
             plateau_min_delta: 0.05,
             anneal_frac: 0.1,
+            extra_view_capacity: 0,
+            recency_bias: 0.0,
+            recent_window: 24,
             lambda: 0.2,
             lr_pos: 1.6e-4,
             pos_lr_final_factor: 0.01,
@@ -468,11 +482,12 @@ impl Trainer {
             (n * config.entries_per_surfel).max(1024),
         );
         let loss = SsimLoss::new(ctx, width, height, config.lambda, &raster.out_color, &raster.dl_dcolor);
-        let appearance = crate::appearance::Appearance::new(
+        let appearance = crate::appearance::Appearance::with_capacity(
             ctx,
             width,
             height,
             &views,
+            views.len() + config.extra_view_capacity,
             &loss.target,
             &raster.out_color,
         );
@@ -674,13 +689,45 @@ impl Trainer {
         *d.select_nth_unstable_by(mid, f32::total_cmp).1
     }
 
+    /// Append a view mid-run: uploads its target into the reserved atlas slot
+    /// and extends every per-view state vector. Returns its index, or None if
+    /// `extra_view_capacity` is exhausted.
+    ///
+    /// This is what lets mapping keep pace with a keyframe stream instead of
+    /// waiting for the whole clip, and it is deliberately fallible — silently
+    /// dropping a keyframe would leave a hole in the map that nothing later
+    /// explains.
+    pub fn add_view(&mut self, ctx: &GpuContext, view: TrainView) -> Option<usize> {
+        let idx = self.appearance.push_view(ctx, &view)?;
+        debug_assert_eq!(idx, self.views.len());
+        self.views.push(view);
+        self.pose_m.push([0.0; 6]);
+        self.pose_v.push([0.0; 6]);
+        self.pose_t.push(0);
+        self.pose_depth.push(0.0);
+        self.appear.push([1.0, 1.0, 1.0, 0.0, 0.0, 0.0]);
+        Some(idx)
+    }
+
     fn next_view(&mut self) -> usize {
         let mut x = self.rng;
         x ^= x << 13;
         x ^= x >> 7;
         x ^= x << 17;
         self.rng = x;
-        (x % self.views.len() as u64) as usize
+        let n = self.views.len();
+        // Recency bias: a fraction of iterations sample only the newest views.
+        // Uniform sampling over a growing set gives each new keyframe an
+        // ever-smaller share exactly when it needs the most work, so a live
+        // map would lag further behind the camera the longer it ran.
+        let window = self.config.recent_window.min(n);
+        if self.config.recency_bias > 0.0 && window > 0 {
+            let roll = ((x >> 11) as f64 / (1u64 << 53) as f64) as f32;
+            if roll < self.config.recency_bias {
+                return n - window + (x >> 5) as usize % window;
+            }
+        }
+        (x % n as u64) as usize
     }
 
     /// One training iteration on a random view. Returns the view used.

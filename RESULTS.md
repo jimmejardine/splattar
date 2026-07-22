@@ -856,14 +856,47 @@ it: 96% of interior pixels accepted, relative depth error median 0.25% / p90
    neighbourhood, in inverse depth where a plane is exactly affine in pixel
    coordinates, raised it to 17% (16,486 → 26,174 surfels).
 
-**Still under-delivering, and the number to watch:** at `downscale: 4` the
-sweep contributes only ~20% of the surfel budget; random jitter fills the rest.
-The remaining knob is nearly free (`downscale: 2` gives ~4× the candidates for
-~3 s instead of 0.7 s, enough to fill the budget from measured geometry), and
-was deliberately NOT turned before this A/B — tuning a parameter mid-experiment
-to improve the number is how you fool yourself. So +1.73 dB is what one fifth
-of the idea is worth.
+**Sweep resolution, measured after the A/B rather than before it.** At
+`downscale: 4` the sweep filled only ~20% of the surfel budget and random
+jitter supplied the rest, so the +1.73 dB above is what one fifth of the idea
+is worth. Re-running the dense arm at `downscale: 2` (everything else
+identical):
+
+| arm | swept surfels | % of budget | submap-0 held-out |
+|---|---|---|---|
+| sparse (`--no-dense-init`) | 0 | 0% | 23.19 dB |
+| dense, sweep downscale 4 | 26,174 | 20% | 24.92 dB |
+| **dense, sweep downscale 2** | **93,121** | **72%** | **25.63 dB** |
+
+**+2.44 dB over sparse init**, and the sweep still costs **708 ms** for 103
+views — the same as at downscale 4, so the coarse setting was latency-bound
+rather than compute-bound and the finer one is genuinely free. Default is now
+2. Iterations-to-quality holds: the sparse run's best (23.35 dB at iteration
+6000) is passed by iteration 3000.
 
 **Caveat:** on submap-1 (13 train views, a 2-view probe) sparse scored 31.79 vs
 dense 31.26. Sample far too small to read anything into, recorded rather than
 omitted.
+
+### Trainer accepts views mid-run (2026-07-22)
+
+The trainer half of PLAN.md §Pipeline step 5. `Trainer::add_view` uploads a
+target into a reserved atlas slot and extends every per-view state vector, so
+mapping no longer has to wait for the whole clip to be tracked and solved. The
+atlas is reserved, not grown: it is uploaded once and stays GPU-resident
+(CLAUDE.md), so reallocating would mean re-uploading every target.
+
+`next_view` gains an optional recency bias. Uniform sampling over a growing
+view set gives each new keyframe an ever-smaller share exactly when it needs
+the most work, so a live map would lag further behind the camera the longer it
+ran. Both knobs default to off — batch runs are bit-identical to before.
+
+Gate (synthetic, 30 train views): 15 views up front, the other 15 appended at
+iteration 1200. **Incremental 29.04 dB vs batch 28.50 dB** — arriving mid-run
+costs nothing. `add_view` returns None past the reserved capacity rather than
+silently dropping a keyframe, which would leave an unexplained hole in the map;
+that is asserted too.
+
+Not yet built: surfel spawning into the MCMC dead pool, pose-correction of
+already-spawned surfels (the two-tier requirement), the causal provisional-pose
+front-end, and the streaming driver.

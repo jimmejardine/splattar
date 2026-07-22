@@ -40,7 +40,11 @@ pub struct SweepOptions {
 impl Default for SweepOptions {
     fn default() -> Self {
         Self {
-            downscale: 4,
+            // 2, not 4: at 4 the sweep resolved only ~20% of the surfel
+            // budget and random jitter filled the rest. Quartering the pixel
+            // count costs ~4x the sweep time, which is still seconds against a
+            // training run of minutes (RESULTS.md 2026-07-22).
+            downscale: 2,
             hypotheses: 64,
             neighbours: 4,
             patch: 2,

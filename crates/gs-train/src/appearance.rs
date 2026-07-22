@@ -40,6 +40,13 @@ pub struct Appearance {
     fit_bgs: Vec<wgpu::BindGroup>,
     ring: ReadbackRing<usize>,
     npix: u32,
+    /// Byte stride between atlas slots, and how many slots exist.
+    stride: u64,
+    capacity: usize,
+    /// Buffers the per-view bind groups reference; held so views can be
+    /// appended after construction (wgpu buffers are refcounted handles).
+    loss_target: wgpu::Buffer,
+    render: wgpu::Buffer,
     /// Sample count of the subsampled fit (host-known, not summed on GPU).
     n_samples: f64,
 }
@@ -55,6 +62,25 @@ impl Appearance {
         target: &wgpu::Buffer,
         render: &wgpu::Buffer,
     ) -> Self {
+        Self::with_capacity(ctx, width, height, views, views.len(), target, render)
+    }
+
+    /// As [`Self::new`], but the atlas is sized for `capacity` views so more
+    /// can be appended later with [`Self::push_view`]. The atlas is uploaded
+    /// once and stays GPU-resident (CLAUDE.md); growing it would mean
+    /// reallocating and re-uploading every target, so incremental mapping
+    /// reserves instead.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_capacity(
+        ctx: &GpuContext,
+        width: u32,
+        height: u32,
+        views: &[TrainView],
+        capacity: usize,
+        target: &wgpu::Buffer,
+        render: &wgpu::Buffer,
+    ) -> Self {
+        let capacity = capacity.max(views.len()).max(1);
         let device = &ctx.device;
         let npix = width * height;
         let view_bytes = npix as u64 * 16;
@@ -62,7 +88,7 @@ impl Appearance {
         let align = device.limits().min_storage_buffer_offset_alignment as u64;
         let stride = view_bytes.div_ceil(align) * align;
 
-        let atlas = buffers::storage_empty(device, "appear-atlas", stride * views.len() as u64);
+        let atlas = buffers::storage_empty(device, "appear-atlas", stride * capacity as u64);
         for (v, view) in views.iter().enumerate() {
             assert_eq!(view.target.len(), npix as usize);
             ctx.queue.write_buffer(
@@ -142,8 +168,60 @@ impl Appearance {
             fit_bgs,
             ring: ReadbackRing::new(device, "appear-stats", 12 * 4, 4),
             npix,
+            stride,
+            capacity,
+            loss_target: target.clone(),
+            render: render.clone(),
             n_samples: npix.div_ceil(FIT_STRIDE) as f64,
         }
+    }
+
+    /// Number of views the atlas can still take.
+    pub fn headroom(&self) -> usize {
+        self.capacity - self.transform_bgs.len()
+    }
+
+    /// Append one view's target to the atlas and build its bind groups.
+    /// Returns its index, or None when the reserved capacity is exhausted.
+    pub fn push_view(&mut self, ctx: &GpuContext, view: &TrainView) -> Option<usize> {
+        let v = self.transform_bgs.len();
+        if v >= self.capacity {
+            return None;
+        }
+        assert_eq!(view.target.len(), self.npix as usize);
+        ctx.queue.write_buffer(
+            &self.atlas,
+            v as u64 * self.stride,
+            bytemuck::cast_slice(&view.target),
+        );
+        let view_bytes = self.npix as u64 * 16;
+        let slice = wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+            buffer: &self.atlas,
+            offset: v as u64 * self.stride,
+            size: std::num::NonZeroU64::new(view_bytes),
+        });
+        self.transform_bgs.push(ctx.device.create_bind_group(
+            &wgpu::BindGroupDescriptor {
+                label: Some("appear-transform"),
+                layout: &self.transform_pipeline.get_bind_group_layout(0),
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: self.uniform.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 1, resource: slice.clone() },
+                    wgpu::BindGroupEntry { binding: 2, resource: self.loss_target.as_entire_binding() },
+                ],
+            },
+        ));
+        self.fit_bgs.push(ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("appear-fit"),
+            layout: &self.fit_pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: self.uniform.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: slice },
+                wgpu::BindGroupEntry { binding: 3, resource: self.render.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: self.stats.as_entire_binding() },
+            ],
+        }));
+        Some(v)
     }
 
     /// Record the target transform for `view_idx` with the given affine

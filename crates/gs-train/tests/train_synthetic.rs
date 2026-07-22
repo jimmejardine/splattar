@@ -486,3 +486,144 @@ fn adaptive_stop_engages_and_shortens_the_run() {
         "adaptive stop cost too much quality: {psnr:.2} dB after {ran} iters"
     );
 }
+
+/// Views must be able to arrive mid-run and be learned as well as if they had
+/// been there from the start. This is the trainer half of incremental mapping:
+/// without it, mapping cannot begin until the whole clip has been tracked and
+/// solved, which is the batch architecture the live-model work is replacing.
+#[test]
+fn views_added_mid_run_converge_like_a_batch_run() {
+    let Some(ctx) = context() else { return };
+
+    let gt = random_surfels(0xfeedbeef, N_GT, 1.2, true);
+    let gt_raster = Rasterizer::new(&ctx, N_GT as u32, SIZE, SIZE, (N_GT * 64) as u32);
+    gt_raster.upload_scene(
+        &ctx,
+        &SceneInput {
+            positions: &gt.positions,
+            scales: &gt.scales,
+            quats: &gt.quats,
+            opacities: &gt.opacities,
+            sh: &gt.sh,
+            sh_coeffs: 1,
+        },
+    );
+    let render_gt = |camera: &RasterCamera| -> Vec<[f32; 4]> {
+        let mut encoder = ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        gt_raster.forward(&ctx, &mut encoder, camera, N_GT as u32);
+        ctx.queue.submit([encoder.finish()]);
+        bytemuck::cast_slice(&gs_wgpu::buffers::readback(
+            &ctx.device,
+            &ctx.queue,
+            &gt_raster.out_color,
+        ))
+        .to_vec()
+    };
+
+    let mut all = Vec::new();
+    let mut eval_views = Vec::new();
+    for i in 0..35 {
+        let angle = i as f32 / 35.0 * std::f32::consts::TAU;
+        let camera = orbit_camera(angle, 1.0 + (i % 3) as f32 * 0.5, 4.0);
+        let view = TrainView {
+            target: render_gt(&camera),
+            camera,
+        };
+        if i % 7 == 3 {
+            eval_views.push(view);
+        } else {
+            all.push(view);
+        }
+    }
+
+    let cfg = |extra: usize| TrainConfig {
+        iters: 6000,
+        log_every: 3000,
+        extra_view_capacity: extra,
+        ..Default::default()
+    };
+
+    // Batch reference: every view present from iteration 0.
+    let mut batch = Trainer::new(
+        &ctx,
+        SIZE,
+        SIZE,
+        all.clone(),
+        random_surfels(0x12345, N_TRAIN, 1.2, false),
+        cfg(0),
+    );
+    batch.train(&ctx, &[]);
+    let batch_psnr = batch.eval_psnr(&ctx, &eval_views);
+
+    // Incremental: start on the first half, append the rest a fifth of the
+    // way in — the shape a keyframe stream has.
+    let half = all.len() / 2;
+    let (first, rest) = all.split_at(half);
+    let mut inc = Trainer::new(
+        &ctx,
+        SIZE,
+        SIZE,
+        first.to_vec(),
+        random_surfels(0x12345, N_TRAIN, 1.2, false),
+        cfg(rest.len()),
+    );
+    assert_eq!(inc.views.len(), half);
+    for iter in 0..6000 {
+        if iter == 1200 {
+            for v in rest {
+                let idx = inc
+                    .add_view(&ctx, v.clone())
+                    .expect("reserved capacity must cover the appended views");
+                assert!(idx < all.len());
+            }
+            assert_eq!(inc.views.len(), all.len());
+        }
+        inc.step(&ctx, iter);
+    }
+    let inc_psnr = inc.eval_psnr(&ctx, &eval_views);
+
+    eprintln!(
+        "batch {batch_psnr:.2} dB vs incremental {inc_psnr:.2} dB \
+         ({half} views up front, {} added at iter 1200)",
+        rest.len()
+    );
+    // Appending must not cost meaningful quality. A generous margin: the two
+    // runs see different view orders, so they are not expected to be equal.
+    assert!(
+        inc_psnr > batch_psnr - 1.5,
+        "incremental lost too much: {inc_psnr:.2} vs batch {batch_psnr:.2}"
+    );
+    assert!(inc_psnr > 25.0, "incremental run did not converge: {inc_psnr:.2}");
+}
+
+/// Appending past the reserved capacity must fail loudly, not silently drop a
+/// keyframe (which would leave an unexplained hole in the map).
+#[test]
+fn add_view_refuses_past_reserved_capacity() {
+    let Some(ctx) = context() else { return };
+    let views: Vec<TrainView> = (0..4)
+        .map(|i| TrainView {
+            camera: orbit_camera(i as f32, 1.0, 4.0),
+            target: vec![[0.2, 0.3, 0.4, 1.0]; (SIZE * SIZE) as usize],
+        })
+        .collect();
+    let mut t = Trainer::new(
+        &ctx,
+        SIZE,
+        SIZE,
+        views.clone(),
+        random_surfels(0x1, 64, 1.2, false),
+        TrainConfig {
+            iters: 1,
+            extra_view_capacity: 1,
+            ..Default::default()
+        },
+    );
+    assert!(t.add_view(&ctx, views[0].clone()).is_some(), "first append fits");
+    assert!(
+        t.add_view(&ctx, views[1].clone()).is_none(),
+        "second append must be refused, not silently dropped"
+    );
+}
