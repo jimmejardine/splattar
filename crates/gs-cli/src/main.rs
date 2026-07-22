@@ -85,12 +85,23 @@ enum Command {
         // when more iterations made things worse. 7000 balances quality/time.
         #[arg(long, default_value_t = 7000)]
         iters: u32,
-        #[arg(long, default_value_t = 150_000)]
+        /// Surfel budget. 0 = scale with the submap's view count (a
+        /// walkthrough and a 30-keyframe fragment should not get the same
+        /// model size).
+        #[arg(long, default_value_t = 0)]
         budget: u32,
         #[arg(long, default_value_t = 2)]
         downscale: u32,
-        #[arg(long, default_value_t = 120)]
+        /// Cap on training views. 0 = let --view-spacing decide, bounded only
+        /// by what fits the GPU target atlas.
+        #[arg(long, default_value_t = 0)]
         max_views: u32,
+        /// Target spacing between training views, in degrees of apparent view
+        /// change (rotation plus translation-over-depth). Lower is denser
+        /// coverage and a bigger model; this, not elapsed time, is what
+        /// decides where supervision lands.
+        #[arg(long, default_value_t = 8.0)]
+        view_spacing: f32,
         /// Fraction of training during which pose refinement runs (1.0 =
         /// full run; the LR decays on the position schedule either way).
         #[arg(long, default_value_t = 1.0)]
@@ -260,6 +271,7 @@ fn main() -> anyhow::Result<()> {
             budget,
             downscale,
             max_views,
+            view_spacing,
             pose_window,
             no_merge_segments,
         } => {
@@ -271,8 +283,19 @@ fn main() -> anyhow::Result<()> {
                     .join("gs-project")
             });
             run_add(
-                &video, &project, focal, max_frames, iters, budget, downscale, max_views,
-                pose_window, no_merge_segments,
+                &video,
+                &project,
+                focal,
+                max_frames,
+                AddOpts {
+                    iters,
+                    budget,
+                    downscale,
+                    max_views,
+                    view_spacing,
+                    pose_window,
+                },
+                no_merge_segments,
             )
         }
         Command::Train {
@@ -778,6 +801,127 @@ fn trajectory_csv(vo: &VoOutput) -> String {
     csv
 }
 
+/// Hard ceiling on training views. Not a quality judgement — every view's
+/// target stays resident in the GPU atlas for the whole run (~1.6 MB each at
+/// downscale 2), so this bounds VRAM, and exceeding it is logged, never
+/// silent.
+const VIEW_ATLAS_CAP: usize = 600;
+
+/// Surfels per training view, the constant behind the auto budget. Calibrated
+/// to reproduce the old flat 150k at the old flat 120 views, so a
+/// walkthrough-sized submap now gets a walkthrough-sized model instead of the
+/// same budget a 30-keyframe fragment gets.
+const SURFELS_PER_VIEW: u32 = 1_250;
+const BUDGET_RANGE: (u32, u32) = (50_000, 600_000);
+
+/// Auto surfel budget for a submap trained on `views` views.
+fn auto_budget(views: usize) -> u32 {
+    (SURFELS_PER_VIEW.saturating_mul(views as u32)).clamp(BUDGET_RANGE.0, BUDGET_RANGE.1)
+}
+
+/// Camera center + camera-to-world rotation of a solved keyframe, in glam.
+fn kf_pose(kp: &gs_pose::vo::KeyframePose) -> (glam::DVec3, glam::DQuat) {
+    let c = kp.pose.center();
+    let q = kp.pose.r.inverse();
+    (
+        glam::DVec3::new(c[0], c[1], c[2]),
+        glam::DQuat::from_xyzw(q.i, q.j, q.k, q.w),
+    )
+}
+
+/// How much the view changes between two poses, in radians of apparent motion:
+/// the rotation between them plus the angle a translation of `|Δc|` subtends
+/// at `depth`. One currency for both, which is what makes it a usable spacing
+/// metric — a pure pan and a pure dolly that reframe the scene equally cost
+/// the same.
+fn view_change(
+    ac: glam::DVec3,
+    aq: glam::DQuat,
+    c: glam::DVec3,
+    q: glam::DQuat,
+    depth: f64,
+) -> f64 {
+    let rot = (aq.conjugate() * q).normalize();
+    let ang = 2.0 * rot.w.abs().clamp(-1.0, 1.0).acos();
+    ang + ((c - ac).length() / depth.max(1e-6)).atan()
+}
+
+/// A solved keyframe offered to view selection.
+struct ViewCandidate {
+    kf: usize,
+    center: glam::DVec3,
+    q_c2w: glam::DQuat,
+    pts: f64,
+    sharpness: f32,
+}
+
+/// Pick the sharpest keyframe per `spacing` radians of viewpoint change.
+/// Candidates must be keyframe-ordered; the returned indices are too.
+///
+/// Spacing by view change rather than elapsed time is what stops a dwelling
+/// operator from consuming the view budget: standing still costs nothing,
+/// while a fast pan — which reframes the scene without moving — earns views in
+/// proportion to how much new geometry it exposes. The 2 s fallback only
+/// covers a degenerate trajectory where every pose reads as identical.
+fn select_views(cands: &[ViewCandidate], spacing: f64, depth: f64) -> Vec<usize> {
+    let mut chosen: Vec<usize> = Vec::new();
+    // (window boundary, sharpest so far in this window). The boundary is where
+    // the window OPENED, never the frame picked from it — anchoring on the
+    // pick would set the reference backwards and make the very next frame
+    // trigger again, emitting near-duplicate pairs.
+    let mut win: Option<(&ViewCandidate, &ViewCandidate)> = None;
+    for c in cands {
+        match win {
+            None => win = Some((c, c)),
+            Some((boundary, best)) => {
+                let closed = view_change(boundary.center, boundary.q_c2w, c.center, c.q_c2w, depth)
+                    >= spacing
+                    || c.pts - boundary.pts >= 2.0;
+                if closed {
+                    chosen.push(best.kf);
+                    win = Some((c, c));
+                } else if c.sharpness > best.sharpness {
+                    win = Some((boundary, c));
+                }
+            }
+        }
+    }
+    if let Some((_, best)) = win {
+        chosen.push(best.kf);
+    }
+    chosen
+}
+
+/// Median depth of the segment's landmarks over its keyframes — the scale that
+/// converts a camera translation into apparent view change. Subsampled on both
+/// axes; this only sets a spacing heuristic.
+fn segment_median_depth(seg: &gs_pose::VoResult) -> f64 {
+    let solved: Vec<&gs_pose::vo::KeyframePose> =
+        seg.keyframe_poses.iter().flatten().collect();
+    if solved.is_empty() || seg.landmarks.is_empty() {
+        return 1.0;
+    }
+    let ks = (solved.len() / 64).max(1);
+    let ls = (seg.landmarks.len() / 256).max(1);
+    let mut depths: Vec<f64> = Vec::new();
+    for kp in solved.iter().step_by(ks) {
+        let (center, q_c2w) = kf_pose(kp);
+        // CV convention: the camera looks down its local +z.
+        let fwd = q_c2w * glam::DVec3::Z;
+        for l in seg.landmarks.iter().step_by(ls) {
+            let d = (glam::DVec3::new(l.x, l.y, l.z) - center).dot(fwd);
+            if d > 0.05 {
+                depths.push(d);
+            }
+        }
+    }
+    if depths.is_empty() {
+        return 1.0;
+    }
+    depths.sort_by(f64::total_cmp);
+    depths[depths.len() / 2]
+}
+
 /// Everything the trainer needs from a video, plus the persistence payload.
 struct Prepared {
     train_views: Vec<gs_train::TrainView>,
@@ -804,6 +948,7 @@ fn prepare_training(
     seg: &gs_pose::VoResult,
     downscale: u32,
     max_views: u32,
+    view_spacing: f32,
 ) -> anyhow::Result<Prepared> {
     use gs_kernels::RasterCamera;
     use gs_train::TrainView;
@@ -812,39 +957,52 @@ fn prepare_training(
     let (vw, vh) = (vo.video_size.0 as usize, vo.video_size.1 as usize);
     let (tw, th) = (vw / ds, vh / ds);
 
-    // View selection: solved keyframes, sharpest per 0.25 s window, capped.
-    let mut chosen: Vec<usize> = Vec::new();
-    {
-        let mut window_start = f64::NEG_INFINITY;
-        let mut best_in_window: Option<usize> = None;
-        for (k, kp) in seg.keyframe_poses.iter().enumerate() {
-            if kp.is_none() {
-                continue;
-            }
-            let kf = &vo.keyframes[k];
-            if kf.pts - window_start > 0.25 {
-                if let Some(b) = best_in_window.take() {
-                    chosen.push(b);
-                }
-                window_start = kf.pts;
-            }
-            if best_in_window.is_none_or(|b| kf.sharpness > vo.keyframes[b].sharpness) {
-                best_in_window = Some(k);
-            }
-        }
-        if let Some(b) = best_in_window {
-            chosen.push(b);
-        }
-    }
-    if chosen.len() > max_views as usize {
-        let stride = chosen.len() as f64 / max_views as f64;
-        chosen = (0..max_views as usize)
+    // View selection: sharpest keyframe per unit of VIEWPOINT change, not per
+    // unit of time. Elapsed-time windows put supervision where the operator
+    // lingered rather than where the scene is: a walkthrough that dwells in a
+    // doorway and then sweeps a room gets the same views per second for both,
+    // starving whole stretches the path later walks through. Spacing by
+    // apparent view change spends views on new geometry instead.
+    let depth = segment_median_depth(seg);
+    let cands: Vec<ViewCandidate> = seg
+        .keyframe_poses
+        .iter()
+        .enumerate()
+        .filter_map(|(k, kp)| {
+            let (center, q_c2w) = kf_pose(kp.as_ref()?);
+            Some(ViewCandidate {
+                kf: k,
+                center,
+                q_c2w,
+                pts: vo.keyframes[k].pts,
+                sharpness: vo.keyframes[k].sharpness,
+            })
+        })
+        .collect();
+    let mut chosen = select_views(&cands, (view_spacing.max(0.1) as f64).to_radians(), depth);
+    let wanted = chosen.len();
+    // `max_views` 0 = let the spacing decide; the hard cap only exists because
+    // every view's target is resident in the GPU atlas for the whole run.
+    let cap = if max_views > 0 {
+        max_views as usize
+    } else {
+        VIEW_ATLAS_CAP
+    };
+    if chosen.len() > cap {
+        let stride = chosen.len() as f64 / cap as f64;
+        chosen = (0..cap)
             .map(|i| chosen[(i as f64 * stride) as usize])
             .collect();
+        log::warn!(
+            "view spacing {view_spacing}° wanted {wanted} views, capped to {cap} \
+             (effective spacing ≈{:.1}°) — raise --max-views or --downscale to keep them",
+            view_spacing as f64 * stride
+        );
     }
     anyhow::ensure!(chosen.len() >= 4, "too few usable views: {}", chosen.len());
     log::info!(
-        "selected {} training views (downscale {ds} -> {tw}x{th})",
+        "selected {} training views at {view_spacing}° spacing (median scene depth \
+         {depth:.2}; downscale {ds} -> {tw}x{th})",
         chosen.len()
     );
 
@@ -1387,17 +1545,24 @@ fn load_seg_poses(
 /// is resolved per connected component at compose time — so the order in
 /// which videos are added doesn't matter (submap indices and archipelago
 /// layout follow add order, which is presentation-only).
-#[allow(clippy::too_many_arguments)]
+/// Per-submap training knobs. `budget` and `max_views` of 0 mean "size this to
+/// the submap" — a walkthrough and a 30-keyframe fragment should not get the
+/// same view count or model size.
+struct AddOpts {
+    iters: u32,
+    budget: u32,
+    downscale: u32,
+    max_views: u32,
+    view_spacing: f32,
+    pose_window: f32,
+}
+
 fn run_add(
     video: &std::path::Path,
     project_root: &std::path::Path,
     focal: Option<f64>,
     max_frames: u32,
-    iters: u32,
-    budget: u32,
-    downscale: u32,
-    max_views: u32,
-    pose_window: f32,
+    opts: AddOpts,
     merge_off: bool,
 ) -> anyhow::Result<()> {
     let mut vo = run_vo(video, focal, max_frames)?;
@@ -1423,17 +1588,7 @@ fn run_add(
     let mut order: Vec<usize> = (0..vo.segments.len()).collect();
     order.sort_by_key(|&i| std::cmp::Reverse(solved_count(&vo.segments[i])));
     for &si in &order {
-        if let Err(e) = add_segment_submap(
-            project_root,
-            video,
-            &vo,
-            &vo.segments[si],
-            iters,
-            budget,
-            downscale,
-            max_views,
-            pose_window,
-        ) {
+        if let Err(e) = add_segment_submap(project_root, video, &vo, &vo.segments[si], &opts) {
             log::warn!("segment {si}: skipped ({e:#})");
         }
     }
@@ -1501,17 +1656,12 @@ fn build_component_db(
 /// registration succeeds, as an island otherwise. Reloads the project each
 /// call so segments landed earlier are bridge targets for later ones. The
 /// first submap of a fresh project is trivially an island.
-#[allow(clippy::too_many_arguments)]
 fn add_segment_submap(
     project_root: &std::path::Path,
     video: &std::path::Path,
     vo: &VoOutput,
     seg: &gs_pose::VoResult,
-    iters: u32,
-    budget: u32,
-    downscale: u32,
-    max_views: u32,
-    pose_window: f32,
+    opts: &AddOpts,
 ) -> anyhow::Result<()> {
     use glam::DVec3;
 
@@ -1525,7 +1675,14 @@ fn add_segment_submap(
     let db = build_component_db(&locals, &placements);
     log::info!("project DB: {} landmarks after dedup", db.len());
 
-    let prepared = prepare_training(video, vo, seg, downscale, max_views)?;
+    let prepared = prepare_training(
+        video,
+        vo,
+        seg,
+        opts.downscale,
+        opts.max_views,
+        opts.view_spacing,
+    )?;
 
     let new_all: Vec<DbLandmark> = prepared
         .landmarks
@@ -1585,7 +1742,19 @@ fn add_segment_submap(
     write_view_thumbs(&dir, &prepared.view_thumbs)?;
 
     let ply = dir.join("splat.ply");
-    let out = train_and_bake(prepared, iters, budget, pose_window, &ply)?;
+    // Model size follows the submap: a fixed budget either starves a whole
+    // walkthrough or squanders itself on a 30-keyframe fragment.
+    let budget = if opts.budget > 0 {
+        opts.budget
+    } else {
+        let b = auto_budget(prepared.train_views.len());
+        log::info!(
+            "surfel budget {b} (auto: {} train views × {SURFELS_PER_VIEW})",
+            prepared.train_views.len()
+        );
+        b
+    };
+    let out = train_and_bake(prepared, opts.iters, budget, opts.pose_window, &ply)?;
     let (psnr, num) = (out.psnr, out.num_surfels);
     update_refined_focal(&dir, out.focal_scale)?;
     write_refined_poses(
@@ -3106,6 +3275,94 @@ mod tests {
                 );
             }
         }
+    }
+
+    fn cand(kf: usize, center: DVec3, q_c2w: DQuat, pts: f64, sharpness: f32) -> ViewCandidate {
+        ViewCandidate {
+            kf,
+            center,
+            q_c2w,
+            pts,
+            sharpness,
+        }
+    }
+
+    /// The whole point of the change: standing still must not consume views,
+    /// and turning on the spot must earn them. Same elapsed time, same
+    /// keyframe count, opposite outcomes.
+    #[test]
+    fn view_selection_follows_viewpoint_not_elapsed_time() {
+        // 60 keyframes over 6 s, camera bolted down.
+        let still: Vec<ViewCandidate> = (0..60)
+            .map(|i| cand(i, DVec3::ZERO, DQuat::IDENTITY, i as f64 * 0.1, 1.0))
+            .collect();
+        // Same cadence, but panning 90° across those 6 s.
+        let panning: Vec<ViewCandidate> = (0..60)
+            .map(|i| {
+                cand(
+                    i,
+                    DVec3::ZERO,
+                    quat(DVec3::Y, i as f64 * 1.5),
+                    i as f64 * 0.1,
+                    1.0,
+                )
+            })
+            .collect();
+        let spacing = 8f64.to_radians();
+        let n_still = select_views(&still, spacing, 3.0).len();
+        let n_pan = select_views(&panning, spacing, 3.0).len();
+        // Stationary: only the 2 s fallback fires (t=0, 2, 4, plus a trailing).
+        assert!(n_still <= 5, "stationary run took {n_still} views");
+        // 90° at 8° spacing ≈ 11 views, plus endpoints.
+        assert!(
+            (10..=14).contains(&n_pan),
+            "90° pan took {n_pan} views, expected ~11"
+        );
+        assert!(n_pan > n_still * 2);
+    }
+
+    /// Translation and rotation have to trade off in one currency, or the
+    /// spacing metric is meaningless on a walkthrough that does both.
+    #[test]
+    fn view_change_trades_translation_against_rotation_at_depth() {
+        let (o, i) = (DVec3::ZERO, DQuat::IDENTITY);
+        // At depth 4, moving 4 units sideways subtends 45°.
+        let moved = view_change(o, i, DVec3::X * 4.0, i, 4.0);
+        assert!((moved.to_degrees() - 45.0).abs() < 1e-9, "{moved}");
+        // Halving the depth doubles the apparent change (for small angles).
+        let closer = view_change(o, i, DVec3::X * 0.1, i, 2.0);
+        let farther = view_change(o, i, DVec3::X * 0.1, i, 4.0);
+        assert!((closer / farther - 2.0).abs() < 0.01);
+        // Pure rotation is depth-independent.
+        let r = quat(DVec3::Y, 30.0);
+        for d in [0.5, 5.0, 50.0] {
+            assert!((view_change(o, i, o, r, d).to_degrees() - 30.0).abs() < 1e-9);
+        }
+    }
+
+    /// Sharpness still decides which frame represents a window.
+    #[test]
+    fn view_selection_keeps_the_sharpest_frame_per_window() {
+        // 20 keyframes panning 2°/frame; frame 7 is by far the sharpest.
+        let cands: Vec<ViewCandidate> = (0..20)
+            .map(|i| {
+                let s = if i == 7 { 100.0 } else { 1.0 };
+                cand(i, DVec3::ZERO, quat(DVec3::Y, i as f64 * 2.0), i as f64 * 0.1, s)
+            })
+            .collect();
+        let chosen = select_views(&cands, 20f64.to_radians(), 3.0);
+        assert!(chosen.contains(&7), "sharpest frame dropped: {chosen:?}");
+        // Indices stay keyframe-ordered and distinct.
+        assert!(chosen.windows(2).all(|w| w[0] < w[1]), "{chosen:?}");
+    }
+
+    #[test]
+    fn auto_budget_scales_with_views_and_clamps() {
+        // The calibration point: the old flat 120 views still yields 150k.
+        assert_eq!(auto_budget(120), 150_000);
+        assert_eq!(auto_budget(300), 375_000);
+        assert_eq!(auto_budget(2), BUDGET_RANGE.0);
+        assert_eq!(auto_budget(100_000), BUDGET_RANGE.1);
     }
 
     fn raw_path(n: u32) -> Vec<(u32, DVec3, DQuat)> {
