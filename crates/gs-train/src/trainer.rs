@@ -107,6 +107,12 @@ const PROBE_VIEWS: usize = 16;
 /// gauge drift accumulated since the last one.
 const PROBE_STEPS_COLD: u32 = 40;
 const PROBE_STEPS_WARM: u32 = 8;
+/// Extra alignment before a probe may count as a plateau strike: a sagging
+/// probe is often the aligner trailing the training gauge (pose refinement
+/// drifts it continuously), not the model declining. Measured: a small
+/// submap's probe fell 20.2 -> 19.2 dB across four strikes and stopped the
+/// run at 45% of its ceiling, 3+ dB short. Only pay this on would-be strikes.
+const PROBE_STEPS_RETRY: u32 = 32;
 
 /// Test-time pose alignment state for a set of held-out views: the aligned
 /// cameras plus their Adam state and GPU-resident targets.
@@ -1246,6 +1252,21 @@ impl Trainer {
     /// peak sits moves with view count, scene size and clip, so the run has to
     /// find it rather than be told it.
     pub fn train(&mut self, ctx: &GpuContext, eval: &[TrainView]) -> u32 {
+        self.train_checkpointed(ctx, eval, 0, &mut |_, _, _| {})
+    }
+
+    /// [`Trainer::train`] with a periodic checkpoint callback: every
+    /// `checkpoint_every` iterations (0 = never) the callback gets a shared
+    /// borrow of the trainer to snapshot interim state — e.g. bake a
+    /// walkable splat.ply so an interrupted run still leaves something to
+    /// view. Kept out of the per-iteration hot path.
+    pub fn train_checkpointed(
+        &mut self,
+        ctx: &GpuContext,
+        eval: &[TrainView],
+        checkpoint_every: u32,
+        on_checkpoint: &mut dyn FnMut(&Self, &GpuContext, u32),
+    ) -> u32 {
         let start = std::time::Instant::now();
         // Probe on a fixed, evenly-strided subset so the signal is consistent
         // across probes and bounded in cost.
@@ -1271,6 +1292,9 @@ impl Trainer {
         let mut ran = self.config.iters;
         for iter in 0..self.config.iters {
             self.step(ctx, iter);
+            if checkpoint_every > 0 && iter > 0 && iter.is_multiple_of(checkpoint_every) {
+                on_checkpoint(self, ctx, iter);
+            }
             if let Some(stop) = self.anneal.map(|a| a.start + a.len)
                 && iter + 1 >= stop
             {
@@ -1295,7 +1319,12 @@ impl Trainer {
                     view.camera.focal = base * self.focal_scale;
                 }
                 self.advance_aligner(ctx, &mut p.aligner, steps);
-                let psnr = self.score(ctx, &p.aligner.views);
+                let mut psnr = self.score(ctx, &p.aligner.views);
+                if psnr <= p.best + self.config.plateau_min_delta {
+                    // Don't let alignment lag masquerade as a plateau.
+                    self.advance_aligner(ctx, &mut p.aligner, PROBE_STEPS_RETRY);
+                    psnr = psnr.max(self.score(ctx, &p.aligner.views));
+                }
                 if psnr > p.best + self.config.plateau_min_delta {
                     p.best = psnr;
                     p.stale = 0;

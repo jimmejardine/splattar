@@ -1250,7 +1250,34 @@ fn train_and_bake(
     // The held-out views double as the plateau probe. They stay held out —
     // the probe only renders and aligns cameras against a frozen model, it
     // never touches the scene, so they are not training signal.
-    let ran = trainer.train(ctx, &eval_views);
+    // Checkpoint bakes: an interrupted add still leaves a walkable splat.
+    // ~1 s each (full readback + 35 MB write) every 2500 iters; tmp+rename
+    // so a concurrent `view` never reads a half-written file.
+    const CHECKPOINT_EVERY: u32 = 2500;
+    let ran = trainer.train_checkpointed(
+        ctx,
+        &eval_views,
+        CHECKPOINT_EVERY,
+        &mut |t, ctx, iter| {
+            let scene = t.read_scene(ctx);
+            let tmp = out.with_extension("ply.tmp");
+            let ok = gs_io::write_3dgs_ply(
+                &tmp,
+                scene.num,
+                &scene.positions,
+                &scene.scales,
+                &scene.quats,
+                &scene.opacities,
+                &scene.sh,
+            )
+            .map_err(anyhow::Error::from)
+            .and_then(|_| std::fs::rename(&tmp, out).map_err(Into::into));
+            match ok {
+                Ok(()) => log::info!("checkpoint splat baked at iteration {iter}"),
+                Err(e) => log::warn!("checkpoint bake failed: {e:#}"),
+            }
+        },
+    );
     let elapsed = start.elapsed();
     let psnr = if eval_views.is_empty() {
         f64::NAN
