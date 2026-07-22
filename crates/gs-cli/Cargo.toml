@@ -13,6 +13,9 @@ path = "src/main.rs"
 [dependencies]
 gs-video = { workspace = true }
 gs-diag = { workspace = true }
+gs-map = { workspace = true }
+gs-kernels = { workspace = true }
+glam = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
 log = { workspace = true }

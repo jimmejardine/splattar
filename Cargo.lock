@@ -781,7 +781,10 @@ dependencies = [
  "anyhow",
  "clap",
  "env_logger",
+ "glam",
  "gs-diag",
+ "gs-kernels",
+ "gs-map",
  "gs-video",
  "log",
 ]
@@ -824,6 +827,22 @@ dependencies = [
  "glam",
  "gs-core",
  "gs-cpu-ref",
+ "gs-wgpu",
+ "log",
+ "pollster",
+ "wgpu",
+]
+
+[[package]]
+name = "gs-map"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytemuck",
+ "glam",
+ "gs-core",
+ "gs-diag",
+ "gs-kernels",
  "gs-wgpu",
  "log",
  "pollster",

@@ -1,0 +1,22 @@
+[package]
+name = "gs-map"
+description = "The surfel map: the scene the tracker aligns against and the mapper updates. Owns the model and renders it to diagnostic panels."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+gs-core = { workspace = true }
+gs-wgpu = { workspace = true }
+pollster = { workspace = true }
+gs-kernels = { workspace = true }
+gs-diag = { workspace = true }
+glam = { workspace = true }
+bytemuck = { workspace = true }
+anyhow = { workspace = true }
+log = { workspace = true }
+wgpu = { workspace = true }
+
+[dev-dependencies]
+pollster = { workspace = true }

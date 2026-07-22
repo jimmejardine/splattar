@@ -63,3 +63,47 @@ Deferred with reasons, not forgotten:
   residual curve at M1 so there is one overlay system rather than two.
 - **No disk trace.** The record's shape should settle before a format is
   committed to; writing it now would mean migrating it at M1 and again at M2.
+
+## M1 — Differentiable render + three-pane diagnostics (2026-07-22)
+
+`gs-cli render` builds a synthetic room, renders it from a known camera and
+from a deliberately displaced one, and shows **frame | render | error**. This is
+what M2's tracker has to close, made visible before the tracker exists.
+
+Carried across the boundary: **`gs-kernels`, `gs-cpu-ref`, `gs-core`,
+`gs-wgpu`**, unchanged. `gs-kernels` needs `gs-core` and `gs-wgpu`; the oracle
+crosses WITH the kernels rather than later, because a kernel without its oracle
+cannot be checked. The gradient checks pass in the new tree: forward, backward,
+aux-loss backward against the CPU oracle, plus binning against its CPU
+reference.
+
+New: **`gs-map`** — the surfel map, and the only thing holding geometry. The
+CPU-side map is separate from its GPU-resident form so it can be built and
+tested with no GPU at all.
+
+**Measured, 3456-surfel room at 480×480 on the RTX 4090:**
+
+| cameras | mean residual | peak |
+|---|---|---|
+| identical | **0.000000** | **0.000000** |
+| offset 0.03 m, 0.4° | 0.017343 | 0.045939 |
+| offset 0.15 m, 2.0° | 0.063867 | 0.074248 |
+
+Two properties this establishes, both prerequisites for M2:
+
+- **Identical cameras agree exactly.** Enforced as a hard check in the headless
+  path, not merely observed: the two renders are the same call with the same
+  inputs, so a non-zero residual would mean the render is not deterministic and
+  every later measurement would be built on sand.
+- **The residual is monotone in displacement.** 0.017 at 0.03 m against 0.064 at
+  0.15 m. Photometric descent needs the residual to fall as the pose improves;
+  if it did not order displacements correctly there would be nothing to descend.
+
+~65 fps for two full renders per step, so the render is not the bottleneck in
+anything that follows.
+
+The synthetic scene is a closed ROOM, not a plane: a fronto-parallel plane can
+be fitted at the wrong scale and still look correct from the bootstrap view,
+which hides exactly the failure that matters. Wall colours are hash-based and
+locally distinct, asserted in a test — a repetitive pattern matches at many
+poses and would let a tracking test pass for the wrong reason.
