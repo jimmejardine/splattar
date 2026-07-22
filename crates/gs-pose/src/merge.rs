@@ -65,8 +65,37 @@ impl Default for MergeConfig {
     }
 }
 
+/// A Sim(3) hypothesis with its fusion pairs and origin label.
+type MergeCandidate = (Sim3G, Vec<(usize, usize)>, &'static str);
+
 fn solved(seg: &VoResult) -> usize {
     seg.keyframe_poses.iter().flatten().count()
+}
+
+/// Indices of voxel-dedup survivors (0.5% of the median centroid distance —
+/// same discipline as the cross-video register path). KLT respawns
+/// re-triangulate the same physical corner ~20×; coincident duplicates let a
+/// degenerate scale→0 Sim(3) out-vote the truth (measured: every real-clip
+/// merge attempt collapsed to scale 0.006–0.05 before this dedup existed).
+fn dedup_indices(pts: &[DVec3]) -> Vec<usize> {
+    if pts.is_empty() {
+        return Vec::new();
+    }
+    let centroid = pts.iter().copied().sum::<DVec3>() / pts.len() as f64;
+    let mut d: Vec<f64> = pts.iter().map(|p| (*p - centroid).length()).collect();
+    d.sort_by(f64::total_cmp);
+    let voxel = (0.005 * d[d.len() / 2]).max(1e-6);
+    let mut seen = std::collections::HashSet::new();
+    (0..pts.len())
+        .filter(|&i| {
+            let p = pts[i];
+            seen.insert((
+                (p.x / voxel).floor() as i64,
+                (p.y / voxel).floor() as i64,
+                (p.z / voxel).floor() as i64,
+            ))
+        })
+        .collect()
 }
 
 /// Merge co-observing segments of one video. Returns the surviving segments
@@ -111,13 +140,17 @@ fn try_merge(
     if b.landmarks.len() < cfg.min_inliers || a.landmarks.len() < cfg.min_inliers {
         return None;
     }
-    // Descriptor match B→A, cross-checked, then covisibility-vote filter.
-    let raw = match_descriptors(
-        &b.landmark_desc,
-        &a.landmark_desc,
-        cfg.max_desc_dist,
-        cfg.ratio,
-    );
+    // Descriptor match B→A over voxel-DEDUPED landmark sets (duplicates make
+    // the Sim(3) collapse degenerate), cross-checked, then vote-filtered.
+    let keep_b = dedup_indices(&b.landmarks);
+    let keep_a = dedup_indices(&a.landmarks);
+    let desc_b: Vec<_> = keep_b.iter().map(|&i| b.landmark_desc[i]).collect();
+    let desc_a: Vec<_> = keep_a.iter().map(|&i| a.landmark_desc[i]).collect();
+    let raw: Vec<(usize, usize)> =
+        match_descriptors(&desc_b, &desc_a, cfg.max_desc_dist, cfg.ratio)
+            .into_iter()
+            .map(|(bi, aj)| (keep_b[bi], keep_a[aj]))
+            .collect();
     const BUCKET: usize = 8;
     let mut votes: std::collections::HashMap<(usize, usize), usize> =
         std::collections::HashMap::new();
@@ -142,62 +175,130 @@ fn try_merge(
         return None;
     }
 
-    // Sim(3) B→A over the matched 3D pairs; threshold from the A-side spread.
+    // Rung a — Sim(3) B→A over matched 3D pairs (A-side spread threshold).
     let b_pts: Vec<DVec3> = matches.iter().map(|&(bi, _)| b.landmarks[bi]).collect();
     let a_pts: Vec<DVec3> = matches.iter().map(|&(_, aj)| a.landmarks[aj]).collect();
     let centroid = a_pts.iter().copied().sum::<DVec3>() / a_pts.len() as f64;
     let mut d: Vec<f64> = a_pts.iter().map(|p| (*p - centroid).length()).collect();
     d.sort_by(f64::total_cmp);
     let thresh = (cfg.thresh_frac * d[d.len() / 2]).max(1e-9);
-    let (s, inliers) = register_point_sets_bounded(
+
+    let mut candidates: Vec<MergeCandidate> = Vec::new();
+    if let Some((s, inliers)) = register_point_sets_bounded(
         &b_pts,
         &a_pts,
         cfg.ransac_iters,
         thresh,
         0x536567,
         cfg.scale_bounds,
-    )?;
-    // Degeneracy gate: inliers must span real 3D structure, not one corner.
-    let inl_a: Vec<DVec3> = inliers.iter().map(|&i| a_pts[i]).collect();
-    let cen = inl_a.iter().copied().sum::<DVec3>() / inl_a.len() as f64;
-    let spread = (inl_a
-        .iter()
-        .map(|p| (*p - cen).length_squared())
-        .sum::<f64>()
-        / inl_a.len() as f64)
-        .sqrt();
-    log::info!(
-        "segment merge Sim(3): {}/{} inliers, scale {:.3}, spread {:.3} vs thresh {:.3}",
-        inliers.len(),
-        matches.len(),
-        s.scale,
-        spread,
-        thresh
-    );
-    if inliers.len() < cfg.min_inliers || spread <= 4.0 * thresh {
-        log::info!("segment merge rejected: weak consensus");
-        return None;
+    ) {
+        // Degeneracy gate: inliers must span real structure, not one corner.
+        let inl_a: Vec<DVec3> = inliers.iter().map(|&i| a_pts[i]).collect();
+        let cen = inl_a.iter().copied().sum::<DVec3>() / inl_a.len() as f64;
+        let spread = (inl_a
+            .iter()
+            .map(|p| (*p - cen).length_squared())
+            .sum::<f64>()
+            / inl_a.len() as f64)
+            .sqrt();
+        log::info!(
+            "segment merge 3D-3D: {}/{} inliers, scale {:.3}, spread {:.3} vs thresh {:.3}",
+            inliers.len(),
+            matches.len(),
+            s.scale,
+            spread,
+            thresh
+        );
+        if inliers.len() >= cfg.min_inliers && spread > 4.0 * thresh {
+            let pairs: Vec<(usize, usize)> = inliers.iter().map(|&i| matches[i]).collect();
+            candidates.push((s, pairs, "3D-3D"));
+        }
     }
 
-    // Fuse into A's gauge; duplicate landmarks (the inlier matches) union
-    // their observation lists so revisit constraints actually meet in BA.
-    let inlier_pairs: Vec<(usize, usize)> = inliers.iter().map(|&i| matches[i]).collect();
-    let mut merged = fuse(a, b, &s, &inlier_pairs);
-
-    // Joint BA over the union — the final arbiter. A wrong Sim(3) cannot
-    // reprojection-converge across both segments' observations.
-    let rms_px = joint_refine(&mut merged, intr, cfg.ba_iters);
-    if !rms_px.is_finite() || rms_px > cfg.max_rms_px {
-        log::info!("segment merge rejected: joint BA rms {rms_px:.2} px > {} px", cfg.max_rms_px);
-        return None;
+    // Rung b — 2D bridge: B landmark depths are the noisiest part of a
+    // boundary reconstruction; solving from B's IMAGE observations against
+    // A's 3D sidesteps them. Try the B keyframes with the most matches.
+    if candidates.is_empty() {
+        let mut by_kf: std::collections::HashMap<usize, Vec<(usize, usize)>> =
+            std::collections::HashMap::new();
+        for &(bi, aj) in &matches {
+            by_kf.entry(b.landmark_obs[bi].0).or_default().push((bi, aj));
+        }
+        let mut kfs: Vec<_> = by_kf.into_iter().filter(|(_, v)| v.len() >= 8).collect();
+        kfs.sort_by_key(|(_, v)| std::cmp::Reverse(v.len()));
+        for (kf, pairs_at_kf) in kfs.into_iter().take(3) {
+            let Some(kp) = b.keyframe_poses.get(kf).and_then(|p| p.as_ref()) else {
+                continue;
+            };
+            let obs: Vec<crate::sim3::BridgeObs> = pairs_at_kf
+                .iter()
+                .map(|&(bi, aj)| crate::sim3::BridgeObs {
+                    obs: (
+                        (b.landmark_obs[bi].1.0 as f64 - intr.cx) / intr.focal,
+                        (b.landmark_obs[bi].1.1 as f64 - intr.cy) / intr.focal,
+                    ),
+                    world: a.landmarks[aj],
+                    seg: b.landmarks[bi],
+                })
+                .collect();
+            let q = kp.pose.r;
+            let rot = glam::DQuat::from_xyzw(q.i, q.j, q.k, q.w);
+            let t = glam::DVec3::new(kp.pose.t[0], kp.pose.t[1], kp.pose.t[2]);
+            if let Some((s, consensus)) =
+                crate::sim3::sim3_from_bridge(rot, t, &obs, 3.0 / intr.focal, 0xB41D6E)
+            {
+                // Fusion pairs from 3D agreement under the bridge transform
+                // (loose tol — B depths are noisy; joint BA is the arbiter).
+                let fusion: Vec<(usize, usize)> = matches
+                    .iter()
+                    .copied()
+                    .filter(|&(bi, aj)| {
+                        (s.apply(b.landmarks[bi]) - a.landmarks[aj]).length() < 10.0 * thresh
+                    })
+                    .collect();
+                log::info!(
+                    "segment merge bridge @kf{kf}: consensus {consensus}/{}, scale {:.3}, {} fusion pairs",
+                    obs.len(),
+                    s.scale,
+                    fusion.len()
+                );
+                if consensus >= 8 && fusion.len() >= 10 {
+                    candidates.push((s, fusion, "bridge"));
+                    break;
+                }
+            }
+        }
     }
-    log::info!(
-        "segment merge ACCEPTED: {} + {} kf -> one gauge, joint rms {:.2} px",
-        solved(a),
-        solved(b),
-        rms_px
-    );
-    Some(merged)
+
+    for (s, pairs, label) in candidates {
+        // Without fused duplicate landmarks the joint BA decomposes into two
+        // independent problems and the RMS gate is vacuous — never accept
+        // a merge with too few shared observations.
+        if pairs.len() < 10 {
+            continue;
+        }
+        // Fuse into A's gauge; duplicates union their observation lists so
+        // revisit constraints actually meet in one problem.
+        let mut merged = fuse(a, b, &s, &pairs);
+        // Joint BA over the union — the final arbiter. A wrong Sim(3) cannot
+        // reprojection-converge across both segments' observations.
+        let rms_px = joint_refine(&mut merged, intr, cfg.ba_iters);
+        if !rms_px.is_finite() || rms_px > cfg.max_rms_px {
+            log::info!(
+                "segment merge [{label}] rejected: joint BA rms {rms_px:.2} px > {} px",
+                cfg.max_rms_px
+            );
+            continue;
+        }
+        log::info!(
+            "segment merge ACCEPTED [{label}]: {} + {} kf -> one gauge, joint rms {:.2} px",
+            solved(a),
+            solved(b),
+            rms_px
+        );
+        return Some(merged);
+    }
+    None
 }
 
 /// Build the fused VoResult: B's poses and landmarks mapped through `s`
