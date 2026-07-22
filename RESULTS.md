@@ -587,3 +587,59 @@ the solve for fast hammering — diff two runs to the first divergent
 frame; the hash column attributes it to pixels vs tracking state. An
 absolute mass-death tripwire was tried and removed: 30–50% single-frame
 track loss is NORMAL during fast pans on this footage.
+
+### RE-EVALUATION after the normal-loss fix (2026-07-22)
+
+Every M7 refinement/quality conclusion above was measured on the broken
+trainer (normal loss ~4e5× too strong from geo_start=1500, so anything past
+~1500 iters was being actively destroyed). Re-ran the ablations against the
+fixed trainer. Testbeds: mip-NeRF360 `room` (perfect COLMAP poses, isolates
+the trainer) and 600 frames of 1.mp4 @ 239×425 (the exact clip the historical
+21.16 dB came from; pose-aligned held-out).
+
+**room (perfect poses), held-out:**
+
+| iters | geo off | geo on (0.001/0.05) |
+|---|---|---|
+| 3k | 22.00 | — |
+| 7k | 27.44 | 27.26 |
+| 30k | 29.35 | 29.73 |
+
+**1.mp4 (full stack unless noted), pose-aligned held-out:**
+
+| config | PSNR |
+|---|---|
+| baseline (no pose, no appear), 7k | 19.88 |
+| + pose refinement, 7k | 21.33 |
+| + appearance, 7k | 21.42 |
+| full, 3k / 7k / 15k / 30k | 19.82 / 21.42 / **22.17** / 21.25 |
+| full 30k, mcmc_noise=0 | **22.33** |
+| full + geo (0.001/0.05), 7k | 21.12 |
+
+**Conclusions, re-evaluated:**
+
+| Prior conclusion | Prior | Now | Verdict |
+|---|---|---|---|
+| Pose refinement helps | +1.53 dB | +1.45 dB | CONFIRMED — keep |
+| Appearance compensation | +0.8–2.1 dB | +0.09 (7k) / +0.33 (15k) | OVERTURNED — was masking geo damage |
+| Long runs DEGRADE (21→16.6) | degrade past 3k | improve to ~15k then plateau | OVERTURNED — was the geo bug |
+| Async-trainer plateau ~16.5–17.8 dB | blamed readback lag | those were 7k geo-on runs; fixed = 21.4 @ 7k | OVERTURNED — geo bug, not async |
+| 24 dB gate unreachable | open at 20.3 | room 27–30 (PASSES); video 22.3 peak | room passes; video resolution-limited |
+| "geo_bench exonerated the kernels; collapse = scene evolution" | exonerated | the collapse WAS the normal-loss weighting | OVERTURNED |
+| MCMC extent-scaled noise trap | prime suspect, unverified | CONFIRMED at long runs only (30k: 21.25→22.33 with noise off); invisible at ≤15k | CONFIRMED |
+| Geo losses help held-out | assumed | neutral (room) / slightly negative (video); value is M9 mesh geometry, not PSNR | REFRAMED |
+
+**Net:** the trainer is healthy. room clears the 24 dB gate; the ~1.7 dB video
+gap is the tiny 239×425 target and monocular pose noise, not a defect.
+Appearance compensation and (for held-out PSNR) the geometry losses are no
+longer justified by the numbers — pose refinement is the one refinement that
+earns its place.
+
+**Follow-ups warranted (not yet done):**
+1. Scale MCMC exploration noise by scene **depth**, not extent (same fix
+   already applied to the pose-center LR) — removes the long-run trap so
+   noise>0 can keep helping early densification without the 30k regression.
+2. Reconsider whether appearance compensation and the geometry losses belong
+   on by default on the `add` path (both are ~neutral-to-negative for
+   held-out PSNR now; geo losses stay relevant for M9 meshing).
+3. `add` default iters raised 4000 → 7000 (quality now rises with length).

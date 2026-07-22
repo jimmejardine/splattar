@@ -80,7 +80,10 @@ enum Command {
         focal: Option<f64>,
         #[arg(long, default_value_t = 0)]
         max_frames: u32,
-        #[arg(long, default_value_t = 4000)]
+        // Quality rises monotonically to ~15k on real video now that the
+        // geo-loss weighting is fixed (RESULTS.md 2026-07-22); 4000 was tuned
+        // when more iterations made things worse. 7000 balances quality/time.
+        #[arg(long, default_value_t = 7000)]
         iters: u32,
         #[arg(long, default_value_t = 150_000)]
         budget: u32,
