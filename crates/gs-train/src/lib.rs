@@ -6,10 +6,12 @@ pub mod appearance;
 pub mod init;
 pub mod normal_loss;
 pub mod optim;
+pub mod plane_sweep;
 pub mod ssim;
 pub mod trainer;
 
 pub use init::{init_from_sfm_points, upsample_to_budget};
+pub use plane_sweep::{DepthMap, PlaneSweep, SweepOptions, init_from_plane_sweep};
 pub use normal_loss::NormalLoss;
 pub use optim::{Activation, Optimizer};
 pub use ssim::SsimLoss;
