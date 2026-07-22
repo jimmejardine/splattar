@@ -819,11 +819,16 @@ fn auto_budget(views: usize) -> u32 {
     (SURFELS_PER_VIEW.saturating_mul(views as u32)).clamp(BUDGET_RANGE.0, BUDGET_RANGE.1)
 }
 
-/// Gradient visits per view behind the auto iteration ceiling, calibrated so
-/// the historical 105 train views still yields ~7000. This is only a CEILING
+/// Gradient visits per view behind the auto iteration ceiling. Only a CEILING
 /// and the LR schedule's length — the run stops when the held-out probe stops
-/// improving, so setting it generously costs nothing but leaves headroom.
-const ITERS_PER_VIEW: u32 = 67;
+/// improving, so a generous value costs nothing except when the plateau never
+/// arrives.
+///
+/// 150 reproduces the ~15k peak RESULTS.md measured at ~105 views, and the
+/// probe trace agrees: at 67/view (the value that merely reproduced the old
+/// flat 7000) held-out was still climbing 18.2 → 23.8 dB when it hit the
+/// ceiling, having gone at most one probe without a gain.
+const ITERS_PER_VIEW: u32 = 150;
 const ITERS_RANGE: (u32, u32) = (3_000, 40_000);
 
 fn auto_iters(views: usize) -> u32 {
@@ -1245,7 +1250,7 @@ fn train_and_bake(
     // The held-out views double as the plateau probe. They stay held out —
     // the probe only renders and aligns cameras against a frozen model, it
     // never touches the scene, so they are not training signal.
-    let ran = trainer.train_probed(ctx, &eval_views);
+    let ran = trainer.train(ctx, &eval_views);
     let elapsed = start.elapsed();
     let psnr = if eval_views.is_empty() {
         f64::NAN
@@ -3267,7 +3272,7 @@ fn train(dataset: &std::path::Path, opts: TrainCliOpts) -> anyhow::Result<()> {
     };
     let mut trainer = Trainer::new(&ctx, ds.width, ds.height, train_views, init, config);
     let start = std::time::Instant::now();
-    trainer.train(&ctx);
+    trainer.train(&ctx, &[]);
     let elapsed = start.elapsed();
 
     if !eval_views.is_empty() {

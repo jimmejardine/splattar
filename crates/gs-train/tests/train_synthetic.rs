@@ -142,7 +142,7 @@ fn trains_synthetic_scene_from_scratch() {
     };
     let mut trainer = Trainer::new(&ctx, SIZE, SIZE, train_views, init, config);
     let start_psnr = trainer.eval_psnr(&ctx, &eval_views);
-    trainer.train(&ctx);
+    trainer.train(&ctx, &[]);
     let psnr = trainer.eval_psnr(&ctx, &eval_views);
     eprintln!("held-out PSNR: {start_psnr:.2} dB → {psnr:.2} dB (gate: > 27 dB)");
     assert!(
@@ -215,7 +215,7 @@ fn trains_with_m4_features_enabled() {
         ..Default::default()
     };
     let mut trainer = Trainer::new(&ctx, SIZE, SIZE, train_views, init, config);
-    trainer.train(&ctx);
+    trainer.train(&ctx, &[]);
     let psnr = trainer.eval_psnr(&ctx, &eval_views);
     eprintln!("M4-featured held-out PSNR: {psnr:.2} dB (gate: > 26 dB)");
     assert!(psnr > 26.0, "M4-featured training regressed: {psnr:.2} dB");
@@ -303,7 +303,7 @@ fn pose_refinement_recovers_perturbed_poses() {
             init,
             config,
         );
-        trainer.train(&ctx);
+        trainer.train(&ctx, &[]);
         trainer.eval_psnr(&ctx, &eval_views)
     };
 
@@ -386,7 +386,7 @@ fn appearance_compensation_recovers_exposure_swings() {
         };
         let mut trainer =
             Trainer::new(&ctx, SIZE, SIZE, train_views.clone(), init, config);
-        trainer.train(&ctx);
+        trainer.train(&ctx, &[]);
         // Eval targets are clean, so plain PSNR is the honest metric here.
         trainer.eval_psnr(&ctx, &eval_views)
     };
@@ -473,7 +473,7 @@ fn adaptive_stop_engages_and_shortens_the_run() {
     };
     let init = random_surfels(0x12345, N_TRAIN, 1.2, false);
     let mut trainer = Trainer::new(&ctx, SIZE, SIZE, train_views, init, config);
-    let ran = trainer.train_probed(&ctx, &eval_views);
+    let ran = trainer.train(&ctx, &eval_views);
     let psnr = trainer.eval_psnr(&ctx, &eval_views);
     eprintln!("adaptive run: stopped at {ran}/{ceiling} iters, held-out {psnr:.2} dB");
 

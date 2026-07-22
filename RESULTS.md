@@ -712,3 +712,57 @@ whole stretch with near-zero supervision, where the surfels stay close to
 their SfM-init state. Scaling `max_views` (and the fixed 150k surfel budget)
 with submap size, and selecting by pose spacing rather than elapsed time, is
 the follow-up.
+
+### Coverage, model size and run length now follow the submap (2026-07-22)
+
+Three flat constants decided how much work a submap got regardless of how
+much scene it covered: 120 training views, a 150k surfel budget, and 7000
+iterations. Real submaps on the back-room clip carry 1749 / 776 / 272
+keyframes, so all three were badly mis-sized, and view selection was
+uniform in *time* (sharpest keyframe per 0.25 s) rather than in space —
+spending the budget where the operator lingered instead of where the scene
+is.
+
+Views are now spaced by **apparent view change** (rotation plus
+translation-over-median-scene-depth, one currency; `--view-spacing`,
+default 8°), the surfel budget follows the view count, and `--iters` became
+a *ceiling* with the run stopping when a held-out probe plateaus.
+
+**Back-room clip (3.mp4), per submap, at the intermediate step (spacing +
+auto budget, iters still flat at 7000):**
+
+| submap | keyframes | views (was 120) | budget (was 150k) | held-out |
+|---|---|---|---|---|
+| 0 | 1749 | 311 | 340k | 17.11 dB (was 16.73) |
+| 1 | 776 | 165 | 180k | 20.55 dB |
+| 2 | 272 | 77 | 84k | 23.96 dB |
+
+Note the eval set is NOT held constant across the 120-view and 311-view
+runs — more views means held-out views sample more of the scene, including
+the previously starved stretches. The two PSNR numbers are not strictly
+comparable and the +0.38 dB understates the change.
+
+**1.mp4, 900 frames, with adaptive stopping (117 views, 127.5k surfels):
+23.77 dB**, against 22.99 dB for the old flat 120 views / 150k / 7000 —
+better on a *smaller* model.
+
+**The probe trace is the useful artifact.** submap-0 climbed 18.23 → 18.63
+→ 20.26 → 20.80 → 20.85 → 22.43 → 22.54 → 22.28 → 23.14 → 23.33 → 23.71 →
+23.66 → 23.76 dB over 13 probes and never plateaued (at most one probe
+without a gain) before hitting the ceiling — so the ceiling, not
+convergence, was binding. `ITERS_PER_VIEW` was therefore raised 67 → 150,
+which reproduces the ~15k peak this file already measured at ~105 views.
+A 12-view submap by contrast reached 3/4 patience by iteration 2500,
+confirming the detector fires when there is genuinely nothing left.
+
+Gauge drift also fell as coverage rose (more views constrain the gauge):
+|Δpos| median 0.2675 → 0.1077 on submap-0, and raw-pose held-out gained
+~2 dB. Drift is now reported as the **view swing** it causes at the median
+scene depth (≈0.3°), not as a multiple of the keyframe step — that
+normalizer was degenerate, since flow-promoted keyframes during a pan sit
+at near-zero baseline and drove the median step to 0.0001.
+
+**Caveat on the defaults:** 8° spacing and 1250 surfels/view are reasoned,
+not ablated. 150 iters/view is now evidence-based but from one clip. The
+plateau detector makes a too-generous ceiling cheap, so the ceiling is the
+safest of the three to be wrong about.

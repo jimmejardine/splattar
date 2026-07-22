@@ -127,9 +127,7 @@ struct PoseAligner {
 /// cold frozen-pose eval mostly reports accumulated gauge drift, which falls
 /// monotonically and would trip the detector for the wrong reason.
 struct Probe {
-    /// `None` only while detached for the duration of a probe — the aligner
-    /// and `&mut self` cannot be borrowed at once.
-    aligner: Option<PoseAligner>,
+    aligner: PoseAligner,
     /// Focal each probe view was built with, before the trainer's refinement.
     base_focal: Vec<f32>,
     best: f64,
@@ -1239,11 +1237,6 @@ impl Trainer {
         }
     }
 
-    /// Fixed-length run to `config.iters`. Returns iterations run.
-    pub fn train(&mut self, ctx: &GpuContext) -> u32 {
-        self.train_probed(ctx, &[])
-    }
-
     /// Train to `config.iters`, or stop earlier when held-out quality stops
     /// improving. Returns the number of iterations actually run.
     ///
@@ -1252,7 +1245,7 @@ impl Trainer {
     /// shape for this problem: quality peaks and then decays, and where the
     /// peak sits moves with view count, scene size and clip, so the run has to
     /// find it rather than be told it.
-    pub fn train_probed(&mut self, ctx: &GpuContext, eval: &[TrainView]) -> u32 {
+    pub fn train(&mut self, ctx: &GpuContext, eval: &[TrainView]) -> u32 {
         let start = std::time::Instant::now();
         // Probe on a fixed, evenly-strided subset so the signal is consistent
         // across probes and bounded in cost.
@@ -1270,7 +1263,7 @@ impl Trainer {
             );
             Probe {
                 base_focal: subset.iter().map(|v| v.camera.focal).collect(),
-                aligner: Some(self.new_aligner(ctx, &subset)),
+                aligner: self.new_aligner(ctx, &subset),
                 best: f64::NEG_INFINITY,
                 stale: 0,
             }
@@ -1290,9 +1283,7 @@ impl Trainer {
                 && iter > 0
                 && iter.is_multiple_of(self.config.eval_every)
             {
-                // Detach so the aligner and `self` are not borrowed at once.
-                let mut a = p.aligner.take().expect("aligner is only None mid-probe");
-                let steps = if a.t == 0 {
+                let steps = if p.aligner.t == 0 {
                     PROBE_STEPS_COLD
                 } else {
                     PROBE_STEPS_WARM
@@ -1300,13 +1291,11 @@ impl Trainer {
                 // The shared focal is refined during training, so the probe's
                 // cameras have to track it or the measurement drifts down for
                 // a reason that has nothing to do with model quality.
-                for (view, base) in a.views.iter_mut().zip(&p.base_focal) {
+                for (view, base) in p.aligner.views.iter_mut().zip(&p.base_focal) {
                     view.camera.focal = base * self.focal_scale;
                 }
-                self.advance_aligner(ctx, &mut a, steps);
-                let psnr = self.score(ctx, &a.views);
-                let p = probe.as_mut().expect("probe present in this branch");
-                p.aligner = Some(a);
+                self.advance_aligner(ctx, &mut p.aligner, steps);
+                let psnr = self.score(ctx, &p.aligner.views);
                 if psnr > p.best + self.config.plateau_min_delta {
                     p.best = psnr;
                     p.stale = 0;
