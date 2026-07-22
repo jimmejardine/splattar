@@ -627,3 +627,121 @@ fn add_view_refuses_past_reserved_capacity() {
         "second append must be refused, not silently dropped"
     );
 }
+
+/// Two-tier mapping's load-bearing assumption: a map built under provisional
+/// poses must SURVIVE being corrected when the real poses land.
+///
+/// Simulated by training to convergence, then displacing every surfel by a
+/// known Sim(3) and correcting the cameras by the same amount — the situation
+/// a background anchor-out re-solve creates. The corrected model must be
+/// recoverable by continued training rather than needing to be rebuilt; if it
+/// is not, the whole two-tier architecture is unsound and a live map would
+/// have to be discarded every time better poses arrived.
+#[test]
+fn a_map_survives_a_pose_correction() {
+    let Some(ctx) = context() else { return };
+
+    let gt = random_surfels(0xfeedbeef, N_GT, 1.2, true);
+    let gt_raster = Rasterizer::new(&ctx, N_GT as u32, SIZE, SIZE, (N_GT * 64) as u32);
+    gt_raster.upload_scene(
+        &ctx,
+        &SceneInput {
+            positions: &gt.positions,
+            scales: &gt.scales,
+            quats: &gt.quats,
+            opacities: &gt.opacities,
+            sh: &gt.sh,
+            sh_coeffs: 1,
+        },
+    );
+    let render_gt = |camera: &RasterCamera| -> Vec<[f32; 4]> {
+        let mut encoder = ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        gt_raster.forward(&ctx, &mut encoder, camera, N_GT as u32);
+        ctx.queue.submit([encoder.finish()]);
+        bytemuck::cast_slice(&gs_wgpu::buffers::readback(
+            &ctx.device,
+            &ctx.queue,
+            &gt_raster.out_color,
+        ))
+        .to_vec()
+    };
+
+    let mut train_views = Vec::new();
+    let mut eval_views = Vec::new();
+    for i in 0..35 {
+        let angle = i as f32 / 35.0 * std::f32::consts::TAU;
+        let camera = orbit_camera(angle, 1.0 + (i % 3) as f32 * 0.5, 4.0);
+        let view = TrainView {
+            target: render_gt(&camera),
+            camera,
+        };
+        if i % 7 == 3 {
+            eval_views.push(view);
+        } else {
+            train_views.push(view);
+        }
+    }
+
+    let mut t = Trainer::new(
+        &ctx,
+        SIZE,
+        SIZE,
+        train_views,
+        random_surfels(0x12345, N_TRAIN, 1.2, false),
+        TrainConfig {
+            iters: 5000,
+            log_every: 5000,
+            ..Default::default()
+        },
+    );
+    for iter in 0..4000 {
+        t.step(&ctx, iter);
+    }
+    let before = t.eval_psnr(&ctx, &eval_views);
+
+    // The correction: a real rotation and translation, of the magnitude a
+    // provisional-to-solved pose update produces.
+    let rot = glam::Quat::from_rotation_y(0.12) * glam::Quat::from_rotation_x(0.05);
+    let trans = Vec3::new(0.15, -0.08, 0.11);
+    let n = t.num_surfels;
+    t.transform_surfels(&ctx, 0..n, rot, trans, 1.0);
+    // Cameras move by the same Sim(3), so the scene is unchanged RELATIVE to
+    // them — a correct transform leaves rendered quality intact.
+    for v in t.views.iter_mut() {
+        v.camera.center = rot * v.camera.center + trans;
+        v.camera.quat = rot * v.camera.quat;
+    }
+    let mut moved_eval = eval_views.clone();
+    for v in moved_eval.iter_mut() {
+        v.camera.center = rot * v.camera.center + trans;
+        v.camera.quat = rot * v.camera.quat;
+    }
+    let after = t.eval_psnr(&ctx, &moved_eval);
+    eprintln!("pose correction: {before:.2} dB -> {after:.2} dB (same relative geometry)");
+
+    // The transform is a rigid motion of scene AND cameras together, so the
+    // rendered result must be essentially unchanged. This is what makes the
+    // correction a warm start rather than a rebuild.
+    //
+    // Note this runs at SH degree 0 (TrainConfig::default has sh_promote_every
+    // = 0), so it does NOT cover the un-rotated higher SH bands documented on
+    // transform_surfels. A correction with view-dependent colour in play will
+    // lose a little that descent must re-fit.
+    assert!(
+        (after - before).abs() < 0.5,
+        "surfel transform did not match the camera transform: {before:.2} -> {after:.2}"
+    );
+
+    // And training continues from there rather than having to start over.
+    for iter in 4000..5000 {
+        t.step(&ctx, iter);
+    }
+    let resumed = t.eval_psnr(&ctx, &moved_eval);
+    eprintln!("after 1000 more iterations: {resumed:.2} dB");
+    assert!(
+        resumed > after - 0.5,
+        "training did not resume cleanly after the correction: {after:.2} -> {resumed:.2}"
+    );
+}

@@ -138,6 +138,94 @@ struct PoseAligner {
     view_bytes: u64,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct XfParams {
+    rot: [f32; 4],
+    trans: [f32; 4],
+    scale: f32,
+    lo: u32,
+    hi: u32,
+    _pad: u32,
+}
+
+/// Sim(3) transform of a surfel index range (see [`Trainer::transform_surfels`]).
+struct TransformKernel {
+    params_pipeline: wgpu::ComputePipeline,
+    moments_pipeline: wgpu::ComputePipeline,
+    params_bg: wgpu::BindGroup,
+    moments_bg: wgpu::BindGroup,
+    uniform: wgpu::Buffer,
+}
+
+impl TransformKernel {
+    fn new(ctx: &GpuContext, optim: &Optimizer) -> Self {
+        let device = &ctx.device;
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("surfel-transform"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/transform.wgsl").into()),
+        });
+        let make = |entry: &str| {
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some(entry),
+                layout: None,
+                module: &module,
+                entry_point: Some(entry),
+                compilation_options: Default::default(),
+                cache: None,
+            })
+        };
+        let params_pipeline = make("transform_params");
+        let moments_pipeline = make("transform_moments");
+        let uniform = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("transform-uniform"),
+            size: std::mem::size_of::<XfParams>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        fn bind(binding: u32, buffer: &wgpu::Buffer) -> wgpu::BindGroupEntry<'_> {
+            wgpu::BindGroupEntry {
+                binding,
+                resource: buffer.as_entire_binding(),
+            }
+        }
+        let params_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("transform-params-bg"),
+            layout: &params_pipeline.get_bind_group_layout(0),
+            entries: &[
+                bind(0, &uniform),
+                bind(1, &optim.class("pos").raw),
+                bind(2, &optim.class("scales").raw),
+                bind(3, &optim.class("quat").raw),
+            ],
+        });
+        let moments_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("transform-moments-bg"),
+            layout: &moments_pipeline.get_bind_group_layout(0),
+            entries: &[
+                bind(0, &uniform),
+                bind(4, &optim.class("pos").m),
+                bind(5, &optim.class("pos").v),
+                bind(6, &optim.class("scales").m),
+                bind(7, &optim.class("scales").v),
+                bind(8, &optim.class("quat").m),
+                bind(9, &optim.class("quat").v),
+                bind(10, &optim.class("opacity").m),
+                bind(11, &optim.class("opacity").v),
+                bind(12, &optim.class("sh").m),
+                bind(13, &optim.class("sh").v),
+            ],
+        });
+        Self {
+            params_pipeline,
+            moments_pipeline,
+            params_bg,
+            moments_bg,
+            uniform,
+        }
+    }
+}
+
 /// Plateau-detection state: a warm-kept pose aligner over a held-out subset,
 /// plus the best score seen and how many probes have passed without beating
 /// it. Keeping the alignment warm is what makes the measurement honest — a
@@ -298,6 +386,8 @@ pub struct Trainer {
     /// extent (a long walkthrough's extent is ~30× the room depth).
     probe_positions: Vec<Vec3>,
     pose_depth: Vec<f32>,
+    /// Sim(3) correction of a surfel range (two-tier pose updates).
+    transform: TransformKernel,
     /// Set once the held-out probe plateaus: the LR schedule's remaining decay
     /// is compressed into a short tail and the run ends.
     anneal: Option<Anneal>,
@@ -605,6 +695,7 @@ impl Trainer {
         ctx.queue.submit([encoder.finish()]);
 
         let relocate = RelocateKernel::new(ctx, n, &optim, &raster.opacities);
+        let transform = TransformKernel::new(ctx, &optim);
         let seed = config.seed;
         let n_views = views.len();
         Self {
@@ -625,6 +716,7 @@ impl Trainer {
             pose_t: vec![0; n_views],
             focal_state: (0.0, 0.0, 0),
             anneal: None,
+            transform,
             focal_scale: 1.0,
             probe_positions,
             pose_depth: vec![0.0; n_views],
@@ -673,6 +765,85 @@ impl Trainer {
         };
         self.pose_depth[view_idx] = d.max(1e-3);
         self.pose_depth[view_idx]
+    }
+
+    /// Move a contiguous surfel range by a Sim(3), in place.
+    ///
+    /// The two-tier mapping requirement. Surfels spawned while a keyframe
+    /// window only had provisional poses sit in the wrong frame once
+    /// anchor-out re-solves it; discarding them would throw away every
+    /// iteration spent on them, so they are moved with the correction and
+    /// training continues from a warm start.
+    ///
+    /// An index range is a sound way to name "the surfels that window
+    /// spawned": MCMC relocation never moves a surfel to a different index —
+    /// it overwrites DEAD slots with copies of alive ones — so an alive
+    /// surfel keeps its index for life.
+    ///
+    /// Adam moments over the range are zeroed. The accumulated history
+    /// describes a position the surfel no longer occupies, and carrying it
+    /// across the jump would push the optimizer in a direction that only made
+    /// sense in the old frame.
+    ///
+    /// LIMITATION: SH bands above degree 0 are NOT rotated — the same v1
+    /// simplification `compose_project` makes for rotated submaps. View
+    /// dependent colour is therefore slightly wrong after a correction with a
+    /// large rotation, and descent has to re-fit it. Rotating SH properly
+    /// needs Wigner-D matrices; until then, keep corrections small or expect
+    /// the specular component to be relearned.
+    pub fn transform_surfels(
+        &mut self,
+        ctx: &GpuContext,
+        range: std::ops::Range<u32>,
+        rot: glam::Quat,
+        trans: Vec3,
+        scale: f32,
+    ) {
+        let hi = range.end.min(self.num_surfels);
+        if range.start >= hi {
+            return;
+        }
+        let xf = XfParams {
+            rot: rot.normalize().to_array(),
+            trans: trans.extend(0.0).to_array(),
+            scale,
+            lo: range.start,
+            hi,
+            _pad: 0,
+        };
+        ctx.queue
+            .write_buffer(&self.transform.uniform, 0, bytemuck::bytes_of(&xf));
+        let n = hi - range.start;
+        let mut encoder = ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("transform-surfels"),
+            });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("transform-params"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.transform.params_pipeline);
+            pass.set_bind_group(0, &self.transform.params_bg, &[]);
+            pass.dispatch_workgroups(n.div_ceil(256), 1, 1);
+        }
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("transform-moments"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.transform.moments_pipeline);
+            pass.set_bind_group(0, &self.transform.moments_bg, &[]);
+            pass.dispatch_workgroups(n.div_ceil(256), 1, 1);
+        }
+        // The optimizer holds RAW parameters; the rasterizer reads a separate
+        // ACTIVATED copy that only the Adam step refreshes. Without this the
+        // moved surfels would not exist for the renderer until the next step,
+        // so anything rendered in between (a live preview, a held-out probe)
+        // would show the pre-correction scene through post-correction cameras.
+        self.optim.encode_activate(ctx, &mut encoder);
+        ctx.queue.submit([encoder.finish()]);
     }
 
     /// Median scene depth across all views — the scale a camera displacement

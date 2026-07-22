@@ -900,3 +900,36 @@ that is asserted too.
 Not yet built: surfel spawning into the MCMC dead pool, pose-correction of
 already-spawned surfels (the two-tier requirement), the causal provisional-pose
 front-end, and the streaming driver.
+
+### Maps survive pose corrections — two-tier mapping is sound (2026-07-22)
+
+The load-bearing assumption of the two-tier design (provisional poses now,
+anchor-out correction later): a map built under provisional poses must survive
+being corrected, or a live map would have to be discarded every time better
+poses landed.
+
+`Trainer::transform_surfels` applies a Sim(3) to a contiguous surfel range and
+zeroes those surfels' Adam moments. An index range is a sound way to name "what
+this keyframe window spawned" because MCMC relocation never moves a surfel to a
+different index — it overwrites DEAD slots with copies of alive ones, so an
+alive surfel keeps its index for life.
+
+Gate (synthetic, 4000 iterations then a 7° rotation + 0.2-unit translation
+applied to surfels and cameras together): **27.88 dB → 27.88 dB**, exact, and
+training resumes to 28.48 dB over the next 1000 iterations. The correction is a
+warm start, not a rebuild.
+
+**The bug the test caught is worth recording, because nothing else would have
+found it.** The optimizer holds RAW parameters; the rasterizer reads a separate
+ACTIVATED copy that only the Adam step refreshes. Transforming raw alone left
+the renderer showing the pre-correction scene through post-correction
+cameras — a 6 dB drop (27.88 → 21.86) that looked exactly like "the transform
+maths is wrong". It is not; the fix is an `encode_activate` pass. Anything that
+writes raw parameters outside the training step has this hazard, including the
+surfel spawning still to be built.
+
+**Known gap:** SH bands above degree 0 are not rotated, the same v1
+simplification `compose_project` makes for rotated submaps. The gate above runs
+at SH degree 0 and so does not cover it. Correct rotation needs Wigner-D
+matrices; until then a large correction loses view-dependent colour that
+descent must re-fit.
