@@ -640,6 +640,24 @@ fn write_thumbs(
     Ok(())
 }
 
+/// Persist a snapshot of every keyframe the trainer actually saw. Kept out of
+/// `thumbs/` so the pairwise registration stage's candidate set is unchanged;
+/// the viewer merges both directories for its ground-truth overlay.
+fn write_view_thumbs(
+    dir: &std::path::Path,
+    thumbs: &[(u32, image::GrayImage)],
+) -> anyhow::Result<()> {
+    if thumbs.is_empty() {
+        return Ok(());
+    }
+    let tdir = dir.join("view-thumbs");
+    std::fs::create_dir_all(&tdir)?;
+    for (kf, img) in thumbs {
+        img.save(tdir.join(format!("{kf:05}.png")))?;
+    }
+    Ok(())
+}
+
 /// Load one persisted thumbnail as an f32 gray image.
 fn load_thumb(dir: &std::path::Path, kf: u32) -> Option<gs_pose::GrayImage> {
     let img = image::open(dir.join("thumbs").join(format!("{kf:05}.png"))).ok()?;
@@ -651,9 +669,62 @@ fn load_thumb(dir: &std::path::Path, kf: u32) -> Option<gs_pose::GrayImage> {
     })
 }
 
+/// Every ground-truth snapshot available for a submap, keyframe → PNG path.
+/// `view-thumbs/` (one per trained view) wins over `thumbs/` (every 4th
+/// keyframe, the registration set) when both cover a keyframe.
+fn thumbnail_sources(dir: &std::path::Path) -> std::collections::BTreeMap<u32, PathBuf> {
+    let mut out = std::collections::BTreeMap::new();
+    for sub in ["thumbs", "view-thumbs"] {
+        for kf in list_pngs(&dir.join(sub)) {
+            out.insert(kf, dir.join(sub).join(format!("{kf:05}.png")));
+        }
+    }
+    out
+}
+
+/// The camera path the viewer walks. `poses_refined.csv` is the gauge
+/// `splat.ply` is actually in (the trainer refines poses alongside the
+/// surfels); `poses.csv` is the raw VO gauge and only the fallback for
+/// submaps trained before refined poses were persisted.
+fn load_path_poses(
+    dir: &std::path::Path,
+) -> anyhow::Result<Vec<(u32, glam::DVec3, glam::DQuat)>> {
+    let refined = dir.join("poses_refined.csv");
+    let path = if refined.is_file() {
+        refined
+    } else {
+        dir.join("poses.csv")
+    };
+    let text = std::fs::read_to_string(&path)
+        .with_context(|| format!("reading {}", path.display()))?;
+    let mut out = Vec::new();
+    for line in text.lines().skip(1) {
+        let f: Vec<f64> = line
+            .split(',')
+            .take(8)
+            .filter_map(|v| v.parse().ok())
+            .collect();
+        if f.len() != 8 {
+            continue;
+        }
+        out.push((
+            f[0] as u32,
+            glam::DVec3::new(f[1], f[2], f[3]),
+            glam::DQuat::from_xyzw(f[5], f[6], f[7], f[4]).normalize(),
+        ));
+    }
+    out.sort_unstable_by_key(|r| r.0);
+    Ok(out)
+}
+
 /// Thumbnail keyframe indices available in a submap dir.
 fn list_thumbs(dir: &std::path::Path) -> Vec<u32> {
-    let mut out: Vec<u32> = std::fs::read_dir(dir.join("thumbs"))
+    list_pngs(&dir.join("thumbs"))
+}
+
+/// Numeric stems of the PNGs in a directory.
+fn list_pngs(dir: &std::path::Path) -> Vec<u32> {
+    let mut out: Vec<u32> = std::fs::read_dir(dir)
         .map(|rd| {
             rd.filter_map(|e| {
                 e.ok()?
@@ -709,6 +780,13 @@ fn trajectory_csv(vo: &VoOutput) -> String {
 struct Prepared {
     train_views: Vec<gs_train::TrainView>,
     eval_views: Vec<gs_train::TrainView>,
+    /// Keyframe index of each entry in `train_views`, same order. The trainer
+    /// refines these views' poses in place, so this is what maps a refined
+    /// camera back to the keyframe it came from.
+    train_kfs: Vec<u32>,
+    /// Grayscale snapshot of every selected view's keyframe — the viewer's
+    /// ground-truth overlay at exactly the poses the model is fit to.
+    view_thumbs: Vec<(u32, image::GrayImage)>,
     points: Vec<gs_io::SfmPoint>,
     /// Landmarks with descriptors for the project registration DB.
     landmarks: Vec<project::Landmark>,
@@ -861,11 +939,16 @@ fn prepare_training(
     let focal_t = (vo.intrinsics.focal * vo.track_scale as f64 / ds as f64) as f32;
     let mut train_views = Vec::new();
     let mut eval_views = Vec::new();
+    let mut train_kfs = Vec::new();
+    let mut view_thumbs = Vec::new();
     for (slot, &k) in chosen.iter().enumerate() {
         let kp = seg.keyframe_poses[k].as_ref().unwrap();
         let c2w = kp.c2w();
         let m = glam::Mat4::from_cols_array(&c2w.to_cols_array().map(|v| v as f32));
         let (_, rot, trans) = m.to_scale_rotation_translation();
+        let target = images[slot].take().unwrap();
+        // Ground-truth snapshot before the target is moved into the view.
+        view_thumbs.push((k as u32, view_thumb(&target, tw, th, vo.track_size)));
         let view = TrainView {
             camera: RasterCamera {
                 center: trans,
@@ -873,11 +956,12 @@ fn prepare_training(
                 focal: focal_t,
                 sh_degree: 3,
             },
-            target: images[slot].take().unwrap(),
+            target,
         };
         if slot % 8 == 0 {
             eval_views.push(view);
         } else {
+            train_kfs.push(k as u32);
             train_views.push(view);
         }
     }
@@ -889,6 +973,8 @@ fn prepare_training(
     Ok(Prepared {
         train_views,
         eval_views,
+        train_kfs,
+        view_thumbs,
         points,
         landmarks,
         tw: tw as u32,
@@ -896,16 +982,42 @@ fn prepare_training(
     })
 }
 
-/// Train on prepared views and bake a compat .ply. Returns (PSNR, surfels).
+/// Grayscale snapshot of a training target, sized to the same half-tracking
+/// resolution `gs_pose::vo::Thumb` uses (pyramid level 1) so the overlay
+/// treats VO thumbs and view thumbs identically. BT.709 luma, matching the
+/// decoder's YUV→RGB transfer, so these read like the VO snapshots.
+fn view_thumb(
+    target: &[[f32; 4]],
+    tw: usize,
+    th: usize,
+    track_size: (u32, u32),
+) -> image::GrayImage {
+    let gray: Vec<u8> = target
+        .iter()
+        .map(|p| {
+            let y = 0.2126 * p[0] + 0.7152 * p[1] + 0.0722 * p[2];
+            (y * 255.0).clamp(0.0, 255.0) as u8
+        })
+        .collect();
+    let img = image::GrayImage::from_raw(tw as u32, th as u32, gray)
+        .expect("target size matches tw*th");
+    let (dw, dh) = ((track_size.0 / 2).max(1), (track_size.1 / 2).max(1));
+    image::imageops::resize(&img, dw, dh, image::imageops::FilterType::Triangle)
+}
+
+/// Train on prepared views and bake a compat .ply, returning the held-out
+/// score, the surfel count, the refined focal scale, and the refined cameras —
+/// the gauge the baked surfels are actually in.
 fn train_and_bake(
     prepared: Prepared,
     iters: u32,
     budget: u32,
     pose_window: f32,
     out: &std::path::Path,
-) -> anyhow::Result<(f64, usize, f64)> {
+) -> anyhow::Result<TrainOutcome> {
     use gs_train::{TrainConfig, Trainer};
 
+    let train_kfs = prepared.train_kfs.clone();
     let ctx = pollster::block_on(gs_wgpu::GpuContext::new(gs_wgpu::backends_from_str(None)?))?;
     let mut init = gs_train::init_from_sfm_points(&prepared.points, 0x5eed);
     gs_train::upsample_to_budget(&mut init, budget as usize, 0xb00);
@@ -986,7 +1098,55 @@ fn train_and_bake(
         &scene.opacities,
         &scene.sh,
     )?;
-    Ok((psnr, scene.num, trainer.focal_scale as f64))
+    // The refined cameras: the gauge `splat.ply` is actually in. Only the
+    // TRAIN views were refined during the run — eval views are refined against
+    // a frozen model inside `eval_psnr_refined`, a different procedure, so
+    // they are deliberately not used as correction anchors.
+    let refined = train_kfs
+        .iter()
+        .zip(&trainer.views)
+        .map(|(&kf, v)| RefinedPose {
+            kf,
+            center: v.camera.center.as_dvec3(),
+            q_c2w: render_to_cv_c2w(v.camera.quat.as_dquat()),
+        })
+        .collect();
+    Ok(TrainOutcome {
+        psnr,
+        num_surfels: scene.num,
+        focal_scale: trainer.focal_scale as f64,
+        refined,
+    })
+}
+
+/// One trainer-refined camera, converted back to the `poses.csv` convention
+/// (world center + camera-to-world rotation in the CV basis).
+struct RefinedPose {
+    kf: u32,
+    center: glam::DVec3,
+    q_c2w: glam::DQuat,
+}
+
+struct TrainOutcome {
+    psnr: f64,
+    num_surfels: usize,
+    focal_scale: f64,
+    refined: Vec<RefinedPose>,
+}
+
+/// Renderer basis ↔ CV basis for a camera-to-world rotation. `KeyframePose::c2w`
+/// builds `R_c2wᶜᵛ · diag(1,−1,−1)`, and diag(1,−1,−1) is a π rotation about x,
+/// so the two conventions differ by a right-multiplied flip.
+fn cv_flip() -> glam::DQuat {
+    glam::DQuat::from_rotation_x(std::f64::consts::PI)
+}
+
+fn cv_c2w_to_render(q_c2w: glam::DQuat) -> glam::DQuat {
+    (q_c2w * cv_flip()).normalize()
+}
+
+fn render_to_cv_c2w(q_render: glam::DQuat) -> glam::DQuat {
+    (q_render * cv_flip().conjugate()).normalize()
 }
 
 fn write_trajectory_csv(
@@ -1012,6 +1172,170 @@ fn write_seg_poses(path: &std::path::Path, seg: &gs_pose::VoResult) -> anyhow::R
     }
     std::fs::write(path, csv)?;
     Ok(())
+}
+
+/// Raw solved poses of a segment as (kf, center, camera-to-world rotation),
+/// keyframe-ordered — the `poses.csv` convention, in memory.
+fn seg_raw_poses(seg: &gs_pose::VoResult) -> Vec<(u32, glam::DVec3, glam::DQuat)> {
+    seg.keyframe_poses
+        .iter()
+        .enumerate()
+        .filter_map(|(k, kp)| {
+            let kp = kp.as_ref()?;
+            let c = kp.pose.center();
+            let q = kp.pose.r.inverse();
+            Some((
+                k as u32,
+                glam::DVec3::new(c[0], c[1], c[2]),
+                glam::DQuat::from_xyzw(q.i, q.j, q.k, q.w),
+            ))
+        })
+        .collect()
+}
+
+/// The trainer's per-view pose correction, propagated to every solved
+/// keyframe.
+///
+/// Training refines each view's camera and the surfels together, so
+/// `splat.ply` ends up in a gauge the raw VO poses no longer describe (RESULTS
+/// M7: raw-pose held-out eval drops several dB while pose-aligned eval gains).
+/// Only ~1 in 12 keyframes on the walk path was ever a training view, so the
+/// correction measured at those anchors is interpolated across the rest —
+/// otherwise the viewer's recorded path walks a different gauge than the model
+/// it renders, and the ground-truth overlay decorrelates in exactly the
+/// stretches where refinement moved the camera most.
+///
+/// The correction is kept LOCAL to each camera (`Δrot = R_ref·R_rawᵀ`,
+/// `Δpos = c_ref − c_raw`): a world-frame SE(3) composition would rotate about
+/// the submap origin and swing distant cameras by metres.
+///
+/// Returns `(kf, center, q_c2w, was_trained)` per keyframe.
+fn refine_all_poses(
+    raw: &[(u32, glam::DVec3, glam::DQuat)],
+    anchors: &[RefinedPose],
+) -> Vec<(u32, glam::DVec3, glam::DQuat, bool)> {
+    let untouched = || {
+        raw.iter()
+            .map(|&(kf, c, q)| (kf, c, q, false))
+            .collect::<Vec<_>>()
+    };
+    if anchors.is_empty() {
+        return untouched();
+    }
+    let raw_of: std::collections::HashMap<u32, (glam::DVec3, glam::DQuat)> =
+        raw.iter().map(|&(kf, c, q)| (kf, (c, q))).collect();
+    // Deltas at the anchors, keyframe-ordered.
+    let mut deltas: Vec<(u32, glam::DVec3, glam::DQuat)> = anchors
+        .iter()
+        .filter_map(|a| {
+            let &(c_raw, q_raw) = raw_of.get(&a.kf)?;
+            Some((
+                a.kf,
+                a.center - c_raw,
+                (a.q_c2w * q_raw.conjugate()).normalize(),
+            ))
+        })
+        .collect();
+    deltas.sort_unstable_by_key(|d| d.0);
+    if deltas.is_empty() {
+        return untouched();
+    }
+    let anchor_kfs: std::collections::HashSet<u32> = deltas.iter().map(|d| d.0).collect();
+
+    raw.iter()
+        .map(|&(kf, c_raw, q_raw)| {
+            // Bracketing anchors; clamped to the nearest one outside the span.
+            let hi = deltas.partition_point(|d| d.0 < kf);
+            let (dpos, drot) = if hi == 0 {
+                (deltas[0].1, deltas[0].2)
+            } else if hi >= deltas.len() {
+                let last = &deltas[deltas.len() - 1];
+                (last.1, last.2)
+            } else {
+                let (a, b) = (&deltas[hi - 1], &deltas[hi]);
+                let span = b.0.saturating_sub(a.0).max(1) as f64;
+                let t = (kf - a.0) as f64 / span;
+                (a.1.lerp(b.1, t), a.2.slerp(b.2, t))
+            };
+            (
+                kf,
+                c_raw + dpos,
+                (drot * q_raw).normalize(),
+                anchor_kfs.contains(&kf),
+            )
+        })
+        .collect()
+}
+
+/// Write the trainer's gauge alongside `poses.csv` — the viewer's walk path
+/// reads this when present.
+///
+/// `poses.csv` is deliberately NOT overwritten: it, `landmarks.bin`, the
+/// Sim(3) edges and `refocal` all live in one geometric gauge, and the
+/// trainer's corrections are photometric. This file is a render-time artifact
+/// paired with `splat.ply` and `focal_refined`.
+fn write_refined_poses(
+    path: &std::path::Path,
+    seg: &gs_pose::VoResult,
+    anchors: &[RefinedPose],
+) -> anyhow::Result<()> {
+    let raw = seg_raw_poses(seg);
+    let refined = refine_all_poses(&raw, anchors);
+    log_pose_drift(&raw, anchors);
+    let mut csv = String::from("kf,cx,cy,cz,qw,qx,qy,qz,trained\n");
+    for (kf, c, q, trained) in &refined {
+        csv.push_str(&format!(
+            "{kf},{:.6},{:.6},{:.6},{:.8},{:.8},{:.8},{:.8},{}\n",
+            c.x,
+            c.y,
+            c.z,
+            q.w,
+            q.x,
+            q.y,
+            q.z,
+            u8::from(*trained)
+        ));
+    }
+    std::fs::write(path, csv)?;
+    Ok(())
+}
+
+/// How far training moved the cameras, in units of the median keyframe step —
+/// the quantity that decides whether the recorded path still frames what the
+/// model renders.
+fn log_pose_drift(raw: &[(u32, glam::DVec3, glam::DQuat)], anchors: &[RefinedPose]) {
+    let raw_of: std::collections::HashMap<u32, (glam::DVec3, glam::DQuat)> =
+        raw.iter().map(|&(kf, c, q)| (kf, (c, q))).collect();
+    let mut dpos: Vec<f64> = Vec::new();
+    let mut drot: Vec<f64> = Vec::new();
+    for a in anchors {
+        let Some(&(c_raw, q_raw)) = raw_of.get(&a.kf) else {
+            continue;
+        };
+        dpos.push((a.center - c_raw).length());
+        let d = (a.q_c2w * q_raw.conjugate()).normalize();
+        drot.push(2.0 * d.w.abs().clamp(-1.0, 1.0).acos().to_degrees());
+    }
+    if dpos.is_empty() {
+        return;
+    }
+    let mut steps: Vec<f64> = raw.windows(2).map(|w| (w[1].1 - w[0].1).length()).collect();
+    steps.sort_by(f64::total_cmp);
+    let step = steps.get(steps.len() / 2).copied().unwrap_or(0.0);
+    let pct = |v: &mut Vec<f64>, p: f64| {
+        v.sort_by(f64::total_cmp);
+        v[((v.len() - 1) as f64 * p) as usize]
+    };
+    let (dp50, dp95) = (pct(&mut dpos, 0.5), pct(&mut dpos, 0.95));
+    let (dr50, dr95) = (pct(&mut drot, 0.5), pct(&mut drot, 0.95));
+    log::info!(
+        "pose gauge drift over {} refined views: |Δpos| median {dp50:.4} / p95 {dp95:.4} \
+         ({:.1}× / {:.1}× the median keyframe step {step:.4}), Δrot median {dr50:.2}° / \
+         p95 {dr95:.2}°",
+        anchors.len(),
+        if step > 0.0 { dp50 / step } else { 0.0 },
+        if step > 0.0 { dp95 / step } else { 0.0 },
+    );
 }
 
 /// Load a poses.csv back as world→camera transforms per keyframe.
@@ -1233,10 +1557,16 @@ fn add_segment_submap(
     write_trajectory_csv(&dir.join("trajectory.csv"), vo)?;
     write_seg_poses(&dir.join("poses.csv"), seg)?;
     write_thumbs(&dir, &vo.thumbs, seg_kf_range(seg))?;
+    // Separate from `thumbs/` on purpose: that directory is the pairwise
+    // registration stage's input (every 4th keyframe, one fixed convention),
+    // and adding entries to it would change which pairs registration tries.
+    write_view_thumbs(&dir, &prepared.view_thumbs)?;
 
     let ply = dir.join("splat.ply");
-    let (psnr, num, fscale) = train_and_bake(prepared, iters, budget, pose_window, &ply)?;
-    update_refined_focal(&dir, fscale)?;
+    let out = train_and_bake(prepared, iters, budget, pose_window, &ply)?;
+    let (psnr, num) = (out.psnr, out.num_surfels);
+    update_refined_focal(&dir, out.focal_scale)?;
+    write_refined_poses(&dir.join("poses_refined.csv"), seg, &out.refined)?;
     println!(
         "submap-{idx}: {num} surfels, held-out PSNR {psnr:.2} dB — {}",
         match edge_to {
@@ -1665,6 +1995,9 @@ fn run_refocal(
             center.x, center.y, center.z, q_c2w.w, q_c2w.x, q_c2w.y, q_c2w.z
         ));
     }
+    // `poses_refined.csv` is deliberately left alone: it is the gauge the
+    // already-baked `splat.ply` sits in, so the viewer's walk path stays
+    // matched to the model until the submap is retrained.
     std::fs::write(dir.join("poses.csv"), csv)?;
     meta.focal = new_focal;
     meta.focal_refined = Some(new_focal);
@@ -2424,13 +2757,14 @@ fn compose_project(
 
         let mut cams: Vec<SubmapCam> = Vec::new();
         let submap_dir = project::Project::submap_dir(root, i);
-        let thumb_kfs = list_thumbs(&submap_dir);
+        let thumb_src = thumbnail_sources(&submap_dir);
+        let thumb_kfs: Vec<u32> = thumb_src.keys().copied().collect();
         // Capture camera's vertical FOV: the exact-pose lock renders with it
         // so the ground-truth blend matches the render pixel-for-pixel.
         let meta_i = &proj.submaps[i];
         let focal_i = meta_i.focal_refined.unwrap_or(meta_i.focal);
         let fov_y = 2.0 * ((meta_i.height as f64 / 2.0) / focal_i).atan() as f32;
-        if let Ok(poses) = load_seg_poses(&submap_dir.join("poses.csv")) {
+        if let Ok(poses) = load_path_poses(&submap_dir) {
             let w = &resolved[i].world;
             let (ps, prot, pt) = (
                 w.scale as f32,
@@ -2442,12 +2776,8 @@ fn compose_project(
                 ),
                 Vec3::new(w.trans.x as f32, w.trans.y as f32, w.trans.z as f32),
             );
-            let flip = glam::DQuat::from_rotation_x(std::f64::consts::PI);
-            let mut rows: Vec<_> = poses.into_iter().collect();
-            rows.sort_unstable_by_key(|(kf, _)| *kf);
-            for (kf, (r_wc, t_wc)) in rows {
-                let center = -(r_wc.conjugate() * t_wc);
-                let q_render = r_wc.conjugate() * flip;
+            for (kf, center, q_c2w) in poses {
+                let q_render = cv_c2w_to_render(q_c2w);
                 let pos = Vec3::new(center.x as f32, center.y as f32, center.z as f32);
                 let rot = Quat::from_xyzw(
                     q_render.x as f32,
@@ -2458,7 +2788,8 @@ fn compose_project(
                 .normalize();
                 let mut p = ps * (prot * pos) + pt;
                 p.x += dx;
-                // Nearest captured thumbnail (thumbs land every 4th kf).
+                // Nearest captured thumbnail. Every trained view has its own
+                // (view-thumbs/); between them the VO thumbs land every 4th kf.
                 let kf32 = kf;
                 let ti = thumb_kfs
                     .iter()
@@ -2468,11 +2799,7 @@ fn compose_project(
                         let idx = match thumb_idx.entry((i, t)) {
                             std::collections::hash_map::Entry::Occupied(e) => *e.get(),
                             std::collections::hash_map::Entry::Vacant(e) => {
-                                let img = image::open(
-                                    submap_dir.join("thumbs").join(format!("{t:05}.png")),
-                                )
-                                .ok()?
-                                .to_luma8();
+                                let img = image::open(&thumb_src[&t]).ok()?.to_luma8();
                                 thumbs.push(gs_viewer::overlay::ThumbImage {
                                     width: img.width(),
                                     height: img.height(),
@@ -2482,8 +2809,7 @@ fn compose_project(
                             }
                         };
                         // Exact only when this pose IS the captured frame —
-                        // neighbours (thumbs land every 4th kf) are only
-                        // approximately aligned.
+                        // neighbours are only approximately aligned.
                         Some((idx, t == kf32))
                     });
                 cams.push(((p, (prot * rot).normalize(), fov_y), ti));
@@ -2686,4 +3012,171 @@ fn render_goldens(
         println!("wrote {}", out.display());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use glam::{DQuat, DVec3};
+
+    fn quat(axis: DVec3, deg: f64) -> DQuat {
+        DQuat::from_axis_angle(axis.normalize(), deg.to_radians())
+    }
+
+    /// The trainer speaks the renderer basis and `poses.csv` speaks the CV
+    /// basis; refined poses cross that boundary in both directions, so the
+    /// round-trip must be exact.
+    #[test]
+    fn camera_convention_round_trips() {
+        for (axis, deg) in [
+            (DVec3::X, 0.0),
+            (DVec3::Y, 37.0),
+            (DVec3::new(1.0, 2.0, -3.0), 155.0),
+            (DVec3::new(-4.0, 1.0, 0.5), -88.0),
+        ] {
+            let q_cv = quat(axis, deg);
+            let back = render_to_cv_c2w(cv_c2w_to_render(q_cv));
+            // Quaternion double cover: compare as rotations.
+            assert!(
+                q_cv.dot(back).abs() > 1.0 - 1e-12,
+                "round-trip lost {q_cv:?} -> {back:?}"
+            );
+        }
+    }
+
+    /// The invariant the whole refined-pose path rests on: an unrefined
+    /// trainer camera must convert back to exactly the rotation `poses.csv`
+    /// stores, so a zero correction stays a zero correction. `KeyframePose::c2w`
+    /// builds `R_c2wᶜᵛ · diag(1,−1,−1)` and hands that to the trainer; a
+    /// convention slip here would show up as a ~180° "drift" on every view.
+    #[test]
+    fn render_basis_matches_the_c2w_matrix_vo_builds() {
+        for (axis, deg) in [
+            (DVec3::X, 12.0),
+            (DVec3::new(0.3, -1.0, 0.7), 121.0),
+            (DVec3::new(2.0, 0.1, -0.4), -63.0),
+        ] {
+            let q_c2w = quat(axis, deg);
+            let expect = glam::DMat3::from_quat(q_c2w)
+                * glam::DMat3::from_diagonal(DVec3::new(1.0, -1.0, -1.0));
+            let got = glam::DMat3::from_quat(cv_c2w_to_render(q_c2w));
+            for c in 0..3 {
+                assert!(
+                    (expect.col(c) - got.col(c)).length() < 1e-12,
+                    "column {c}: {:?} vs {:?}",
+                    expect.col(c),
+                    got.col(c)
+                );
+            }
+        }
+    }
+
+    fn raw_path(n: u32) -> Vec<(u32, DVec3, DQuat)> {
+        (0..n)
+            .map(|k| {
+                (
+                    k,
+                    DVec3::new(k as f64 * 0.1, 0.0, 0.0),
+                    quat(DVec3::Y, k as f64),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn refine_all_poses_reproduces_anchors_exactly() {
+        let raw = raw_path(20);
+        let anchors: Vec<RefinedPose> = [3u32, 11, 17]
+            .iter()
+            .map(|&kf| RefinedPose {
+                kf,
+                center: raw[kf as usize].1 + DVec3::new(0.0, 0.05 * kf as f64, 0.0),
+                q_c2w: quat(DVec3::Z, 2.0) * raw[kf as usize].2,
+            })
+            .collect();
+        let out = refine_all_poses(&raw, &anchors);
+        assert_eq!(out.len(), raw.len());
+        for a in &anchors {
+            let row = out.iter().find(|r| r.0 == a.kf).unwrap();
+            assert!(row.3, "anchor {} not flagged as trained", a.kf);
+            assert!((row.1 - a.center).length() < 1e-12);
+            assert!(row.2.dot(a.q_c2w).abs() > 1.0 - 1e-12);
+        }
+        assert_eq!(out.iter().filter(|r| r.3).count(), anchors.len());
+    }
+
+    #[test]
+    fn refine_all_poses_interpolates_between_and_clamps_outside() {
+        let raw = raw_path(11);
+        // Deltas of +0.0 at kf 0 and +1.0 (y) at kf 10: the midpoint must land
+        // halfway, and everything past the ends must hold the end delta.
+        let anchors = vec![
+            RefinedPose {
+                kf: 0,
+                center: raw[0].1,
+                q_c2w: raw[0].2,
+            },
+            RefinedPose {
+                kf: 10,
+                center: raw[10].1 + DVec3::Y,
+                q_c2w: raw[10].2,
+            },
+        ];
+        let out = refine_all_poses(&raw, &anchors);
+        let dy = |kf: usize| out[kf].1.y - raw[kf].1.y;
+        assert!((dy(5) - 0.5).abs() < 1e-12, "midpoint delta {}", dy(5));
+        assert!((dy(2) - 0.2).abs() < 1e-12);
+        assert!(!out[5].3, "interpolated pose must not claim to be trained");
+
+        // Single anchor in the middle: constant delta everywhere (clamped).
+        let one = vec![RefinedPose {
+            kf: 5,
+            center: raw[5].1 + DVec3::Y,
+            q_c2w: raw[5].2,
+        }];
+        let out = refine_all_poses(&raw, &one);
+        for k in 0..raw.len() {
+            assert!((out[k].1.y - raw[k].1.y - 1.0).abs() < 1e-12, "kf {k}");
+        }
+    }
+
+    #[test]
+    fn refine_all_poses_without_anchors_is_the_identity() {
+        let raw = raw_path(7);
+        let out = refine_all_poses(&raw, &[]);
+        for (r, o) in raw.iter().zip(&out) {
+            assert_eq!(r.0, o.0);
+            assert!((r.1 - o.1).length() < 1e-15);
+            assert!(r.2.dot(o.2).abs() > 1.0 - 1e-15);
+            assert!(!o.3);
+        }
+    }
+
+    /// A pose refined by the trainer must land back at the same rendered
+    /// camera after the CSV round-trip through `load_path_poses`.
+    #[test]
+    fn refined_poses_csv_round_trips_through_the_loader() {
+        let dir = std::env::temp_dir().join(format!(
+            "splattar-refined-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let raw = raw_path(6);
+        let mut csv = String::from("kf,cx,cy,cz,qw,qx,qy,qz,trained\n");
+        for (kf, c, q) in &raw {
+            csv.push_str(&format!(
+                "{kf},{:.6},{:.6},{:.6},{:.8},{:.8},{:.8},{:.8},1\n",
+                c.x, c.y, c.z, q.w, q.x, q.y, q.z
+            ));
+        }
+        std::fs::write(dir.join("poses_refined.csv"), csv).unwrap();
+        let loaded = load_path_poses(&dir).unwrap();
+        assert_eq!(loaded.len(), raw.len());
+        for ((kf, c, q), (lkf, lc, lq)) in raw.iter().zip(&loaded) {
+            assert_eq!(*kf, *lkf);
+            assert!((*c - *lc).length() < 1e-5);
+            assert!(q.dot(*lq).abs() > 1.0 - 1e-7);
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

@@ -660,3 +660,55 @@ assumed dominant). Next lever, if the solve needs to be faster still:
 BA itself — iteration counts/tolerances, Schur assembly parallelism,
 and local-BA cadence (currently every 2nd keyframe) — not more scan
 optimization.
+
+### The recorded walk path was in the wrong gauge (2026-07-22)
+
+Symptom from walking the viewer's recorded path with the ground-truth
+overlay on (`[`/`]` + `T`): the captured frame lines up with the render in
+some stretches and shows an unrelated part of the room in others. The
+hypothesis on the table was under-convergence. It was not — it was
+bookkeeping, and more iterations made it worse.
+
+`add_submap` wrote `poses.csv` BEFORE training. The trainer then refines
+every view's camera for the rest of the run (`pose_window` 1.0) and only the
+refined *focal* was ever written back, so `splat.ply` ended up in a gauge
+`poses.csv` no longer described — and the viewer's path reads `poses.csv`.
+
+Measured on 900 frames of 1.mp4 (submap-0: 539 keyframes, 102 selected
+views → 89 train / 13 held out, 7000 iters, 150k surfels):
+
+| | |
+|---|---|
+| held-out PSNR, raw VO poses | 17.58 dB |
+| held-out PSNR, pose-aligned (BARF protocol) | **22.99 dB** |
+| \|Δpos\| median / p95 over the 89 refined views | 0.2415 / 0.4578 |
+| …as a multiple of the median keyframe step (0.0621) | **3.9× / 7.4×** |
+| Δrot median / p95 | 0.45° / 0.83° |
+
+Training slides each camera by roughly four keyframe-steps of translation
+(rotation drift is negligible by comparison), and the shift is nonuniform —
+p95 is nearly double the median. That nonuniformity is exactly the observed
+pattern: stretches where refinement barely moved cost nothing, stretches
+where it moved most decorrelate completely. The 5.4 dB raw-vs-aligned gap is
+the same effect measured photometrically.
+
+Fix: submaps now persist `poses_refined.csv` next to `poses.csv`. Two
+gauges, not one — see PLAN.md §Key decisions. `poses.csv` stays the
+geometric gauge (`landmarks.bin`, Sim(3) edges, `refocal` all share it);
+`poses_refined.csv` is the photometric gauge the surfels are in, and is what
+the viewer's path reads. Only ~1 in 6 keyframes here was a training view
+(1 in 12 on full-length clips), so the correction measured at those anchors
+is propagated to the rest as a local Δrot/Δpos field (slerp/lerp between
+bracketing anchors, clamped outside the span). Snapshots are additionally
+written for every selected view (`view-thumbs/`, kept out of `thumbs/` so
+the pairwise registration candidate set is unchanged), so the full-strength
+ground-truth blend is available at exactly the poses the model was fit to.
+
+**Still open, same symptom, different cause:** `--max-views` is a flat 120
+regardless of clip length, and selection is one sharpest keyframe per 0.25 s
+window — uniform in *time*, not in *space*. Real submaps carry 1413 and 1749
+keyframes on their paths against those ≤120 views, so a fast pan can leave a
+whole stretch with near-zero supervision, where the surfels stay close to
+their SfM-init state. Scaling `max_views` (and the fixed 150k surfel budget)
+with submap size, and selecting by pose spacing rather than elapsed time, is
+the follow-up.
