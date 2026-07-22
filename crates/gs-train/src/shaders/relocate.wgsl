@@ -18,7 +18,15 @@ struct RelocParams {
 }
 
 @group(0) @binding(0) var<uniform> rp: RelocParams;
-@group(0) @binding(1) var<storage, read> pairs: array<vec2<u32>>; // (dead, alive)
+// (dead, alive, mode, _): mode 0 = classic dead->alive relocation
+// (co-located copy), mode 1 = oversized-surfel split - the dead surfel
+// becomes the second half of an over-grown alive one, the two halves offset
+// +-0.6 sigma along the major axis with in-plane scales x0.6. Oversized
+// surfels exist because the trainer's 64 px tile-rect cap truncates their
+// gradient support: the optimizer literally cannot see most of their error,
+// so they must be split structurally (fixed budget: splits consume the dead
+// pool, never allocate).
+@group(0) @binding(1) var<storage, read> pairs: array<vec4<u32>>;
 
 // relocate_params bindings.
 @group(0) @binding(2) var<storage, read> opac_act: array<f32>;
@@ -37,6 +45,7 @@ fn relocate_params(@builtin(global_invocation_id) gid: vec3<u32>) {
     let pr = pairs[i];
     let d = pr.x;
     let a = pr.y;
+    let split = pr.z == 1u;
 
     // Split opacity α' = 1 − √(1−α), applied to both, in logit space.
     let alpha_a = clamp(opac_act[a], 1e-4, 0.999);
@@ -45,11 +54,33 @@ fn relocate_params(@builtin(global_invocation_id) gid: vec3<u32>) {
     opac_raw[d] = logit;
     opac_raw[a] = logit;
 
-    pos_raw[d] = pos_raw[a];
     quat_raw[d] = quat_raw[a];
-    let s = scales_raw[a] - vec2<f32>(0.16, 0.16); // log-space ×0.85
-    scales_raw[a] = s;
-    scales_raw[d] = s;
+    if split {
+        // Two halves displaced along the major in-plane axis; identical
+        // co-located copies would receive identical gradients and never
+        // separate.
+        let q = normalize(quat_raw[a]);
+        let x = q.x; let y = q.y; let z = q.z; let w = q.w;
+        let col0 = vec3<f32>(1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y + w * z), 2.0 * (x * z - w * y));
+        let col1 = vec3<f32>(2.0 * (x * y - w * z), 1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z + w * x));
+        let sw = exp(scales_raw[a]);
+        var axis = col0 * sw.x;
+        if sw.y > sw.x {
+            axis = col1 * sw.y;
+        }
+        let off = vec4<f32>(0.6 * axis, 0.0);
+        let center = pos_raw[a];
+        pos_raw[d] = center + off;
+        pos_raw[a] = center - off;
+        let s = scales_raw[a] - vec2<f32>(0.51, 0.51); // log-space ×0.6
+        scales_raw[a] = s;
+        scales_raw[d] = s;
+    } else {
+        pos_raw[d] = pos_raw[a];
+        let s = scales_raw[a] - vec2<f32>(0.16, 0.16); // log-space ×0.85
+        scales_raw[a] = s;
+        scales_raw[d] = s;
+    }
     for (var k = 0u; k < 12u; k++) {
         sh_raw[d * 12u + k] = sh_raw[a * 12u + k];
     }

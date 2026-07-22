@@ -48,6 +48,12 @@ pub struct TrainConfig {
     pub mcmc_every: u32,
     /// Activated-opacity threshold below which a surfel counts as dead.
     pub mcmc_dead: f32,
+    /// Split surfels whose in-plane scale exceeds this multiple of the alive
+    /// median (0 = off). The 64 px tile-rect cap truncates a huge surfel's
+    /// gradient support, so the optimizer can't shrink what it can't see —
+    /// oversized surfels must be split structurally. Splits consume the dead
+    /// pool (budget-neutral) and run on the relocate kernel's mode 1.
+    pub mcmc_split_ratio: f32,
     /// Position exploration noise multiplier (× current position LR; 0 = off).
     pub mcmc_noise: f32,
     // --- M7: pose refinement (VO poses are noisy; the rasterizer's camera
@@ -99,6 +105,7 @@ impl Default for TrainConfig {
             sh_promote_every: 0,
             mcmc_every: 0,
             mcmc_dead: 0.005,
+            mcmc_split_ratio: 8.0,
             mcmc_noise: 0.0,
             pose_refine_lr: 0.0,
             pose_refine_start: 500,
@@ -206,7 +213,7 @@ impl RelocateKernel {
         let moments_pipeline = make("relocate_moments");
         // Worst case every surfel is in a pair.
         let pairs =
-            gs_wgpu::buffers::storage_empty(device, "relocate-pairs", capacity as u64 * 8);
+            gs_wgpu::buffers::storage_empty(device, "relocate-pairs", capacity as u64 * 16);
         let uniform = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("relocate-uniform"),
             size: 16,
@@ -939,8 +946,9 @@ impl Trainer {
         }
 
         let mut used = vec![false; n];
-        let mut pairs: Vec<[u32; 2]> = Vec::with_capacity(dead.len());
-        for &d in &dead {
+        let mut pairs: Vec<[u32; 4]> = Vec::with_capacity(dead.len());
+        let mut spent = vec![false; dead.len()];
+        for (di, &d) in dead.iter().enumerate() {
             // Sample an alive target ∝ opacity.
             let mut x = self.rng;
             x ^= x << 13;
@@ -953,7 +961,55 @@ impl Trainer {
                 continue;
             }
             used[a] = true;
-            pairs.push([d, a as u32]);
+            spent[di] = true;
+            pairs.push([d, a as u32, 0, 0]);
+        }
+
+        // Oversized-surfel splits: surfels whose in-plane extent dwarfs the
+        // alive median grew past the 64 px gradient window and can't shrink
+        // by descent — split each across a leftover dead slot (mode 1).
+        if self.config.mcmc_split_ratio > 0.0 {
+            let scales_act: Vec<f32> = bytemuck::cast_slice(&gs_wgpu::buffers::readback(
+                &ctx.device,
+                &ctx.queue,
+                &self.raster.scales,
+            ))
+            .to_vec();
+            let size = |i: usize| scales_act[i * 2].max(scales_act[i * 2 + 1]);
+            let mut alive_sizes: Vec<f32> = (0..n)
+                .filter(|&i| opacity_act[i] >= self.config.mcmc_dead)
+                .map(size)
+                .collect();
+            if alive_sizes.len() >= 16 {
+                alive_sizes.sort_by(f32::total_cmp);
+                let med = alive_sizes[alive_sizes.len() / 2];
+                let cap = self.config.mcmc_split_ratio * med;
+                let mut oversized: Vec<u32> = (0..n)
+                    .filter(|&i| {
+                        opacity_act[i] >= self.config.mcmc_dead && size(i) > cap && !used[i]
+                    })
+                    .map(|i| i as u32)
+                    .collect();
+                oversized.sort_by(|&x, &y| size(y as usize).total_cmp(&size(x as usize)));
+                let mut leftovers = dead
+                    .iter()
+                    .enumerate()
+                    .filter(|&(di, _)| !spent[di])
+                    .map(|(_, &d)| d);
+                let mut n_split = 0usize;
+                for big in oversized {
+                    let Some(slot) = leftovers.next() else { break };
+                    used[big as usize] = true;
+                    pairs.push([slot, big, 1, 0]);
+                    n_split += 1;
+                }
+                if n_split > 0 {
+                    log::debug!(
+                        "mcmc: split {n_split} oversized surfel(s) (> {:.1}x median scale)",
+                        self.config.mcmc_split_ratio
+                    );
+                }
+            }
         }
         if pairs.is_empty() {
             return;
