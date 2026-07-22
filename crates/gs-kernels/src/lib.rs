@@ -1,0 +1,12 @@
+//! WGSL training kernels (forward + hand-derived backward) and their dispatch layer.
+//!
+//! Any change here must pass the gs-cpu-ref gradient checks — wrong gradients
+//! fail silently (see CLAUDE.md Verification rules). Shaders live in `src/shaders/`
+//! as `<stage>_fwd.wgsl` / `<stage>_bwd.wgsl` pairs (binning/utility kernels
+//! are exempt from the pair naming — they have no backward).
+
+pub mod binning;
+pub mod rasterizer;
+
+pub use binning::{TileBinner, TileRect};
+pub use rasterizer::{RasterCamera, Rasterizer, SceneInput};

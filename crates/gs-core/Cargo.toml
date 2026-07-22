@@ -1,0 +1,12 @@
+[package]
+name = "gs-core"
+description = "Core math and types: splat SoA structs, SE(3)/quat math, camera model, SH eval. Wasm-safe, dependency-light."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+glam = { workspace = true }
+bytemuck = { workspace = true }
+half = { workspace = true }

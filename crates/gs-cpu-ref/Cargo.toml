@@ -1,0 +1,11 @@
+[package]
+name = "gs-cpu-ref"
+description = "Slow, obviously-correct CPU reference rasterizer and finite-difference harness. Test oracle only — never ships in apps."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+gs-core = { workspace = true }
+glam = { workspace = true }

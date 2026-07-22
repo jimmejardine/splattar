@@ -3,7 +3,15 @@
 # here) and is reference only.
 [workspace]
 resolver = "2"
-members = ["crates/gs-video", "crates/gs-diag", "crates/gs-cli"]
+members = [
+    "crates/gs-core",
+    "crates/gs-wgpu",
+    "crates/gs-kernels",
+    "crates/gs-cpu-ref",
+    "crates/gs-video",
+    "crates/gs-diag",
+    "crates/gs-cli",
+]
 exclude = ["first_attempt"]
 
 [workspace.package]
@@ -29,11 +37,16 @@ winit = "0.30"
 mp4 = "0.14"
 ash = "0.38"
 thiserror = "2"
+rand = "0.9"
 
 # Workspace members carried from first_attempt/ are listed here with the
 # milestone that pulled them across, so the boundary stays auditable.
 gs-video = { path = "crates/gs-video" }   # M0: NVDEC decode, carried unchanged
 gs-diag = { path = "crates/gs-diag" }     # M0: new — the diagnostic stream
+gs-core = { path = "crates/gs-core" }     # M1: splat SoA, camera, SH — carried
+gs-wgpu = { path = "crates/gs-wgpu" }     # M1: device, buffers, sort — carried
+gs-kernels = { path = "crates/gs-kernels" }   # M1: differentiable rasterizer — carried
+gs-cpu-ref = { path = "crates/gs-cpu-ref" }   # M1: gradient oracle — comes WITH the kernels
 
 [profile.dev]
 opt-level = 1
