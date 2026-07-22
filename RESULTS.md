@@ -933,3 +933,40 @@ simplification `compose_project` makes for rotated submaps. The gate above runs
 at SH degree 0 and so does not cover it. Correct rotation needs Wigner-D
 matrices; until then a large correction loses view-dependent colour that
 descent must re-fit.
+
+### Surfel spawning into the dead pool (2026-07-22)
+
+The last trainer-side primitive for incremental mapping. New keyframes must be
+able to ADD geometry: a corridor the camera has just entered contains nothing
+for descent to move, and no amount of optimizing the existing set will invent
+it. Relocation (relocate.wgsl modes 0/1) derives a new surfel from an alive
+one; `Trainer::spawn_surfels` writes uploaded parameters instead, which is what
+lets a plane-sweep depth map become surfels mid-run.
+
+Budget-neutral like everything else touching the surfel set: the splat buffers
+are pre-allocated to the MCMC budget and never reallocated (CLAUDE.md), so a
+spawn consumes the dead pool. When the pool is short the placed count is
+RETURNED rather than the request silently truncated — a caller feeding a depth
+map needs to know its geometry did not land.
+
+Gate: a deliberately starved model (40 live surfels in a 900 budget, MCMC
+relocation disabled so it cannot refill the pool itself) trained to 22.76 dB,
+then 600 surfels spawned onto the geometry it was missing → **49.10 dB** after
+further training, all 600 placed. The high absolute number is not a quality
+claim: the test hands it exact ground-truth positions and normals, because its
+job is to prove the geometry is reachable at all, not to benchmark it. It also
+asserts the render changes IMMEDIATELY after spawning, which is what catches
+the raw-vs-activated hazard below.
+
+**The raw/activated hazard, hit twice now.** The optimizer holds raw parameters
+and the rasterizer reads a separate activated copy refreshed only by the Adam
+step. `transform_surfels` hit this first (a 6 dB drop that looked like bad
+transform maths); `spawn_surfels` needs the same `encode_activate` pass, and
+its test asserts immediate visibility precisely so a future writer of raw
+parameters cannot reintroduce it quietly.
+
+Trainer-side incremental mapping is now complete: dense init, mid-run view
+append, Sim(3) correction of spawned geometry, and spawning. Remaining work is
+outside gs-train — the causal provisional-pose front-end in gs-pose, and the
+streaming driver in gs-cli where the redundant per-submap decode (~75 s) and
+the 15.4 min wall clock actually live.

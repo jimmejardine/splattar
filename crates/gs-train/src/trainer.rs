@@ -138,6 +138,52 @@ struct PoseAligner {
     view_bytes: u64,
 }
 
+/// A surfel to spawn, in activated units — the caller works in world space and
+/// linear colour; the raw log/logit encoding is applied on the way in.
+#[derive(Clone, Copy, Debug)]
+pub struct NewSurfel {
+    pub position: Vec3,
+    /// Surface normal; becomes the surfel's local +z.
+    pub normal: Vec3,
+    /// In-plane radius (both axes).
+    pub radius: f32,
+    pub color: [f32; 3],
+    pub opacity: f32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct SpawnSurfelGpu {
+    pos: [f32; 4],
+    quat: [f32; 4],
+    scale_opac: [f32; 4],
+    sh: [f32; 4],
+}
+
+const SH_C0: f32 = 0.282_094_79;
+
+impl From<&NewSurfel> for SpawnSurfelGpu {
+    fn from(s: &NewSurfel) -> Self {
+        let n = s.normal.normalize_or(Vec3::Z);
+        let q = glam::Quat::from_rotation_arc(Vec3::Z, n);
+        let r = s.radius.max(1e-6).ln();
+        let a = s.opacity.clamp(1e-4, 0.9999);
+        Self {
+            pos: s.position.extend(0.0).to_array(),
+            quat: q.to_array(),
+            // Raw encoding: scales log-space, opacity logit (Activation::Exp
+            // and ::Sigmoid respectively).
+            scale_opac: [r, r, (a / (1.0 - a)).ln(), 0.0],
+            sh: [
+                (s.color[0] - 0.5) / SH_C0,
+                (s.color[1] - 0.5) / SH_C0,
+                (s.color[2] - 0.5) / SH_C0,
+                0.0,
+            ],
+        }
+    }
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct XfParams {
@@ -147,6 +193,102 @@ struct XfParams {
     lo: u32,
     hi: u32,
     _pad: u32,
+}
+
+/// Writes uploaded surfel parameters into dead slots
+/// (see [`Trainer::spawn_surfels`]).
+struct SpawnKernel {
+    params_pipeline: wgpu::ComputePipeline,
+    moments_pipeline: wgpu::ComputePipeline,
+    params_bg: wgpu::BindGroup,
+    moments_bg: wgpu::BindGroup,
+    uniform: wgpu::Buffer,
+    slots: wgpu::Buffer,
+    incoming: wgpu::Buffer,
+    capacity: u32,
+}
+
+impl SpawnKernel {
+    fn new(ctx: &GpuContext, capacity: u32, optim: &Optimizer) -> Self {
+        let device = &ctx.device;
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("surfel-spawn"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/spawn.wgsl").into()),
+        });
+        let make = |entry: &str| {
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some(entry),
+                layout: None,
+                module: &module,
+                entry_point: Some(entry),
+                compilation_options: Default::default(),
+                cache: None,
+            })
+        };
+        let params_pipeline = make("spawn_params");
+        let moments_pipeline = make("spawn_moments");
+        // Worst case every surfel is dead and refilled in one batch.
+        let slots = gs_wgpu::buffers::storage_empty(device, "spawn-slots", capacity as u64 * 4);
+        let incoming = gs_wgpu::buffers::storage_empty(
+            device,
+            "spawn-incoming",
+            capacity as u64 * std::mem::size_of::<SpawnSurfelGpu>() as u64,
+        );
+        let uniform = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("spawn-uniform"),
+            size: 16,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        fn bind(binding: u32, buffer: &wgpu::Buffer) -> wgpu::BindGroupEntry<'_> {
+            wgpu::BindGroupEntry {
+                binding,
+                resource: buffer.as_entire_binding(),
+            }
+        }
+        let params_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("spawn-params-bg"),
+            layout: &params_pipeline.get_bind_group_layout(0),
+            entries: &[
+                bind(0, &uniform),
+                bind(1, &slots),
+                bind(2, &incoming),
+                bind(3, &optim.class("pos").raw),
+                bind(4, &optim.class("scales").raw),
+                bind(5, &optim.class("quat").raw),
+                bind(6, &optim.class("opacity").raw),
+                bind(7, &optim.class("sh").raw),
+            ],
+        });
+        let moments_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("spawn-moments-bg"),
+            layout: &moments_pipeline.get_bind_group_layout(0),
+            entries: &[
+                bind(0, &uniform),
+                bind(1, &slots),
+                bind(8, &optim.class("pos").m),
+                bind(9, &optim.class("pos").v),
+                bind(10, &optim.class("scales").m),
+                bind(11, &optim.class("scales").v),
+                bind(12, &optim.class("quat").m),
+                bind(13, &optim.class("quat").v),
+                bind(14, &optim.class("opacity").m),
+                bind(15, &optim.class("opacity").v),
+                bind(16, &optim.class("sh").m),
+                bind(17, &optim.class("sh").v),
+            ],
+        });
+        Self {
+            params_pipeline,
+            moments_pipeline,
+            params_bg,
+            moments_bg,
+            uniform,
+            slots,
+            incoming,
+            capacity,
+        }
+    }
 }
 
 /// Sim(3) transform of a surfel index range (see [`Trainer::transform_surfels`]).
@@ -388,6 +530,8 @@ pub struct Trainer {
     pose_depth: Vec<f32>,
     /// Sim(3) correction of a surfel range (two-tier pose updates).
     transform: TransformKernel,
+    /// Writes new surfels into dead slots (incremental mapping).
+    spawn: SpawnKernel,
     /// Set once the held-out probe plateaus: the LR schedule's remaining decay
     /// is compressed into a short tail and the run ends.
     anneal: Option<Anneal>,
@@ -696,6 +840,7 @@ impl Trainer {
 
         let relocate = RelocateKernel::new(ctx, n, &optim, &raster.opacities);
         let transform = TransformKernel::new(ctx, &optim);
+        let spawn = SpawnKernel::new(ctx, n, &optim);
         let seed = config.seed;
         let n_views = views.len();
         Self {
@@ -717,6 +862,7 @@ impl Trainer {
             focal_state: (0.0, 0.0, 0),
             anneal: None,
             transform,
+            spawn,
             focal_scale: 1.0,
             probe_positions,
             pose_depth: vec![0.0; n_views],
@@ -765,6 +911,82 @@ impl Trainer {
         };
         self.pose_depth[view_idx] = d.max(1e-3);
         self.pose_depth[view_idx]
+    }
+
+    /// Spawn new surfels into dead slots. Returns the index range written.
+    ///
+    /// Incremental mapping needs new keyframes to ADD geometry: a corridor the
+    /// camera has just entered contains nothing for descent to move, and no
+    /// amount of optimizing existing surfels will invent it.
+    ///
+    /// Budget-neutral by construction — the splat buffers are pre-allocated to
+    /// the MCMC budget and never reallocated (CLAUDE.md), so this consumes the
+    /// dead pool. Fewer surfels are placed than requested when the pool is
+    /// short; the count is returned rather than silently truncated, because a
+    /// caller feeding a depth map needs to know its geometry did not land.
+    ///
+    /// The one blocking readback here is deliberate and matches
+    /// `mcmc_relocate`: this runs on keyframe arrival, not in the hot loop.
+    pub fn spawn_surfels(&mut self, ctx: &GpuContext, incoming: &[NewSurfel]) -> usize {
+        if incoming.is_empty() {
+            return 0;
+        }
+        let opacity_act: Vec<f32> = bytemuck::cast_slice(&gs_wgpu::buffers::readback(
+            &ctx.device,
+            &ctx.queue,
+            &self.raster.opacities,
+        ))
+        .to_vec();
+        let want = incoming.len().min(self.spawn.capacity as usize);
+        let dead: Vec<u32> = (0..self.num_surfels as usize)
+            .filter(|&i| opacity_act[i] < self.config.mcmc_dead)
+            .take(want)
+            .map(|i| i as u32)
+            .collect();
+        if dead.is_empty() {
+            log::debug!("spawn: dead pool empty, {} surfels dropped", incoming.len());
+            return 0;
+        }
+        let n = dead.len();
+        if n < incoming.len() {
+            log::info!(
+                "spawn: dead pool held {n} of {} requested surfels",
+                incoming.len()
+            );
+        }
+        let gpu: Vec<SpawnSurfelGpu> = incoming[..n].iter().map(SpawnSurfelGpu::from).collect();
+        ctx.queue
+            .write_buffer(&self.spawn.slots, 0, bytemuck::cast_slice(&dead));
+        ctx.queue
+            .write_buffer(&self.spawn.incoming, 0, bytemuck::cast_slice(&gpu));
+        ctx.queue.write_buffer(
+            &self.spawn.uniform,
+            0,
+            bytemuck::bytes_of(&[n as u32, 0u32, 0u32, 0u32]),
+        );
+        let mut encoder = ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("spawn-surfels"),
+            });
+        for (pipeline, bg, label) in [
+            (&self.spawn.params_pipeline, &self.spawn.params_bg, "spawn-params"),
+            (&self.spawn.moments_pipeline, &self.spawn.moments_bg, "spawn-moments"),
+        ] {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some(label),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, bg, &[]);
+            pass.dispatch_workgroups((n as u32).div_ceil(256), 1, 1);
+        }
+        // Raw parameters are not what the rasterizer reads — see
+        // `transform_surfels`. Without this the spawned surfels would be
+        // invisible until the next Adam step.
+        self.optim.encode_activate(ctx, &mut encoder);
+        ctx.queue.submit([encoder.finish()]);
+        n
     }
 
     /// Move a contiguous surfel range by a Sim(3), in place.

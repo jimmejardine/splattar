@@ -745,3 +745,122 @@ fn a_map_survives_a_pose_correction() {
         "training did not resume cleanly after the correction: {after:.2} -> {resumed:.2}"
     );
 }
+
+/// Spawning must actually add geometry a fixed surfel set cannot reach.
+///
+/// Set up so descent alone CANNOT win: train with a budget almost entirely
+/// starved (most surfels driven dead), then spawn onto the region the model is
+/// missing. If spawning works the model recovers; if it silently does nothing,
+/// or writes surfels the rasterizer never sees, quality is flat.
+#[test]
+fn spawned_surfels_are_visible_and_trainable() {
+    let Some(ctx) = context() else { return };
+
+    let gt = random_surfels(0xfeedbeef, N_GT, 1.2, true);
+    let gt_raster = Rasterizer::new(&ctx, N_GT as u32, SIZE, SIZE, (N_GT * 64) as u32);
+    gt_raster.upload_scene(
+        &ctx,
+        &SceneInput {
+            positions: &gt.positions,
+            scales: &gt.scales,
+            quats: &gt.quats,
+            opacities: &gt.opacities,
+            sh: &gt.sh,
+            sh_coeffs: 1,
+        },
+    );
+    let render_gt = |camera: &RasterCamera| -> Vec<[f32; 4]> {
+        let mut encoder = ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        gt_raster.forward(&ctx, &mut encoder, camera, N_GT as u32);
+        ctx.queue.submit([encoder.finish()]);
+        bytemuck::cast_slice(&gs_wgpu::buffers::readback(
+            &ctx.device,
+            &ctx.queue,
+            &gt_raster.out_color,
+        ))
+        .to_vec()
+    };
+
+    let mut train_views = Vec::new();
+    let mut eval_views = Vec::new();
+    for i in 0..21 {
+        let angle = i as f32 / 21.0 * std::f32::consts::TAU;
+        let camera = orbit_camera(angle, 1.0, 4.0);
+        let view = TrainView {
+            target: render_gt(&camera),
+            camera,
+        };
+        if i % 7 == 3 {
+            eval_views.push(view);
+        } else {
+            train_views.push(view);
+        }
+    }
+
+    // Start from a tiny live set inside a large budget: the surplus surfels
+    // begin at near-zero opacity, which is exactly the dead pool a spawn
+    // consumes.
+    let mut init = random_surfels(0x999, 40, 1.2, false);
+    let budget = 900;
+    gs_train::upsample_to_budget(&mut init, budget, 0xb00);
+    for o in init.opacities.iter_mut().skip(40) {
+        *o = 0.001;
+    }
+    let mut t = Trainer::new(
+        &ctx,
+        SIZE,
+        SIZE,
+        train_views,
+        init,
+        TrainConfig {
+            iters: 3000,
+            log_every: 3000,
+            // No relocation: it would refill the dead pool on its own and
+            // confound what spawning is responsible for.
+            mcmc_every: 0,
+            ..Default::default()
+        },
+    );
+    for iter in 0..1500 {
+        t.step(&ctx, iter);
+    }
+    let before = t.eval_psnr(&ctx, &eval_views);
+
+    // Spawn onto the ground-truth surfaces the starved model is missing.
+    let spawn: Vec<gs_train::NewSurfel> = (0..600)
+        .map(|i| {
+            let k = (i * 7 + 3) % N_GT;
+            gs_train::NewSurfel {
+                position: gt.positions[k],
+                normal: glam::Quat::from_array(gt.quats[k]) * Vec3::Z,
+                radius: gt.scales[k][0].max(gt.scales[k][1]),
+                color: [0.5, 0.5, 0.5],
+                opacity: 0.5,
+            }
+        })
+        .collect();
+    let placed = t.spawn_surfels(&ctx, &spawn);
+    eprintln!("spawned {placed} of {} requested", spawn.len());
+    assert!(placed > 100, "spawn placed almost nothing: {placed}");
+
+    // Visible immediately: the activation pass must have run, or the
+    // rasterizer is still reading the pre-spawn parameters.
+    let right_after = t.eval_psnr(&ctx, &eval_views);
+    assert!(
+        (right_after - before).abs() > 0.01,
+        "spawned surfels had no effect on the render at all \
+         ({before:.2} -> {right_after:.2}) — activation pass missing?"
+    );
+
+    for iter in 1500..3000 {
+        t.step(&ctx, iter);
+    }
+    let after = t.eval_psnr(&ctx, &eval_views);
+    eprintln!("starved {before:.2} dB -> spawned+trained {after:.2} dB");
+    assert!(
+        after > before + 1.0,
+        "spawning did not add reachable geometry: {before:.2} -> {after:.2}"
+    );
+}

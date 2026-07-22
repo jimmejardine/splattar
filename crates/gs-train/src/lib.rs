@@ -15,4 +15,4 @@ pub use plane_sweep::{DepthMap, PlaneSweep, SweepOptions, init_from_plane_sweep}
 pub use normal_loss::NormalLoss;
 pub use optim::{Activation, Optimizer};
 pub use ssim::SsimLoss;
-pub use trainer::{ExportScene, InitialSurfels, TrainConfig, TrainView, Trainer};
+pub use trainer::{ExportScene, InitialSurfels, NewSurfel, TrainConfig, TrainView, Trainer};
